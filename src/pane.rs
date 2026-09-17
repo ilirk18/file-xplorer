@@ -36,6 +36,10 @@ pub struct Tab {
     pub loading: bool,
     /// Set when the last load failed, shown in place of the listing.
     pub error: Option<String>,
+    /// Some(query) while this tab shows search results rather than a listing.
+    /// `path` stays the search root, so opening a result still works through
+    /// the ordinary path_join(current_path, name).
+    pub search_query: Option<String>,
 
     generation: u64,
     pending_select: Option<String>,
@@ -51,6 +55,7 @@ impl Tab {
             file_list: FileList::default(),
             loading: false,
             error: None,
+            search_query: None,
             generation: 0,
             pending_select: None,
             history: Vec::new(),
@@ -59,6 +64,9 @@ impl Tab {
     }
 
     pub fn label(&self) -> String {
+        if let Some(q) = &self.search_query {
+            return format!("Search: {}", q);
+        }
         if self.path.is_empty() {
             "New Tab".to_string()
         } else {
@@ -215,6 +223,7 @@ impl Pane {
         tab.generation += 1;
         tab.loading = true;
         tab.error = None;
+        tab.search_query = None;
         tab.file_list.set_show_hidden(show_hidden);
         tab.file_list.row_height = row_height;
         if let Some(sel) = select_after.clone() {
@@ -354,6 +363,45 @@ impl Pane {
 
     /// Select `name` once the next load lands. Used after a rename or a new
             /// folder so the thing just created is the thing now highlighted.
+    /// Switch the active tab into search mode. Shares the load generation, so
+    /// navigating away while a search runs discards its remaining results.
+    pub fn begin_search(&mut self, query: &str) -> (u64, u64, String) {
+        let root = self.current_path().to_string();
+        let tab = self.active_mut();
+        tab.generation += 1;
+        tab.loading = true;
+        tab.error = None;
+        tab.search_query = Some(query.to_string());
+        tab.file_list.set_entries(Vec::new());
+        (tab.id, tab.generation, root)
+    }
+
+    /// Apply one batch of search results. Stale batches are dropped, exactly
+    /// like stale directory reads.
+    pub fn finish_search_batch(
+        &mut self,
+        tab_id: u64,
+        generation: u64,
+        entries: Vec<FileEntry>,
+        done: bool,
+    ) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return false;
+        };
+        if tab.generation != generation || tab.search_query.is_none() {
+            return false;
+        }
+        tab.file_list.append_entries(entries);
+        if done {
+            tab.loading = false;
+        }
+        true
+    }
+
+    pub fn is_searching(&self) -> bool {
+        self.active().search_query.is_some()
+    }
+
     pub fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|t| t.id == id)
     }
@@ -573,6 +621,50 @@ mod tests {
         assert_eq!(rr.kind, LoadKind::Refresh);
         load(&mut pane, &rr, &[("one.txt", false), ("two.txt", false), ("new.txt", false)]);
         assert_eq!(pane.list().selected_entries()[0].name, "two.txt");
+    }
+
+    #[test]
+    fn search_results_stream_in_and_stale_ones_are_dropped() {
+        let mut pane = Pane::new();
+        let r = pane.navigate("C:\\a");
+        load(&mut pane, &r, &[("x.txt", false)]);
+
+        let (tab, gen, root) = pane.begin_search("rs");
+        assert_eq!(root, "C:\\a");
+        assert!(pane.is_searching());
+        assert_eq!(pane.list().entries.len(), 0, "results start empty");
+
+        assert!(pane.finish_search_batch(tab, gen, vec![entry("sub\\one.rs", false)], false));
+        assert!(pane.finish_search_batch(tab, gen, vec![entry("two.rs", false)], true));
+        assert_eq!(pane.list().entries.len(), 2);
+        assert!(!pane.active().loading);
+
+        // A batch from a superseded search must not land.
+        assert!(!pane.finish_search_batch(tab, gen - 1, vec![entry("old.rs", false)], true));
+    }
+
+    #[test]
+    fn navigating_leaves_search_mode() {
+        let mut pane = Pane::new();
+        let r = pane.navigate("C:\\a");
+        load(&mut pane, &r, &[]);
+        let (tab, gen, _) = pane.begin_search("q");
+        pane.finish_search_batch(tab, gen, vec![entry("hit.rs", false)], true);
+        assert!(pane.is_searching());
+
+        let r2 = pane.navigate("C:\\b");
+        load(&mut pane, &r2, &[("plain.txt", false)]);
+        assert!(!pane.is_searching());
+        assert_eq!(pane.active().label(), "b");
+    }
+
+    #[test]
+    fn a_searching_tab_is_labelled_as_such() {
+        let mut pane = Pane::new();
+        let r = pane.navigate("C:\\a");
+        load(&mut pane, &r, &[]);
+        pane.begin_search("*.rs");
+        assert_eq!(pane.active().label(), "Search: *.rs");
     }
 
     #[test]

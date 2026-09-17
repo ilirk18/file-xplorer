@@ -49,6 +49,27 @@ An operation that fails raises a message box with the actual reason.
 **Live filter.** Each pane's footer filters its listing as you type, with a
 `12 of 340` count.
 
+**Command palette.** `Ctrl+Shift+P` finds any command by initials, so nothing
+is hidden behind a chord you have to remember.
+
+**Recursive search.** `Ctrl+Shift+F` walks the tree on a worker thread and
+streams matches in as it finds them. `*` is allowed (`*.rs`, `test*`).
+
+**Batch rename.** `{n}` name, `{e}` extension, `{#}` counter, with a live
+preview that flags collisions and illegal names before anything happens.
+
+**The real Windows context menu.** Right-click shows this app's commands, then
+everything installed software registered: 7-Zip, Git, Open with, Send to.
+
+**Drag and drop**, both directions, interoperating with Explorer. Copy by
+default, Shift to move; dropping on a folder row targets that folder.
+
+**Folder sizes on demand.** Never automatic - recursive sizing of a whole drive
+is how file managers earn a reputation for hanging.
+
+**Live updates.** Directories are watched, so changes made elsewhere appear
+without a refresh.
+
 **Sidebar** with drives (label, free/total, and a capacity bar that turns amber
 past 90%) and your standard folders, each with its real shell icon.
 
@@ -77,6 +98,9 @@ Bindings follow Windows conventions, with the dual-pane extras on Ctrl+Shift.
 | Multi-select with the mouse | `Ctrl+click` to toggle, `Shift+click` for a range |
 | Open | `Enter` or double-click (folders navigate, files open in their default app) |
 | Up / back / forward | `Backspace` or `Alt+Up` / `Alt+Left` / `Alt+Right`, or mouse buttons 4 and 5 |
+| Command palette | `Ctrl+Shift+P` |
+| Search in this folder and below | `Ctrl+Shift+F` |
+| Batch rename | `Ctrl+Shift+R` |
 | One pane / two panes | `Ctrl+1` / `Ctrl+2` |
 | Switch pane | `Tab` |
 | New / close / cycle tab | `Ctrl+T` / `Ctrl+W` / `Ctrl+Tab`, middle-click a tab to close |
@@ -110,6 +134,14 @@ Bindings follow Windows conventions, with the dual-pane extras on Ctrl+Shift.
 | `src/ops.rs` | `IFileOperation` wrappers and clipboard interop |
 | `src/icons.rs` | Shell icon cache, keyed by extension or path |
 | `src/config.rs` | Settings file load/save |
+| `src/palette.rs` | Command palette and its fuzzy matcher |
+| `src/search.rs` | Recursive name search |
+| `src/batch_rename.rs` | Rename patterns, preview, dialog |
+| `src/watch.rs` | ReadDirectoryChangesW watcher |
+| `src/dnd.rs` | Drag and drop (IDropTarget / IDropSource) |
+| `src/shellmenu.rs` | The real shell context menu |
+| `src/pidl.rs` | Shell item id lists, freed on drop |
+| `src/dialog.rs` | Shared dialog font handling |
 
 ### Why `layout.rs` exists
 
@@ -128,7 +160,7 @@ is unit-tested without a window.
 cargo test
 ```
 
-102 tests, no warnings. They cover path handling and name validation, the virtual
+151 tests, no warnings. They cover path handling and name validation, the virtual
 list and selection model, sorting and filtering, tab and history behaviour,
 stale-load rejection, layout geometry and hit-testing, and palette contrast.
 
