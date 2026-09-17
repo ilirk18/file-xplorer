@@ -1,6 +1,6 @@
 [package]
 name = "jamb"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Minimal native dual-pane file manager for Windows"
 license = "GPL-3.0-only"
