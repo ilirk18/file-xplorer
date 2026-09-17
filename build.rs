@@ -1,6 +1,6 @@
 // Embeds app.manifest into the executable: DPI awareness (PerMonitorV2),
 // long-path support, UTF-8 code page, and Common Controls v6 theming.
-// Also compiles app.rc so the sash icon ships inside the exe.
+// Also compiles app.rc so the app icon ships inside the exe.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,7 +8,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=app.manifest");
     println!("cargo:rerun-if-changed=app.rc");
-    println!("cargo:rerun-if-changed=assets/app.ico");
+    println!("cargo:rerun-if-changed=assets/jamb.ico");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -26,7 +26,7 @@ fn main() {
     if let Err(e) = embed_icon(&manifest_dir) {
         // A missing resource compiler must not silently ship a blank icon: fail
         // the build so the gap is obvious.
-        panic!("embedding app.ico failed: {e}");
+        panic!("embedding the app icon failed: {e}");
     }
 }
 

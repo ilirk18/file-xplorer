@@ -4,7 +4,7 @@ if (Test-Path $cargoBin) {
     $env:Path = "$cargoBin;$env:Path"
 }
 
-$exe = "target\release\file-xplorer.exe"
+$exe = "target\release\jamb.exe"
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Host "Rust/cargo not found. Install from https://rustup.rs/ then run this script again."

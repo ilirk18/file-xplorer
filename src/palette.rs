@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::icons::IconCache;
 use crate::theme::{colorref, Palette, Rgb, Theme};
 
-const CLASS: &str = "FileXplorerPicker";
+const CLASS: &str = "JambPicker";
 const IDC_QUERY: i32 = 2001;
 /// EM_SETCUEBANNER: the grey prompt an empty edit box shows.
 const EM_SETCUEBANNER: u32 = 0x1501;

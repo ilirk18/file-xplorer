@@ -40,6 +40,12 @@ pub struct Tab {
     /// `path` stays the search root, so opening a result still works through
     /// the ordinary path_join(current_path, name).
     pub search_query: Option<String>,
+    /// Running totals for a duplicate scan, which streams its findings in and
+    /// so cannot state its own result until the last batch. Counted on the tab
+    /// rather than in the app, because two panes can be scanning at once.
+    pub dup_groups: u32,
+    pub dup_files: usize,
+    pub dup_bytes: u64,
 
     generation: u64,
     pending_select: Option<String>,
@@ -56,6 +62,9 @@ impl Tab {
             loading: false,
             error: None,
             search_query: None,
+            dup_groups: 0,
+            dup_files: 0,
+            dup_bytes: 0,
             generation: 0,
             pending_select: None,
             history: Vec::new(),
@@ -65,7 +74,7 @@ impl Tab {
 
     pub fn label(&self) -> String {
         if let Some(q) = &self.search_query {
-            return format!("Search: {}", q);
+            return q.clone();
         }
         if self.path.is_empty() {
             "New Tab".to_string()
@@ -481,6 +490,10 @@ impl Pane {
         tab.loading = true;
         tab.error = None;
         tab.search_query = Some(query.to_string());
+        // A second scan in the same tab starts its findings from zero.
+        tab.dup_groups = 0;
+        tab.dup_files = 0;
+        tab.dup_bytes = 0;
         tab.file_list.set_entries(Vec::new());
         (tab.id, tab.generation, root)
     }
@@ -563,6 +576,20 @@ pub fn paths_equal(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use crate::fs::FileEntry;
+
+    #[test]
+    fn restoring_one_path_collapses_a_pane_to_one_tab() {
+        // What a split relies on: the slot it is handed may still hold the
+        // tabs it had before it was closed, and a new pane shows one folder.
+        let mut p = Pane::new();
+        p.new_tab(r"C:");
+        p.new_tab(r"C:");
+        assert_eq!(p.tabs.len(), 3);
+        p.restore(&[r"C:\here".to_string()], 0);
+        assert_eq!(p.tabs.len(), 1);
+        assert_eq!(p.active_tab_index, 0);
+        assert_eq!(p.current_path(), r"C:\here");
+    }
 
     #[test]
     fn reorder_keeps_the_active_tab_active() {
@@ -887,8 +914,17 @@ mod tests {
         let mut pane = Pane::new();
         let r = pane.navigate("C:\\a");
         load(&mut pane, &r, &[]);
-        pane.begin_search("*.rs");
+        // What the real caller passes: a label, already saying what kind of
+        // search this is. Prefixing it again gave "Search: Search: *.rs".
+        pane.begin_search(&crate::search::Query::by_name("*.rs").label());
         assert_eq!(pane.active().label(), "Search: *.rs");
+
+        pane.begin_search("Duplicates in a");
+        assert_eq!(
+            pane.active().label(),
+            "Duplicates in a",
+            "a scan that is not a name search says so"
+        );
     }
 
     #[test]

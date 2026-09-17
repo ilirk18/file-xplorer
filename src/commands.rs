@@ -64,7 +64,6 @@ pub const CMD_INSPECTOR: usize = 143;
 pub const CMD_GRID: usize = 144;
 pub const CMD_BIND: usize = 145;
 pub const CMD_NEW_WINDOW: usize = 146;
-pub const CMD_TOGGLE_BAR: usize = 147;
 pub const CMD_SPLIT_RIGHT: usize = 148;
 pub const CMD_SPLIT_DOWN: usize = 149;
 pub const CMD_CLOSE_PANE: usize = 150;
@@ -82,6 +81,9 @@ pub const CMD_FOLDER_SIZES: usize = 161;
 pub const CMD_SETTINGS: usize = 162;
 pub const CMD_SAVE_LAYOUT: usize = 163;
 pub const CMD_LAYOUTS: usize = 164;
+pub const CMD_DUPLICATES: usize = 165;
+pub const CMD_PIN_PATH: usize = 166;
+pub const CMD_GO_HOME: usize = 167;
 
 /// Everything the palette can reach. The context menu builds from the same
 /// list, so a command is described in exactly one place.
@@ -112,6 +114,7 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_DEFAULT_APP, label: "Default file manager\u{2026}", keys: "" },
     CommandDef { id: CMD_SEARCH, label: "Search here", keys: "Ctrl+Shift+F" },
     CommandDef { id: CMD_SEARCH_CONTENTS, label: "Search file contents", keys: "Ctrl+Shift+G" },
+    CommandDef { id: CMD_DUPLICATES, label: "Find duplicate files", keys: "" },
     CommandDef { id: CMD_FILTER, label: "Filter this pane", keys: "Ctrl+F" },
     CommandDef { id: CMD_CALC_SIZES, label: "Calculate folder sizes", keys: "" },
     CommandDef { id: CMD_EXTRACT, label: "Extract from archive", keys: "" },
@@ -123,10 +126,12 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_TERMINAL, label: "Open terminal here", keys: "" },
     CommandDef { id: CMD_COPY_PATH, label: "Copy path", keys: "Ctrl+Shift+C" },
     CommandDef { id: CMD_PIN, label: "Pin or unpin this folder", keys: "" },
+    CommandDef { id: CMD_PIN_PATH, label: "Pin or unpin a path\u{2026}", keys: "" },
     CommandDef { id: CMD_REVEAL, label: "Show this folder in the tree", keys: "" },
     CommandDef { id: CMD_ARCHIVE, label: "Add to archive", keys: "" },
     CommandDef { id: CMD_COMPARE_CONTENT, label: "Compare contents with next pane", keys: "" },
     CommandDef { id: CMD_GO_UP, label: "Go up", keys: "Backspace" },
+    CommandDef { id: CMD_GO_HOME, label: "Go home", keys: "" },
     CommandDef { id: CMD_GO_BACK, label: "Go back", keys: "Alt+Left" },
     CommandDef { id: CMD_GO_FORWARD, label: "Go forward", keys: "Alt+Right" },
     CommandDef { id: CMD_NEW_TAB, label: "New tab", keys: "Ctrl+T" },
@@ -148,7 +153,6 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_TOGGLE_HIDDEN, label: "Toggle hidden files", keys: "Ctrl+H" },
     CommandDef { id: CMD_TOGGLE_SIDEBAR, label: "Toggle sidebar", keys: "Ctrl+B" },
     CommandDef { id: CMD_INSPECTOR, label: "Toggle inspector", keys: "Alt+P" },
-    CommandDef { id: CMD_TOGGLE_BAR, label: "Toggle command bar", keys: "" },
     CommandDef { id: CMD_GRID, label: "Toggle icon view", keys: "Ctrl+Shift+I" },
     CommandDef { id: CMD_BIND, label: "Change a shortcut", keys: "" },
     CommandDef { id: CMD_TOGGLE_THEME, label: "Toggle dark / light theme", keys: "Ctrl+Shift+D" },
@@ -251,7 +255,6 @@ pub enum BarMenu {
 }
 
 pub struct BarItem {
-    pub glyph: &'static str,
     /// Empty for an icon-only button, which is most of them.
     pub label: &'static str,
     pub action: BarAction,
@@ -264,17 +267,17 @@ pub struct BarItem {
 /// reach the commands, never a second implementation of them, which is why
 /// nothing below this line knows how to copy a file.
 pub const BAR: &[BarItem] = &[
-    BarItem { glyph: crate::renderer::glyph::ADD, label: "New", action: BarAction::Menu(BarMenu::New), right: false },
-    BarItem { glyph: crate::renderer::glyph::CUT, label: "", action: BarAction::Run(CMD_CUT), right: false },
-    BarItem { glyph: crate::renderer::glyph::COPY, label: "", action: BarAction::Run(CMD_COPY), right: false },
-    BarItem { glyph: crate::renderer::glyph::PASTE, label: "", action: BarAction::Run(CMD_PASTE), right: false },
-    BarItem { glyph: crate::renderer::glyph::RENAME, label: "", action: BarAction::Run(CMD_RENAME), right: false },
-    BarItem { glyph: crate::renderer::glyph::DELETE, label: "", action: BarAction::Run(CMD_DELETE), right: false },
-    BarItem { glyph: crate::renderer::glyph::SHARE, label: "", action: BarAction::Run(CMD_SHARE), right: false },
-    BarItem { glyph: crate::renderer::glyph::SORT, label: "Sort", action: BarAction::Menu(BarMenu::Sort), right: false },
-    BarItem { glyph: crate::renderer::glyph::VIEW, label: "View", action: BarAction::Menu(BarMenu::View), right: false },
-    BarItem { glyph: crate::renderer::glyph::SETTINGS, label: "", action: BarAction::Menu(BarMenu::Settings), right: true },
-    BarItem { glyph: crate::renderer::glyph::PANE_CLOSED, label: "Details", action: BarAction::Run(CMD_INSPECTOR), right: true },
+    BarItem { label: "New", action: BarAction::Menu(BarMenu::New), right: false },
+    BarItem { label: "", action: BarAction::Run(CMD_CUT), right: false },
+    BarItem { label: "", action: BarAction::Run(CMD_COPY), right: false },
+    BarItem { label: "", action: BarAction::Run(CMD_PASTE), right: false },
+    BarItem { label: "", action: BarAction::Run(CMD_RENAME), right: false },
+    BarItem { label: "", action: BarAction::Run(CMD_DELETE), right: false },
+    BarItem { label: "", action: BarAction::Run(CMD_SHARE), right: false },
+    BarItem { label: "Sort", action: BarAction::Menu(BarMenu::Sort), right: false },
+    BarItem { label: "View", action: BarAction::Menu(BarMenu::View), right: false },
+    BarItem { label: "", action: BarAction::Menu(BarMenu::Settings), right: true },
+    BarItem { label: "Details", action: BarAction::Run(CMD_INSPECTOR), right: true },
 ];
 
 /// What a button is called when it is not being drawn: in the overflow menu,
@@ -286,19 +289,6 @@ pub fn bar_name(item: &BarItem) -> &'static str {
         BarAction::Menu(BarMenu::Settings) => "Settings",
         // Every other menu button carries its name on the bar already.
         BarAction::Menu(_) => item.label,
-    }
-}
-
-/// Whether a button shows something that is currently on.
-///
-/// Only toggles can be on, and the bar has one; the table carries the off
-/// glyph, so this is also where the on one is chosen.
-pub fn bar_state(state: &AppState, action: BarAction) -> (bool, &'static str) {
-    match action {
-        BarAction::Run(CMD_INSPECTOR) if state.inspector => {
-            (true, crate::renderer::glyph::PANE_OPEN)
-        }
-        _ => (false, ""),
     }
 }
 
@@ -363,17 +353,12 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
     use crate::layout::{ICONS_OFF, ICON_STEPS};
 
     let pid = state.focused;
-    // Which buttons did not fit. The layout already answered this: anything it
-    // could not place got an empty rectangle and was never drawn.
+    // There is no bar any more, so every one of its commands is "what did not
+    // fit": the overflow menu is the only place they are drawn.
     let hidden: Vec<usize> = if which == BarMenu::Settings {
-        let placed = state.layout().bar_items;
         BAR.iter()
             .enumerate()
-            .filter(|(i, it)| {
-                !it.right
-                    && placed.get(*i).map(|r| r.is_empty()).unwrap_or(true)
-                    && bar_enabled(state, it.action)
-            })
+            .filter(|(_, it)| !it.right && bar_enabled(state, it.action))
             .map(|(i, _)| i)
             .collect()
     } else {
@@ -516,12 +501,6 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
                 );
                 themed.add(
                     menu,
-                    CMD_TOGGLE_BAR,
-                    &format!("{}Command bar", check(state.command_bar)),
-                    &binds.text_for(CMD_TOGGLE_BAR),
-                );
-                themed.add(
-                    menu,
                     CMD_TOGGLE_HIDDEN,
                     &format!("{}Hidden files", check(state.show_hidden)),
                     &binds.text_for(CMD_TOGGLE_HIDDEN),
@@ -646,22 +625,10 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
 
 /// Open the settings menu, from the keyboard or from the palette.
 ///
-/// Anchored under the gear button when the bar is showing, and under the top
-/// of the focused pane when it is not \u2014 a menu has to come from
-/// somewhere, and it is still the same menu.
+/// Anchored under the focused pane's overflow button, which is where clicking
+/// for it opens the same menu.
 pub fn do_settings(state: &mut AppState, hwnd: HWND) {
-    let layout = state.layout();
-    let at = BAR
-        .iter()
-        .position(|b| b.action == BarAction::Menu(BarMenu::Settings))
-        .and_then(|i| layout.bar_items.get(i).copied())
-        .filter(|r| !r.is_empty())
-        .unwrap_or_else(|| {
-            // No bar to hang from: the top-right of the pane, which is where
-            // the button would have been.
-            let b = layout.pane(state.focused).bounds;
-            crate::layout::Rect::new(b.right(), b.y, 0, 0)
-        });
+    let at = state.layout().pane(state.focused).overflow;
     bar_menu(state, hwnd, BarMenu::Settings, at);
 }
 
@@ -1059,7 +1026,7 @@ pub fn do_default_app(state: &mut AppState, hwnd: HWND) {
             hwnd,
             "Restore Windows Explorer",
             "Folders, drives and This PC will open in Windows Explorer again.\n\n\
-             Whatever these keys said before File Xplorer claimed them is put \
+             Whatever these keys said before Jamb claimed them is put \
              back exactly. Nothing outside your own user account is touched.\n\n\
              Restore Windows Explorer?",
         );
@@ -1077,13 +1044,13 @@ pub fn do_default_app(state: &mut AppState, hwnd: HWND) {
         hwnd,
         "Default file manager",
         &format!(
-            "Folders, drives and This PC will open in File Xplorer instead of \
+            "Folders, drives and This PC will open in Jamb instead of \
              Windows Explorer.\n\n\
              This writes three keys under HKEY_CURRENT_USER only \u{2014} your \
              account, not the machine \u{2014} and records what each one said \
              first so this command can put them back. Windows Explorer itself \
              keeps working.\n\n{}\n\n\
-             Make File Xplorer the default?",
+             Make Jamb the default?",
             default_app::command_for(&exe)
         ),
     );
@@ -1092,7 +1059,7 @@ pub fn do_default_app(state: &mut AppState, hwnd: HWND) {
     }
     match default_app::make_default() {
         Ok(()) => {
-            state.status_override = Some("File Xplorer opens folders now".into());
+            state.status_override = Some("Jamb opens folders now".into());
         }
         Err(e) => report_error(hwnd, "Default file manager", &e),
     }
@@ -1273,6 +1240,120 @@ pub fn start_search(state: &mut AppState, hwnd: HWND, query: search::Query) {
                 PostMessageW(
                     Some(owner.hwnd()),
                     WM_APP_SEARCH_BATCH,
+                    WPARAM(0),
+                    LPARAM(raw as isize),
+                )
+            };
+            if posted.is_err() {
+                unsafe { drop(Box::from_raw(raw)) };
+            }
+        });
+    });
+    invalidate(hwnd);
+}
+
+/// Pin a path without going there first: a share that is not mounted, a drive
+/// that is not plugged in, or a folder you only ever want one click away.
+/// `prompt_path` brings the shell's own completion, which already completes
+/// `\server\share`, so a UNC is typed the same way a local path is.
+///
+/// Accepts `shell32.dll,4|C:\work` too, which is the same text the settings
+/// file holds — one format, whether it is typed or edited by hand.
+///
+/// ponytail: the path is not checked for existence. `CreateFileW` on an
+/// unreachable share blocks until SMB gives up, and this runs on the UI
+/// thread; a pin that does not resolve fails when it is clicked, like any pin
+/// to a folder that has since been deleted. Check it on a worker if the typo
+/// case ever matters more than the hang does.
+fn do_pin_path(state: &mut AppState, hwnd: HWND) {
+    let Some(text) = crate::prompt::prompt_path(
+        hwnd,
+        state,
+        "Pin a path",
+        "Path to pin, or icon|path:",
+        "",
+    ) else {
+        return;
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let pinning = !state.is_pinned(&crate::config::Pin::parse(text).path);
+    state.toggle_pin(text);
+    state.status_override = Some(if pinning {
+        format!("Pinned {}", text)
+    } else {
+        format!("Unpinned {}", text)
+    });
+    invalidate(hwnd);
+}
+
+/// Scan the focused pane's folder and everything under it for files holding
+/// identical bytes, and list what it finds in that pane.
+///
+/// The results are a search listing in every respect — streamed in batches,
+/// tied to the tab's generation so navigating away discards them, names
+/// relative to the root so opening one needs no special case — so it takes
+/// over the same machinery rather than growing a second kind of tab beside it.
+/// The one thing it adds is which group each row is in, which the listing
+/// keeps in a side map and the renderer draws as a bar down the left edge.
+///
+/// Sorted by size, largest first: the copies worth deleting are the big ones,
+/// and a size sort is also what keeps each group's rows together, since
+/// identical files are identical in length by definition.
+pub fn start_duplicates(state: &mut AppState, hwnd: HWND) {
+    let pid = state.focused;
+    let root = state.pane(pid).current_path().to_string();
+    if root.is_empty() {
+        return;
+    }
+    // A duplicate scan is `fs::list_dir` all the way down, and neither an
+    // archive nor the shell namespace answers that. Refused with a reason
+    // rather than silently returning nothing, which would read as "no
+    // duplicates here".
+    if crate::shellns::is_shell_path(&root) || crate::archive::split(&root).is_some() {
+        report_error(
+            hwnd,
+            "Find duplicate files",
+            "Duplicates can only be found in a folder on a disk.",
+        );
+        return;
+    }
+
+    let leaf = fs::path_leaf(&root).to_string();
+    let (tab_id, generation, root) = state.pane_mut(pid).begin_search(&format!("Duplicates in {}", leaf));
+    // Largest first. Set before the results arrive so batches land already in
+    // order rather than reshuffling the list under the pointer as it fills.
+    state
+        .pane_mut(pid)
+        .active_mut()
+        .file_list
+        .set_sort(
+            crate::file_list::SortKey::Size,
+            crate::file_list::SortOrder::Desc,
+        );
+
+    // The same cancel slot searching uses: one long walk per pane, and
+    // starting either kind cancels whichever was running.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.searches[pid.0] = Some(search::Search {
+        cancel: cancel.clone(),
+    });
+    state.status_override = Some(format!("Scanning {} for duplicates\u{2026}", leaf));
+
+    let owner = ops::OwnerWindow(hwnd);
+    std::thread::spawn(move || {
+        crate::duplicates::run(root, generation, cancel, |batch| {
+            let raw = Box::into_raw(Box::new(crate::app::DupesBatch {
+                pid,
+                tab_id,
+                batch,
+            }));
+            let posted = unsafe {
+                PostMessageW(
+                    Some(owner.hwnd()),
+                    crate::app::WM_APP_DUPES_BATCH,
                     WPARAM(0),
                     LPARAM(raw as isize),
                 )
@@ -1664,7 +1745,7 @@ pub fn do_places(state: &mut AppState, hwnd: HWND) {
     let roots: Vec<String> = state.drives.iter().map(|d| d.root.clone()).collect();
     let found = go_to_list(
         &state.recent,
-        &state.pins,
+        &state.pins.iter().map(|p| p.path.clone()).collect::<Vec<_>>(),
         &state.places,
         &state.drives,
         &state.tree.rows(&roots),
@@ -2081,6 +2162,10 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
                 .pane(pid)
                 .cell_at(client.x, client.y, list.scroll_px(), list.total_rows())
         }
+        // The panel is describing the cursor entry, so its menu is that
+        // entry's. Falling through to the folder's would offer commands for
+        // something other than what you are looking at.
+        Hit::Inspector => state.pane(pid).list().cursor(),
         _ => None,
     };
     // Right-clicking an unselected row selects it first, as Explorer does.
@@ -2168,6 +2253,7 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
             add!(true, CMD_REVEAL, "Show in tree");
             themed.separator(menu);
             add!(true, CMD_SEARCH, "Search here");
+            add!(!in_archive, CMD_DUPLICATES, "Find duplicate files");
             add!(true, CMD_CALC_SIZES, "Calculate folder sizes");
             add!(true, CMD_REFRESH, "Refresh");
             themed.separator(menu);
@@ -2273,7 +2359,6 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_PIN_ACTION => do_actions(state, hwnd, true),
         CMD_GOTO => do_goto(state, hwnd),
         CMD_RECENT => do_places(state, hwnd),
-        CMD_TOGGLE_BAR => state.command_bar = !state.command_bar,
         CMD_SPLIT_RIGHT | CMD_SPLIT_DOWN => {
             let here = state.pane(pid).current_path().to_string();
             match state.split_focused(cmd == CMD_SPLIT_RIGHT) {
@@ -2320,6 +2405,8 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_CALC_SIZES => calculate_folder_sizes(state, hwnd),
         CMD_SEARCH => prompt_search(state, hwnd),
         CMD_SEARCH_CONTENTS => prompt_search_contents(state, hwnd),
+        CMD_DUPLICATES => start_duplicates(state, hwnd),
+        CMD_PIN_PATH => do_pin_path(state, hwnd),
         CMD_BATCH_RENAME => do_batch_rename(state, hwnd),
         CMD_TOGGLE_THEME => toggle_theme(state, hwnd),
         CMD_THEME => do_theme(state, hwnd),
@@ -2401,6 +2488,14 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_GO_UP => {
             let req = state.pane_mut(pid).navigate_up();
             start_load(hwnd, pid, req);
+        }
+        CMD_GO_HOME => {
+            // The same folder the sidebar's Home place points at, read from
+            // the same place, so the button and the shortcut cannot drift.
+            if let Ok(home) = std::env::var("USERPROFILE") {
+                let req = state.pane_mut(pid).navigate(&home);
+                start_load(hwnd, pid, Some(req));
+            }
         }
         CMD_GO_BACK => {
             let req = state.pane_mut(pid).go_back();
@@ -2514,7 +2609,7 @@ mod tests {
         // The overflow menu shows names, not glyphs, so a button whose name is
         // empty would appear there as a blank row nobody can read.
         for it in BAR {
-            assert!(!bar_name(it).is_empty(), "{:?} has no name", it.glyph);
+            assert!(!bar_name(it).is_empty(), "{:?} has no name", it.action);
         }
     }
 

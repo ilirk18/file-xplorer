@@ -197,7 +197,7 @@ pub fn files_differ(a: &str, b: &str) -> bool {
     }
 }
 
-fn hash_file(path: &str) -> Option<u64> {
+pub fn hash_file(path: &str) -> Option<u64> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::io::Read;

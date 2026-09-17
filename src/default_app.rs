@@ -26,7 +26,16 @@ const CLASSES: &[&str] = &["Directory", "Drive", "Folder"];
 
 /// Where the previous commands are kept. Our own key, so removing it by hand
 /// loses the ability to restore and nothing else.
-const BACKUP_KEY: &str = r"Software\FileXplorer\PreviousOpenCommand";
+const BACKUP_KEY: &str = r"Software\Jamb\PreviousOpenCommand";
+/// Where the backup lived under the old name. Read, never written: somebody
+/// who made Jamb their default and then upgraded must still be able to
+/// give the folder classes back to whatever had them first.
+const LEGACY_BACKUP_KEY: &str = r"Software\FileXplorer\PreviousOpenCommand";
+
+/// The recorded previous handler for `class`, under either name.
+fn read_backup(class: &str) -> Option<String> {
+    read_value(BACKUP_KEY, Some(class)).or_else(|| read_value(LEGACY_BACKUP_KEY, Some(class)))
+}
 
 use crate::fs::wide;
 
@@ -251,7 +260,7 @@ pub fn make_default() -> Result<(), String> {
         let before = read_value(&key, None).unwrap_or_default();
         // "" means there was nothing here, which restore reads as "take ours
         // away". Never record our own command as the thing to go back to.
-        if read_value(BACKUP_KEY, Some(class)).is_none() {
+        if read_backup(class).is_none() {
             let record = if points_at(&before, &exe) {
                 String::new()
             } else {
@@ -269,7 +278,7 @@ pub fn make_default() -> Result<(), String> {
 pub fn restore() -> Result<(), String> {
     let mut failed: Vec<String> = Vec::new();
     for class in CLASSES {
-        match restore_action(read_value(BACKUP_KEY, Some(class))) {
+        match restore_action(read_backup(class)) {
             Restore::Put(cmd) => {
                 if let Err(e) = write_default(&class_key(class), &cmd) {
                     failed.push(e);
@@ -289,6 +298,7 @@ pub fn restore() -> Result<(), String> {
         }
     }
     delete_tree(BACKUP_KEY);
+    delete_tree(LEGACY_BACKUP_KEY);
     announce();
     if failed.is_empty() {
         Ok(())
@@ -314,7 +324,7 @@ mod tests {
         // It earns its place: restore reads what set wrote, and a silent
         // failure in either direction is somebody's default file manager
         // stuck.
-        const SCRATCH: &str = r"Software\FileXplorer\SelfTest";
+        const SCRATCH: &str = r"Software\Jamb\SelfTest";
         assert_eq!(read_value(SCRATCH, None), None, "left over from a failed run");
 
         write_default(SCRATCH, "a command").expect("creates the key");
@@ -344,7 +354,7 @@ mod tests {
 
         // The parent goes only if it is empty; a real backup living there
         // makes this fail, which is what should happen.
-        let parent = wide(r"Software\FileXplorer");
+        let parent = wide(r"Software\Jamb");
         unsafe {
             let _ = RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR::from_raw(parent.as_ptr()));
         }
@@ -352,7 +362,7 @@ mod tests {
 
     #[test]
     fn the_registered_command_quotes_both_halves() {
-        let exe = r"C:\Program Files\App\file-xplorer.exe";
+        let exe = r"C:\Program Files\App\jamb.exe";
         let cmd = command_for(exe);
         assert_eq!(cmd, format!("\"{}\" \"%1\"", exe));
         // A path with a space survives the round trip, which is the whole
@@ -362,16 +372,16 @@ mod tests {
 
     #[test]
     fn another_app_is_not_mistaken_for_this_one() {
-        let exe = r"C:\Apps\file-xplorer.exe";
+        let exe = r"C:\Apps\jamb.exe";
         assert!(!points_at(r"C:\Windows\explorer.exe %1", exe));
         assert!(!points_at("", exe));
         // A prefix of our path is a different program.
-        assert!(!points_at(r"C:\Apps\file-xplorer.exe.old %1", exe));
+        assert!(!points_at(r"C:\Apps\jamb.exe.old %1", exe));
         // Case and quoting are not differences.
-        assert!(points_at(r"C:\APPS\FILE-XPLORER.EXE %1", exe));
+        assert!(points_at(r"C:\APPS\JAMB.EXE %1", exe));
         assert!(points_at(
-            r#""C:\Apps\file-xplorer.exe" "%1""#,
-            r"c:\apps\file-xplorer.exe"
+            r#""C:\Apps\jamb.exe" "%1""#,
+            r"c:\apps\jamb.exe"
         ));
     }
 

@@ -20,7 +20,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-const CLASS: &str = "FileXplorerBatchRename";
+const CLASS: &str = "JambBatchRename";
 const IDC_PATTERN: i32 = 3001;
 const IDC_PREVIEW: i32 = 3002;
 const IDC_OK: i32 = 3003;

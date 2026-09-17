@@ -26,7 +26,7 @@ use windows::Win32::UI::Shell::{
 pub const IDC_PROMPT_EDIT: i32 = 1001;
 pub const IDC_PROMPT_OK: i32 = 1002;
 pub const IDC_PROMPT_CANCEL: i32 = 1003;
-pub const PROMPT_CLASS: &str = "FileXplorerPromptDlg";
+pub const PROMPT_CLASS: &str = "JambPromptDlg";
 /// EM_SETSEL. Declared here rather than pulling in all of Win32_UI_Controls
 /// for one constant.
 pub const EM_SETSEL: u32 = 0x00B1;

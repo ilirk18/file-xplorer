@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
-use windows::Win32::UI::Shell::{PathIsNetworkPathW, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
+use windows::Win32::UI::Shell::{ExtractIconExW, PathIsNetworkPathW, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
 use crate::fs::wide;
@@ -37,6 +37,14 @@ pub fn icon_key_for_path(path: &str) -> String {
 
 const PATH_PREFIX: &str = "path:";
 
+/// Cache key for an icon named the way Windows names one: `shell32.dll,4`,
+/// or a bare `.ico`/`.exe` path, whose index is 0.
+pub fn custom_icon_key(spec: &str) -> String {
+    format!("{}{}", ICON_PREFIX, spec.to_lowercase())
+}
+
+const ICON_PREFIX: &str = "icon:";
+
 #[derive(Default)]
 pub struct IconCache {
     by_key: HashMap<String, Option<HICON>>,
@@ -63,10 +71,39 @@ impl IconCache {
     }
 }
 
+/// One icon out of a file that holds some: a DLL, an EXE, or an `.ico`.
+///
+/// `ExtractIconExW` is the whole feature — it takes the same `file,index`
+/// pair the shell has always used, searches for a bare name the way
+/// `LoadLibrary` does, and hands back a handle this cache already knows how to
+/// destroy.
+///
+/// Its return value is not a success flag and is not treated as one: a missing
+/// file gives `0xFFFFFFFF`, and index `-1` gives the *count* of icons in the
+/// file without filling anything in. Both leave the handle null, so the handle
+/// is what decides.
+unsafe fn extract_icon(spec: &str) -> Option<HICON> {
+    let (file, index) = match spec.rsplit_once(',') {
+        Some((file, index)) => (file.trim(), index.trim().parse().ok()?),
+        // No comma: the file holds one icon, or we want its first.
+        None => (spec.trim(), 0i32),
+    };
+    if file.is_empty() {
+        return None;
+    }
+    let w = wide(file);
+    let mut small = HICON::default();
+    ExtractIconExW(PCWSTR::from_raw(w.as_ptr()), index, None, Some(&mut small), 1);
+    (!small.is_invalid()).then_some(small)
+}
+
 unsafe fn lookup(key: &str) -> Option<HICON> {
     // A "path:" key asks for the icon of a real location, so the shell is
     // allowed to touch it. Everything else is resolved from attributes alone
     // and never hits the disk.
+    if let Some(spec) = key.strip_prefix(ICON_PREFIX) {
+        return extract_icon(spec);
+    }
     let (path, attrs, flags) = if let Some(real) = key.strip_prefix(PATH_PREFIX) {
         // A shell location has no file to ask about, so it is resolved to an
         // id list first. Worth the extra call for the three of them: the

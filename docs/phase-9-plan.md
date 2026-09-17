@@ -35,7 +35,7 @@ three other things are blocked behind it.
 is no way to say "open this folder" — which is also why nothing in the shell can
 hand it a path, which is why it cannot be a default file manager.
 
-- `file-xplorer.exe <path>` opens there instead of restoring the session.
+- `jamb.exe <path>` opens there instead of restoring the session.
 - `--new-window` so a second instance is deliberate rather than accidental.
 - A real second window. Today `AppState` hangs off one HWND and `state_of` finds
   it there, so a second window is mostly a matter of not assuming one — the
@@ -354,7 +354,7 @@ Things the document does not list, in the order I would take them.
 | ~~**Persist per-folder view**~~ | Done: `folderview=<path>=<key>,<asc>,<icons>`, most recently changed first and capped at 200. The session map became a list, because the file is written in an order and a map has none |
 | ~~**Transfer queue**~~ | Done as a lock rather than a list: copies and moves take one turn at a time, everything else runs straight away, and a queued transfer says so in the footer. A queue you can look at and reorder is the upgrade, and needs somewhere to show it |
 | **Verify after copy** | Hash both sides on request. `files_differ` already exists for compare |
-| **Duplicate finder** | Content compare across a tree, not just two panes. Reuses `files_differ` and the search walker |
+| ~~**Duplicate finder**~~ | Done. It reused the search *walker* and `hash_file` rather than `files_differ`: comparing pairwise inside a bucket of n files is n²/2 reads where hashing is n. `src/duplicates.rs` |
 | **Dual-pane sync** | "Make right look like left", with a preview of what it would do |
 
 ### The PIDL question — done

@@ -327,7 +327,7 @@ pub fn list(archive: &str, inner: &str) -> Result<Vec<FileEntry>, String> {
 /// shell can open it. Read-only: edits to the temp copy do not go back in.
 pub fn extract_to_temp(archive: &str, inner: &str) -> Result<String, String> {
     let exe = seven_zip().ok_or_else(|| "7-Zip is not installed.".to_string())?;
-    let dir = std::env::temp_dir().join("FileXplorer").join("extract");
+    let dir = std::env::temp_dir().join("Jamb").join("extract");
     let _ = std::fs::create_dir_all(&dir);
 
     // `e` rather than `x`: flattened, so the result is predictably <dir>\<leaf>.
