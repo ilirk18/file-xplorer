@@ -1,0 +1,36 @@
+---
+description: After each phase create tests; run them before the next phase and fix failures before continuing
+alwaysApply: true
+---
+
+# Phase tests rule
+
+## After each phase: create tests
+
+When a phase (e.g. Phase 1 scaffold, Phase 2 file listing) is completed:
+
+1. **Add tests** that cover the main behavior of that phase (e.g. directory listing, virtual list math, sort order, path helpers).
+2. Put tests in the right place: unit tests in the same module (`#[cfg(test)] mod tests`) or in `tests/` for integration.
+3. Document in the plan or README that “Phase N tests” exist and what they cover.
+
+## Before starting the next phase: run tests
+
+When starting the **next** phase:
+
+1. **Run the full test suite first**: `cargo test` (or the project’s test command).
+2. **If any test fails**: do **not** start implementing the new phase.
+3. **Find out why**: fix the failing test, fix the code, or update the test if the behavior changed on purpose. Understand and resolve the failure before continuing.
+4. **Only after all tests pass** should work on the next phase begin.
+
+## After each phase: update documentation
+
+When a phase is completed:
+
+1. **Add or update** `docs/phase-N.md` for that phase: what was built, key files, main APIs, and any tests added.
+2. **Update** `docs/INDEX.md`: set the phase status, refresh the “Current codebase” summary and “Quick reference” table so the index always reflects the latest state.
+3. This keeps context in one place so nothing is forgotten when starting the next phase.
+
+## Summary
+
+- **End of phase** → add tests; add/update `docs/phase-N.md`; update `docs/INDEX.md`.
+- **Start of next phase** → run tests; if they fail, fix and understand why; then proceed.
