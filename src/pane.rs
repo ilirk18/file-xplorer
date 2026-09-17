@@ -328,6 +328,24 @@ impl Pane {
     /// Detach a tab so another pane can adopt it. The last tab is never
     /// detached: a pane with no tabs has nothing to show and nowhere to
     /// navigate from.
+    /// Move a tab within this pane, for dragging one past another.
+    ///
+    /// The active tab stays active wherever it lands, which is why this works
+    /// by id rather than by index: `remove` then `insert` shifts everything in
+    /// between, and half of those shifts are in the opposite direction.
+    pub fn reorder_tab(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return false;
+        }
+        let active_id = self.active_tab_id();
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if let Some(i) = self.tabs.iter().position(|t| t.id == active_id) {
+            self.active_tab_index = i;
+        }
+        true
+    }
+
     pub fn take_tab(&mut self, index: usize) -> Option<Tab> {
         if index >= self.tabs.len() || self.tabs.len() == 1 {
             return None;
@@ -500,6 +518,14 @@ impl Pane {
             tab.file_list.row_height = h;
         }
     }
+
+    /// Entries per line, from the layout. Every tab in the pane agrees, so
+    /// switching tabs does not switch view.
+    pub fn set_columns(&mut self, cols: u32) {
+        for tab in &mut self.tabs {
+            tab.file_list.columns = cols.max(1);
+        }
+    }
 }
 
 /// Windows paths are case-insensitive, and a trailing slash is not a difference.
@@ -519,6 +545,42 @@ pub fn paths_equal(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use crate::fs::FileEntry;
+
+    #[test]
+    fn reorder_keeps_the_active_tab_active() {
+        let mut p = Pane::new();
+        p.new_tab(r"C:");
+        p.new_tab(r"C:\c");
+        // new_tab activates what it opened, so the third tab is active.
+        let ids: Vec<u64> = p.tabs.iter().map(|t| t.id).collect();
+        let active = p.active_tab_id();
+        assert!(p.reorder_tab(2, 0));
+        assert_eq!(p.active_tab_id(), active);
+        assert_eq!(p.active_tab_index, 0);
+        assert_eq!(
+            p.tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![ids[2], ids[0], ids[1]]
+        );
+    }
+
+    #[test]
+    fn reorder_shifting_past_the_active_tab_tracks_it() {
+        let mut p = Pane::new();
+        p.new_tab(r"C:");
+        p.new_tab(r"C:\c");
+        p.switch_tab(0);
+        let active = p.active_tab_id();
+        assert!(p.reorder_tab(2, 0));
+        assert_eq!(p.active_tab_id(), active);
+        assert_eq!(p.active_tab_index, 1, "the active tab was pushed right");
+    }
+
+    #[test]
+    fn reorder_rejects_nonsense() {
+        let mut p = Pane::new();
+        assert!(!p.reorder_tab(0, 0), "no-op");
+        assert!(!p.reorder_tab(0, 9), "out of range");
+    }
 
     fn entry(name: &str, is_dir: bool) -> FileEntry {
         FileEntry {

@@ -29,6 +29,8 @@ the current state so context is never lost.
 | `src/input.rs` | Mouse and keyboard handlers |
 | `src/commands.rs` | The one `COMMANDS` table, context menu, file operations, undo |
 | `src/prompt.rs` | Modal single-line text prompt, with shell path completion |
+| `src/rename.rs` | The inline rename editor: a real EDIT control over the name cell |
+| `src/preview.rs` | Shell thumbnails: the inspector's preview, the icon view's cells, and the bounded cache behind them |
 | `src/menu.rs` | The context menu's own owner-draw painting |
 | `src/layout.rs` | Every rectangle in the UI, plus `hit_test`. No Win32 types, fully unit-tested |
 | `src/renderer.rs` | Direct2D/DirectWrite drawing, WIC icon bitmaps, `TextMeasurer` |
@@ -43,6 +45,7 @@ the current state so context is never lost.
 | `src/tree.rs` | The sidebar's folder tree: flat rows from a set of expanded paths |
 | `src/archive.rs` | Archives browsed as folders, via the 7-Zip CLI |
 | `src/palette.rs` | Command palette and its fuzzy matcher |
+| `src/keys.rs` | Chords, and which command each runs. No Win32 types, fully unit-tested |
 | `src/batch_rename.rs` | Rename patterns, preview, dialog |
 | `src/watch.rs` | `ReadDirectoryChangesW` watcher, one per pane |
 | `src/dnd.rs` | Drag and drop (`IDropTarget` / `IDropSource`) |
@@ -77,7 +80,7 @@ the current state so context is never lost.
   failures. See [.cursor/rules/phase-tests.mdc](../.cursor/rules/phase-tests.mdc).
 - **Docs**: after each phase add or update `docs/phase-N.md` and this index.
 
-Current: **204 tests, zero warnings** (`cargo test`).
+Current: **239 tests, zero warnings** (`cargo test`).
 
 ---
 

@@ -12,12 +12,29 @@ use std::path::PathBuf;
 
 use crate::layout::MAX_PANES;
 
+/// Push `path` onto a most-recent-first history: no duplicates, bounded.
+/// Comparison is case-insensitive because Windows paths are.
+pub fn push_recent(history: &mut Vec<String>, path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    history.retain(|p| !p.eq_ignore_ascii_case(path));
+    history.insert(0, path.to_string());
+    history.truncate(MAX_RECENT);
+}
+
+/// How many visited folders are kept. Enough to cover a session's worth of
+/// jumping about, short enough that the list stays pickable.
+pub const MAX_RECENT: usize = 20;
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Config {
     /// Panes on screen, 1..=MAX_PANES.
     pub pane_count: usize,
     pub theme_dark: bool,
     pub sidebar_visible: bool,
+    pub inspector: bool,
+    pub grid: bool,
     pub show_hidden: bool,
     /// One fraction of the body width per divider. Fractions rather than
     /// pixels so a window resize keeps the panes in proportion; an empty or
@@ -42,6 +59,12 @@ pub struct Config {
 
     /// Folders pinned into the sidebar's Places, in the order they were added.
     pub pins: Vec<String>,
+    /// Shortcuts that differ from the defaults, as (chord text, command
+    /// label). An empty chord means the command has had its shortcut removed.
+    pub binds: Vec<(String, String)>,
+    /// Folders visited, most recent first. Bounded by `MAX_RECENT`: a history
+    /// is a shortcut, not a log.
+    pub recent: Vec<String>,
     /// Sort key and direction per pane, as `(key, ascending)`.
     pub sort: Vec<(u8, bool)>,
     /// Type, Size and Date column widths in DIPs — not pixels, so a settings
@@ -57,8 +80,12 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pane_count: 1,
-            theme_dark: true,
+            // No saved preference means "whatever Windows is set to". Once the
+            // user toggles the theme the key is written and wins from then on.
+            theme_dark: crate::theme::system_dark(),
             sidebar_visible: true,
+            inspector: false,
+            grid: false,
             show_hidden: false,
             splits: Vec::new(),
             win_x: UNSET,
@@ -71,6 +98,8 @@ impl Default for Config {
             tabs: vec![Vec::new(); MAX_PANES],
             active_tab: vec![0; MAX_PANES],
             pins: Vec::new(),
+            recent: Vec::new(),
+            binds: Vec::new(),
             sort: vec![(0, true); MAX_PANES],
             col_widths: [96, 84, 124],
         }
@@ -145,6 +174,8 @@ impl Config {
              pane_count={}\n\
              theme_dark={}\n\
              sidebar_visible={}\n\
+             inspector={}\n\
+             grid={}\n\
              show_hidden={}\n\
              splits={}\n\
              win_x={}\n\
@@ -158,6 +189,8 @@ impl Config {
             self.pane_count,
             self.theme_dark,
             self.sidebar_visible,
+            self.inspector,
+            self.grid,
             self.show_hidden,
             join_splits(&self.splits),
             self.win_x,
@@ -182,6 +215,13 @@ impl Config {
         let mut out = String::new();
         for p in &self.pins {
             out.push_str(&format!("pin={}\n", p));
+        }
+        for (chord, label) in &self.binds {
+            out.push_str(&format!("bind={}={}
+", chord, label));
+        }
+        for p in self.recent.iter().take(MAX_RECENT) {
+            out.push_str(&format!("recent={}\n", p));
         }
         for (i, (key, asc)) in self.sort.iter().enumerate() {
             if (*key, *asc) != (0, true) {
@@ -229,6 +269,8 @@ impl Config {
                 "sidebar_visible" => {
                     c.sidebar_visible = value.parse().unwrap_or(c.sidebar_visible)
                 }
+                "inspector" => c.inspector = value.parse().unwrap_or(c.inspector),
+                "grid" => c.grid = value.parse().unwrap_or(c.grid),
                 "show_hidden" => c.show_hidden = value.parse().unwrap_or(c.show_hidden),
                 "splits" => c.splits = parse_splits(value),
                 "win_x" => c.win_x = value.parse().unwrap_or(c.win_x),
@@ -241,6 +283,20 @@ impl Config {
                 "pin" => {
                     if !value.is_empty() {
                         c.pins.push(value.to_string());
+                    }
+                }
+                "bind" => {
+                    // `bind=<chord>=<command label>`. The label can contain
+                    // anything, so the split is at the *first* "=" only.
+                    if let Some((chord, label)) = value.split_once('=') {
+                        if !label.is_empty() {
+                            c.binds.push((chord.to_string(), label.to_string()));
+                        }
+                    }
+                }
+                "recent" => {
+                    if !value.is_empty() && c.recent.len() < MAX_RECENT {
+                        c.recent.push(value.to_string());
                     }
                 }
                 "col_widths" => c.col_widths = parse_widths(value, c.col_widths),
@@ -271,11 +327,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recent_is_most_recent_first_deduplicated_and_bounded() {
+        // Plain names: push_recent cares about order, case and count, not about
+        // what a path looks like.
+        let mut h = Vec::new();
+        push_recent(&mut h, "alpha");
+        push_recent(&mut h, "beta");
+        push_recent(&mut h, "ALPHA");
+        assert_eq!(h, vec!["ALPHA".to_string(), "beta".to_string()]);
+
+        push_recent(&mut h, "");
+        assert_eq!(h.len(), 2, "an empty path is not a visit");
+
+        for i in 0..MAX_RECENT + 5 {
+            push_recent(&mut h, &format!("dir{}", i));
+        }
+        assert_eq!(h.len(), MAX_RECENT);
+        assert_eq!(h[0], format!("dir{}", MAX_RECENT + 4));
+    }
+
+    #[test]
     fn round_trips() {
         let c = Config {
             pane_count: 3,
             theme_dark: false,
             sidebar_visible: false,
+            inspector: true,
+            grid: true,
             show_hidden: true,
             splits: vec![0.25, 0.75],
             win_x: -1400,
@@ -293,6 +371,13 @@ mod tests {
             ],
             active_tab: vec![1, 0, 0, 0],
             pins: vec!["C:\\pinned".into()],
+            recent: vec![r"C:\Users".into(), r"D:\work".into()],
+            binds: vec![
+                ("Ctrl+Q".into(), "Refresh".into()),
+                // An empty chord is how a removed shortcut is recorded, and it
+                // has to survive the round trip or unbinding would not stick.
+                (String::new(), "Toggle sidebar".into()),
+            ],
             sort: vec![(2, false), (0, true), (0, true), (1, true)],
             col_widths: [110, 90, 130],
         };

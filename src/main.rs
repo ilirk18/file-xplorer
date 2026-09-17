@@ -26,13 +26,16 @@ mod file_list;
 mod fs;
 mod icons;
 mod input;
+mod keys;
 mod layout;
 mod menu;
 mod ops;
 mod palette;
 mod pane;
 mod pidl;
+mod preview;
 mod prompt;
+mod rename;
 mod renderer;
 mod search;
 mod shellmenu;
@@ -143,6 +146,13 @@ fn main() -> Result<()> {
             if r.0 <= 0 {
                 break;
             }
+            // The inline rename box is a real EDIT and swallows Enter and
+            // Escape before the window procedure can see them.
+            if let Some(state) = state_of(hwnd) {
+                if rename::handle_key(hwnd, state, &msg) {
+                    continue;
+                }
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -150,6 +160,29 @@ fn main() -> Result<()> {
         OleUninitialize();
     }
     Ok(())
+}
+
+/// The inspector's facts, built before `paint` destructures `state` and
+/// therefore owning its strings.
+struct InspectorView {
+    name: Option<String>,
+    kind: String,
+    size: String,
+    modified: String,
+}
+
+/// Rows a full wheel notch moves. Windows' own default; reading
+/// SPI_GETWHEELSCROLLLINES would honour the user's setting, which nothing has
+/// asked for yet.
+const WHEEL_ROWS: i32 = 3;
+
+/// The `AppState` hanging off the main window.
+///
+/// The message pump needs it before dispatch, where the window procedure's own
+/// borrow does not exist yet. Read-only: anything that changes state goes
+/// through a posted message like every other input.
+unsafe fn state_of(hwnd: HWND) -> Option<&'static AppState> {
+    (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AppState).as_ref()
 }
 
 /// Match the title bar to the app's theme. Without this a dark app sits under a
@@ -251,6 +284,11 @@ fn handle(
         WM_ERASEBKGND => Some(LRESULT(1)),
 
         WM_SIZE => {
+            // The editor is placed at a rectangle a resize invalidates, and
+            // there is nothing sensible to do with a box that no longer sits
+            // over its row. Committing here would apply a half-typed name to
+            // a window drag, so this one abandons.
+            commands::finish_rename(state, hwnd, false);
             let w = loword(lparam.0 as u32).max(0);
             let h = hiword(lparam.0 as u32).max(0);
             state.client = Rect::new(0, 0, w, h);
@@ -358,6 +396,10 @@ fn handle(
                 if let (true, Some(to)) = (far, state.layout().pane_at(x, y)) {
                     if to != from {
                         move_tab(state, hwnd, from, index, to);
+                    } else if let Some(target) = tab_drop_index(state, to, x, y) {
+                        if state.pane_mut(to).reorder_tab(index, target) {
+                            invalidate(hwnd);
+                        }
                     }
                 }
             }
@@ -416,6 +458,9 @@ fn handle(
         }
 
         WM_MOUSEWHEEL => {
+            // Same reasoning as WM_SIZE: scrolling moves the row out from
+            // under the box.
+            commands::finish_rename(state, hwnd, false);
             let delta = hiword(wparam.0 as u32);
             let mut pt = POINT {
                 x: loword(lparam.0 as u32),
@@ -437,9 +482,13 @@ fn handle(
             // Scroll whatever the pointer is over, which is what people expect,
             // without stealing keyboard focus from another pane.
             let pid = layout.pane_at(pt.x, pt.y).unwrap_or(state.focused);
-            let lines = if delta > 0 { -3 } else { 3 };
+            // In pixels rather than rows, so a precision touchpad reporting
+            // less than a notch moves the list by less than a row. A mouse
+            // wheel still sends exactly WHEEL_DELTA and still moves three.
             let h = layout.pane(pid).list.h.max(0) as u32;
-            state.pane_mut(pid).list_mut().scroll_by(lines, h);
+            let step = layout.metrics.row_h * WHEEL_ROWS;
+            let dy = -delta * step / WHEEL_DELTA as i32;
+            state.pane_mut(pid).list_mut().scroll_by_px(dy, h);
             state.mirror_scroll(pid);
             invalidate(hwnd);
             Some(LRESULT(0))
@@ -469,9 +518,57 @@ fn handle(
             None
         }
 
+        // Enter or Escape in the inline rename box, turned into a message by
+        // the pump because the EDIT control itself consumes both keys.
+        rename::WM_APP_RENAME_DONE => {
+            commands::finish_rename(state, hwnd, wparam.0 != 0);
+            Some(LRESULT(0))
+        }
+
+        // Clicking away, or anything else that takes focus off the box, commits
+        // what was typed. That is what every in-place rename in Windows does,
+        // and the alternative — silently discarding it — loses work.
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as i32;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            if id == rename::IDC_INLINE_EDIT && code == EN_KILLFOCUS {
+                commands::finish_rename(state, hwnd, true);
+                return Some(LRESULT(0));
+            }
+            None
+        }
+
+        WM_APP_THUMB_READY => {
+            let payload = unsafe {
+                Box::from_raw(lparam.0 as *mut (String, Option<windows::Win32::Graphics::Gdi::HBITMAP>))
+            };
+            let (key, bmp) = *payload;
+            state.finish_thumb(key, bmp);
+            invalidate(hwnd);
+            Some(LRESULT(0))
+        }
+
+        WM_APP_PREVIEW_READY => {
+            let payload = unsafe { Box::from_raw(lparam.0 as *mut (String, preview::Preview)) };
+            let (key, built) = *payload;
+            // A selection that moved on while the worker read the file: drop
+            // the result rather than showing the wrong file's contents.
+            if state.preview_pending.as_deref() == Some(key.as_str()) {
+                state.preview_pending = None;
+                state.preview = Some((key, built));
+                invalidate(hwnd);
+            }
+            Some(LRESULT(0))
+        }
+
         WM_APP_DIR_LOADED => {
+            // A listing that changed underneath the editor leaves it pointing
+            // at whatever row now has that index. Abandon rather than rename
+            // the wrong file.
+            commands::finish_rename(state, hwnd, false);
             let payload = unsafe { Box::from_raw(lparam.0 as *mut DirLoaded) };
             let pid = payload.pid;
+            let path = payload.req.path.clone();
             let h = state.list_height(pid);
             let changed = state.pane_mut(pid).finish_load(
                 payload.req.tab_id,
@@ -482,6 +579,14 @@ fn handle(
                 h,
             );
             if changed {
+                // A folder that actually opened is one worth offering again,
+                // and one whose remembered sort now applies. Both are keyed on
+                // the load finishing rather than on the request, so a path that
+                // failed to read never joins the history.
+                state.remember_visit(&path);
+                if let Some((key, order)) = state.sort_for(&path) {
+                    state.pane_mut(pid).list_mut().set_sort(key, order);
+                }
                 state.rewatch(pid, hwnd);
                 invalidate(hwnd);
             }
@@ -636,6 +741,17 @@ fn handle(
 
 
 /// Move a tab from one pane to another, keeping its listing and history.
+/// Where a tab dropped at (x, y) lands within its own pane: onto another tab,
+/// that tab's slot; onto the new-tab button or the strip past the last tab, the
+/// end. Anywhere else is not a reorder.
+fn tab_drop_index(state: &AppState, pid: PaneId, x: i32, y: i32) -> Option<usize> {
+    match state.layout().hit_test(x, y) {
+        Hit::Tab(p, i) if p == pid => Some(i),
+        Hit::NewTab(p) if p == pid => Some(state.pane(pid).tabs.len() - 1),
+        _ => None,
+    }
+}
+
 fn move_tab(state: &mut AppState, hwnd: HWND, from: PaneId, index: usize, to: PaneId) {
     let Some(tab) = state.pane_mut(from).take_tab(index) else {
         return;
@@ -653,6 +769,15 @@ fn move_tab(state: &mut AppState, hwnd: HWND, from: PaneId, index: usize, to: Pa
 // ---------------------------------------------------------------------------
 
 fn paint(state: &mut AppState, hwnd: HWND) {
+    // The one place that sees the selection after every way of changing it —
+    // arrows, clicks, a drag band, type-ahead, a reload. Spawns a worker at
+    // most; the disk work is not done here.
+    state.sync_columns();
+    state.ensure_preview(hwnd);
+    state.ensure_thumbs(hwnd);
+    let cache = std::mem::take(&mut state.thumbs);
+    state.renderer.prune_cells(&cache);
+    state.thumbs = cache;
     if !state.renderer.has_target() {
         let _ = state
             .renderer
@@ -663,6 +788,17 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     let current = state.focused_pane().current_path().to_string();
     let state_drag = match state.drag {
         Drag::Divider { index, .. } => Some(index),
+        _ => None,
+    };
+    let renaming = state.rename.as_ref().map(|r| (r.pid, r.row));
+    // Clipped to the rows here rather than while dragging, so the selection
+    // still follows a mouse that has left the pane.
+    let band = match state.drag {
+        Drag::Band {
+            pid,
+            origin,
+            cursor,
+        } => Some((pid, Rect::between(origin, cursor).clamp_to(layout.pane(pid).list))),
         _ => None,
     };
     let hover = state.hover;
@@ -690,11 +826,29 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     };
     update_title(state, hwnd);
 
+    // Built before the destructure: it reads the focused pane's cursor entry,
+    // which `panes` would otherwise be holding.
+    let inspector = {
+        let entry = state.focused_pane().list().cursor_entry();
+        InspectorView {
+            name: entry.map(|e| e.name.clone()),
+            kind: entry.map(|e| e.type_display()).unwrap_or_default(),
+            size: entry.map(|e| e.size_display()).unwrap_or_default(),
+            modified: entry.map(|e| e.date_display()).unwrap_or_default(),
+        }
+    };
+
     // Destructure so the renderer can be borrowed mutably while the panes are
     // borrowed immutably. Borrowing through `state` would conflict.
     let AppState {
-        renderer, panes, ..
+        renderer,
+        panes,
+        preview,
+        thumbs,
+        grid,
+        ..
     } = state;
+    let grid = *grid;
 
     renderer.begin();
     renderer.draw_sidebar(
@@ -706,6 +860,17 @@ fn paint(state: &mut AppState, hwnd: HWND) {
             current_path: &current,
             tree: &tree_rows,
             hover,
+        },
+    );
+
+    renderer.draw_inspector(
+        &layout,
+        &renderer::InspectorView {
+            name: inspector.name.as_deref(),
+            kind: inspector.kind,
+            size: inspector.size,
+            modified: inspector.modified,
+            preview: preview.as_ref().map(|(k, p)| (k.as_str(), p)),
         },
     );
 
@@ -728,6 +893,9 @@ fn paint(state: &mut AppState, hwnd: HWND) {
             can_forward: pane.active().can_go_forward(),
             can_up: fs::path_parent(pane.current_path()).is_some(),
             filter_focused: filter_focus == Some(pid),
+            renaming: renaming.filter(|(p, _)| *p == pid).map(|(_, row)| row),
+            thumbs: grid.then_some((thumbs, pane.current_path())),
+            band: band.filter(|(p, _)| *p == pid).map(|(_, r)| r),
             counts: &counts[pid.0],
             other_names: comparing.then(|| &names[(pid.0 + 1) % names.len()]),
         };

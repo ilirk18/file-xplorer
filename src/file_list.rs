@@ -57,7 +57,18 @@ pub struct FileList {
     /// Empty until "Compare contents" is run, and cleared on navigation.
     pub differing: HashSet<String>,
     pub scroll_offset: u32,
+    /// Pixels scrolled *within* the top row, 0..row_height. Only the wheel
+    /// sets it; every other way of moving the list lands on a row boundary,
+    /// because a keyboard move to a half-visible row is not a thing anyone
+    /// means. Keeping it beside the row index rather than replacing it means
+    /// the scrollbar, `max_scroll` and every existing caller stay in rows.
+    pub scroll_frac: i32,
+    /// Height of one line, which is a row in the details view and a cell in
+    /// the icon view.
     pub row_height: u32,
+    /// Entries per line. 1 in the details view; the icon view is the same list
+    /// with a wider line, which is why nothing else here changes.
+    pub columns: u32,
     pub sort_key: SortKey,
     pub sort_order: SortOrder,
     pub show_hidden: bool,
@@ -80,7 +91,9 @@ impl Default for FileList {
             dir_sizes: HashMap::new(),
             differing: HashSet::new(),
             scroll_offset: 0,
+            scroll_frac: 0,
             row_height: 24,
+            columns: 1,
             sort_key: SortKey::Name,
             sort_order: SortOrder::Asc,
             show_hidden: false,
@@ -94,17 +107,22 @@ impl Default for FileList {
 impl FileList {
     // -- geometry ----------------------------------------------------------
 
-    /// Visible row range as (start, end_exclusive).
+    /// Visible entry range as (start, end_exclusive).
+    ///
+    /// In indices, not lines, so the painter iterates entries either way. One
+    /// extra line is included because the top one is usually part-scrolled and
+    /// the bottom one part-visible.
     pub fn visible_range(&self, client_height: u32) -> (u32, u32) {
         if self.entries.is_empty() {
             return (0, 0);
         }
-        let start = self.scroll_offset;
-        let end = (start + self.visible_row_count(client_height) + 1).min(self.entries.len() as u32);
-        (start, end)
+        let cols = self.columns.max(1);
+        let start = self.scroll_offset * cols;
+        let span = (self.visible_row_count(client_height) + 1) * cols;
+        (start, start.saturating_add(span).min(self.entries.len() as u32))
     }
 
-    /// Whole rows that fit in `client_height`.
+    /// Whole lines that fit in `client_height`.
     pub fn visible_row_count(&self, client_height: u32) -> u32 {
         if self.row_height == 0 {
             return 0;
@@ -116,21 +134,45 @@ impl FileList {
         self.entries.len() as u32
     }
 
+    /// Lines the entries occupy. The scrollbar measures against this, not
+    /// against the entry count.
+    pub fn total_lines(&self) -> u32 {
+        let cols = self.columns.max(1);
+        (self.entries.len() as u32).div_ceil(cols)
+    }
+
+    /// Furthest first-visible line, in lines.
     pub fn max_scroll(&self, client_height: u32) -> u32 {
         let visible = self.visible_row_count(client_height);
-        (self.entries.len() as u32).saturating_sub(visible)
+        self.total_lines().saturating_sub(visible)
+    }
+
+    /// How far the list is scrolled, in pixels. What the layout and the
+    /// painter position rows against.
+    pub fn scroll_px(&self) -> i32 {
+        self.scroll_offset as i32 * self.row_height as i32 + self.scroll_frac
     }
 
     pub fn scroll_to(&mut self, offset: u32, client_height: u32) {
         self.scroll_offset = offset.min(self.max_scroll(client_height));
+        self.scroll_frac = 0;
     }
 
-    pub fn scroll_by(&mut self, delta: i32, client_height: u32) {
-        let max = self.max_scroll(client_height) as i32;
-        self.scroll_offset = (self.scroll_offset as i32 + delta).clamp(0, max.max(0)) as u32;
+    /// Scroll by a pixel amount, for a wheel or a touchpad that reports less
+    /// than a whole notch. Normalises back into a row index and a remainder,
+    /// so nothing downstream has to know this happened.
+    pub fn scroll_by_px(&mut self, dy: i32, client_height: u32) {
+        let row_h = self.row_height as i32;
+        if row_h <= 0 {
+            return;
+        }
+        let max = self.max_scroll(client_height) as i32 * row_h;
+        let px = (self.scroll_px() + dy).clamp(0, max.max(0));
+        self.scroll_offset = (px / row_h) as u32;
+        self.scroll_frac = px % row_h;
     }
 
-    /// Scroll the minimum distance needed to bring `index` on screen.
+    /// Scroll the minimum distance needed to bring `index`'s line on screen.
     ///
     /// The old Up handler re-centred the viewport on every keypress whenever the
     /// list was scrolled at all, which made Up and Down behave differently and
@@ -140,10 +182,12 @@ impl FileList {
         if visible == 0 {
             return;
         }
-        if index < self.scroll_offset {
-            self.scroll_offset = index;
-        } else if index >= self.scroll_offset + visible {
-            self.scroll_offset = index.saturating_sub(visible).saturating_add(1);
+        self.scroll_frac = 0;
+        let line = index / self.columns.max(1);
+        if line < self.scroll_offset {
+            self.scroll_offset = line;
+        } else if line >= self.scroll_offset + visible {
+            self.scroll_offset = line.saturating_sub(visible).saturating_add(1);
         }
         self.scroll_offset = self.scroll_offset.min(self.max_scroll(client_height));
     }
@@ -194,6 +238,23 @@ impl FileList {
         if self.cursor.is_none() && !self.entries.is_empty() {
             self.cursor = Some(0);
             self.anchor = Some(0);
+        }
+    }
+
+    /// Select exactly `first..=last`, for a drag band.
+    ///
+    /// The cursor follows `moving_end` — the row under the mouse — so the
+    /// footer and any later keyboard move continue from where the drag is,
+    /// not from where it started.
+    pub fn select_indices(&mut self, indices: &[u32], moving_end: Option<u32>) {
+        let len = self.entries.len() as u32;
+        if len == 0 {
+            return;
+        }
+        self.selected = indices.iter().copied().filter(|i| *i < len).collect();
+        if let Some(end) = moving_end {
+            self.cursor = Some(end.min(len - 1));
+            self.anchor = self.cursor;
         }
     }
 
@@ -346,6 +407,17 @@ impl FileList {
         self.resort_preserving_selection();
     }
 
+    /// Apply a specific sort, for restoring the one a folder was last given.
+    /// Unlike `apply_sort` this never toggles: the caller knows the direction.
+    pub fn set_sort(&mut self, key: SortKey, order: SortOrder) {
+        if (self.sort_key, self.sort_order) == (key, order) {
+            return;
+        }
+        self.sort_key = key;
+        self.sort_order = order;
+        self.resort_preserving_selection();
+    }
+
     fn resort_preserving_selection(&mut self) {
         let sel: HashSet<String> = self
             .selected_entries()
@@ -390,6 +462,7 @@ impl FileList {
         self.all = entries;
         self.rebuild();
         self.scroll_offset = 0;
+        self.scroll_frac = 0;
         self.selected.clear();
         self.cursor = None;
         self.anchor = None;
@@ -410,6 +483,7 @@ impl FileList {
         self.rebuild();
         self.restore_selection(&sel, cursor_name.as_deref());
         self.scroll_offset = scroll.min(self.entries.len() as u32);
+        self.scroll_frac = 0;
     }
 
     /// Select a single entry by name, if present. Used when navigating up so
@@ -444,6 +518,7 @@ impl FileList {
         self.filter = filter.to_string();
         self.rebuild_preserving_selection();
         self.scroll_offset = 0;
+        self.scroll_frac = 0;
     }
 
     pub fn push_filter_char(&mut self, c: char) {
@@ -614,15 +689,36 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_by_clamps() {
+    fn test_scroll_by_px_clamps_and_splits_into_rows() {
         let mut list = list_of(&[("a", false), ("b", false), ("c", false), ("d", false), ("e", false)]);
         let h = 72u32; // 3 visible
-        list.scroll_by(1, h);
-        assert_eq!(list.scroll_offset, 1);
-        list.scroll_by(10, h);
-        assert_eq!(list.scroll_offset, 2); // max is 5 - 3
-        list.scroll_by(-10, h);
-        assert_eq!(list.scroll_offset, 0);
+        let row = list.row_height as i32; // 24
+
+        list.scroll_by_px(row, h);
+        assert_eq!((list.scroll_offset, list.scroll_frac), (1, 0));
+
+        // Part of a row: the remainder is kept rather than rounded away.
+        list.scroll_by_px(row / 2, h);
+        assert_eq!((list.scroll_offset, list.scroll_frac), (1, row / 2));
+        assert_eq!(list.scroll_px(), row + row / 2);
+
+        // Past the end clamps to the last whole row, remainder and all.
+        list.scroll_by_px(row * 10, h);
+        assert_eq!((list.scroll_offset, list.scroll_frac), (2, 0)); // max is 5 - 3
+        list.scroll_by_px(-row * 10, h);
+        assert_eq!((list.scroll_offset, list.scroll_frac), (0, 0));
+    }
+
+    #[test]
+    fn landing_on_a_row_clears_the_remainder() {
+        let mut list = list_of(&[("a", false), ("b", false), ("c", false), ("d", false), ("e", false)]);
+        let h = 72u32;
+        list.scroll_by_px(list.row_height as i32 / 2, h);
+        assert_ne!(list.scroll_frac, 0);
+        // Keyboard moves and explicit scrolls land on a boundary: a row half
+        // out of view is not something anyone asks for on purpose.
+        list.ensure_visible(4, h);
+        assert_eq!(list.scroll_frac, 0);
     }
 
     #[test]

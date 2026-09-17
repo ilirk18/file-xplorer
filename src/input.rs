@@ -113,6 +113,29 @@ pub fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             invalidate(hwnd);
             return;
         }
+        Drag::Band { pid, origin, .. } => {
+            state.drag = Drag::Band {
+                pid,
+                origin,
+                cursor: (x, y),
+            };
+            let layout = state.layout();
+            let p = layout.pane(pid);
+            let list = state.pane(pid).list();
+            let (scroll, total) = (list.scroll_px(), list.total_rows());
+            let covered = p.band_indices(layout::Rect::between(origin, (x, y)), scroll, total);
+            // The moving end is the entry under the mouse when there is one,
+            // and otherwise the last one the band reached.
+            let moving = p
+                .cell_at(x, y, scroll, total)
+                .or_else(|| covered.last().copied());
+            state
+                .pane_mut(pid)
+                .list_mut()
+                .select_indices(&covered, moving);
+            invalidate(hwnd);
+            return;
+        }
         Drag::None => {}
     }
 
@@ -145,8 +168,7 @@ pub fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
     if let Hit::ListBackground(pid) = hit {
         let p = layout.pane(pid);
         let list = state.pane(pid).list();
-        if let Some(row) = p.row_at(y, list.scroll_offset, layout.metrics.row_h, list.total_rows())
-        {
+        if let Some(row) = p.cell_at(x, y, list.scroll_px(), list.total_rows()) {
             hit = Hit::Row(pid, row);
         }
     }
@@ -243,6 +265,12 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
         Hit::Column(pid, key) => {
             state.focused = pid;
             state.pane_mut(pid).list_mut().apply_sort(key);
+            // Sorting by hand is a statement about this folder, so coming back
+            // to it later comes back to this order too.
+            let path = state.pane(pid).current_path().to_string();
+            let list = state.pane(pid).list();
+            let (k, o) = (list.sort_key, list.sort_order);
+            state.remember_sort(&path, k, o);
         }
 
         Hit::ColumnEdge(pid, key) => {
@@ -273,7 +301,7 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             state.focused = pid;
             let p = layout.pane(pid);
             let list = state.pane(pid).list();
-            let row = p.row_at(y, list.scroll_offset, layout.metrics.row_h, list.total_rows());
+            let row = p.cell_at(x, y, list.scroll_px(), list.total_rows());
             match row {
                 Some(row) => {
                     let mode = select_mode();
@@ -283,6 +311,15 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
                     if !ctrl_down() {
                         state.pane_mut(pid).list_mut().clear_selection();
                     }
+                    // Pressing in the empty space below the rows starts a
+                    // rubber band. Pressing on a row does not: there it means
+                    // "drag these files", which `drag_origin` already handles.
+                    state.drag = Drag::Band {
+                        pid,
+                        origin: (x, y),
+                        cursor: (x, y),
+                    };
+                    unsafe { SetCapture(hwnd) };
                 }
             }
         }
@@ -361,7 +398,7 @@ pub fn on_double_click(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
     state.focused = pid;
     let p = layout.pane(pid);
     let list = state.pane(pid).list();
-    let Some(row) = p.row_at(y, list.scroll_offset, layout.metrics.row_h, list.total_rows()) else {
+    let Some(row) = p.cell_at(x, y, list.scroll_px(), list.total_rows()) else {
         return;
     };
     state.pane_mut(pid).list_mut().select(row, SelectMode::Replace);
@@ -450,10 +487,35 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
     let alt = alt_down();
     let mode = select_mode();
 
+    // Bound chords win, and they are the only thing a person can change. What
+    // is left below is movement — arrows, paging, Tab, type-ahead — whose
+    // meaning shifts with Ctrl and Shift rather than naming a command.
+    //
+    // Consulting the table first also settles a conflict the old match had:
+    // `VK_LEFT if state.grid` came before `VK_LEFT if alt`, so Alt+Left moved
+    // the cursor in the icon view instead of going back.
+    let chord = crate::keys::Chord::new(vk.0, ctrl, shift, alt);
+    if let Some(cmd) = state.bindings.command_for(chord) {
+        run_command(state, hwnd, cmd);
+        invalidate(hwnd);
+        return true;
+    }
+
     let mut handled = true;
     match vk {
+        // Left and Right step one entry; Up and Down step one line, which in
+        // the icon view is a whole row of them. Same flat indices either way.
+        VK_LEFT | VK_RIGHT if state.grid => {
+            let delta = if vk == VK_LEFT { -1 } else { 1 };
+            let list = state.pane_mut(pid).list_mut();
+            if let Some(n) = list.move_cursor(delta, mode) {
+                list.ensure_visible(n, list_h);
+            }
+        }
+
         VK_UP | VK_DOWN => {
-            let delta = if vk == VK_UP { -1 } else { 1 };
+            let step = state.pane(pid).list().columns.max(1) as i32;
+            let delta = if vk == VK_UP { -step } else { step };
             if alt && vk == VK_UP {
                 let req = state.pane_mut(pid).navigate_up();
                 start_load(hwnd, pid, req);
@@ -471,7 +533,9 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
         }
 
         VK_PRIOR | VK_NEXT => {
-            let page = state.layout().pane(pid).visible_rows.max(1) as i32;
+            let layout = state.layout();
+            let p = layout.pane(pid);
+            let page = (p.visible_rows.max(1) * p.columns_per_line.max(1)) as i32;
             let delta = if vk == VK_PRIOR { -page } else { page };
             let list = state.pane_mut(pid).list_mut();
             if let Some(n) = list.move_cursor(delta, mode) {
@@ -491,22 +555,6 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
             }
         }
 
-        VK_RETURN => activate_selection(state, hwnd, pid),
-
-        VK_BACK => {
-            let req = state.pane_mut(pid).navigate_up();
-            start_load(hwnd, pid, req);
-        }
-
-        VK_LEFT if alt => {
-            let req = state.pane_mut(pid).go_back();
-            start_load(hwnd, pid, req);
-        }
-        VK_RIGHT if alt => {
-            let req = state.pane_mut(pid).go_forward();
-            start_load(hwnd, pid, req);
-        }
-
         VK_TAB if ctrl => {
             let delta = if shift { -1 } else { 1 };
             let req = state.pane_mut(pid).next_tab(delta);
@@ -517,13 +565,8 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
             state.focused = state.other_side();
         }
 
-        VK_F2 => do_rename(state, hwnd),
-        VK_F5 => {
-            let req = state.pane_mut(pid).refresh();
-            start_load(hwnd, pid, req);
-        }
-        VK_F6 => copy_or_move_to_other(state, hwnd, false),
-
+        // Plain Del is bound to the Delete command; this is Shift+Del, which
+        // is the same operation asking to skip the Recycle Bin.
         VK_DELETE => do_delete(state, hwnd, shift),
 
         VK_ESCAPE => {
@@ -590,6 +633,7 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
                 (true, true, 'C') => do_copy_path(state, hwnd),
                 (true, true, 'M') => copy_or_move_to_other(state, hwnd, true),
                 (true, true, 'D') => toggle_theme(state, hwnd),
+                (true, true, 'I') => run_command(state, hwnd, CMD_GRID),
                 _ => handled = false,
             }
         }

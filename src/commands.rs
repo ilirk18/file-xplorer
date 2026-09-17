@@ -59,13 +59,19 @@ pub const CMD_PIN: usize = 138;
 pub const CMD_REVEAL: usize = 139;
 pub const CMD_ARCHIVE: usize = 140;
 pub const CMD_COMPARE_CONTENT: usize = 141;
+pub const CMD_RECENT: usize = 142;
+pub const CMD_INSPECTOR: usize = 143;
+pub const CMD_GRID: usize = 144;
+pub const CMD_BIND: usize = 145;
 
 /// Everything the palette can reach. The context menu builds from the same
 /// list, so a command is described in exactly one place.
 pub struct CommandDef {
-    id: usize,
-    label: &'static str,
-    keys: &'static str,
+    pub id: usize,
+    pub label: &'static str,
+    /// The *default* shortcut. What is actually bound lives in
+    /// `AppState::bindings`, which is seeded from these and may then differ.
+    pub keys: &'static str,
 }
 
 pub const COMMANDS: &[CommandDef] = &[
@@ -90,6 +96,7 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_REFRESH, label: "Refresh", keys: "F5" },
     CommandDef { id: CMD_SELECT_ALL, label: "Select all", keys: "Ctrl+A" },
     CommandDef { id: CMD_GOTO, label: "Go to path", keys: "Ctrl+L" },
+    CommandDef { id: CMD_RECENT, label: "Recent folders", keys: "" },
     CommandDef { id: CMD_TERMINAL, label: "Open terminal here", keys: "" },
     CommandDef { id: CMD_COPY_PATH, label: "Copy path", keys: "Ctrl+Shift+C" },
     CommandDef { id: CMD_PIN, label: "Pin or unpin this folder", keys: "" },
@@ -109,6 +116,9 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_COMPARE, label: "Toggle compare panes", keys: "" },
     CommandDef { id: CMD_TOGGLE_HIDDEN, label: "Toggle hidden files", keys: "Ctrl+H" },
     CommandDef { id: CMD_TOGGLE_SIDEBAR, label: "Toggle sidebar", keys: "Ctrl+B" },
+    CommandDef { id: CMD_INSPECTOR, label: "Toggle inspector", keys: "Alt+P" },
+    CommandDef { id: CMD_GRID, label: "Toggle icon view", keys: "Ctrl+Shift+I" },
+    CommandDef { id: CMD_BIND, label: "Change a shortcut", keys: "" },
     CommandDef { id: CMD_TOGGLE_THEME, label: "Toggle dark / light theme", keys: "Ctrl+Shift+D" },
 ];
 
@@ -119,22 +129,32 @@ pub fn do_batch_rename(state: &mut AppState, hwnd: HWND) {
     }
     let pane = state.focused_pane();
     let dir = pane.current_path().to_string();
-    let names: Vec<String> = pane
+    // The date comes along because `{d}` needs it and only the listing has it.
+    // `format_filetime` yields "YYYY-MM-DD HH:MM"; the time half carries a colon,
+    // which is not legal in a file name, so only the date half is offered.
+    let items: Vec<batch_rename::Item> = pane
         .list()
         .selected_entries()
         .iter()
-        .map(|e| e.name.clone())
+        .map(|e| batch_rename::Item {
+            name: e.name.clone(),
+            date: fs::format_filetime(e.modified)
+                .split(' ')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        })
         .collect();
-    if names.is_empty() || dir.is_empty() {
+    if items.is_empty() || dir.is_empty() {
         return;
     }
 
     state.modal = true;
-    let pattern = batch_rename::prompt(hwnd, state.dpi, names.clone());
+    let pattern = batch_rename::prompt(hwnd, state.dpi, items.clone());
     state.modal = false;
 
     let Some(pattern) = pattern else { return };
-    let plan = batch_rename::plan(&names, &pattern);
+    let plan = batch_rename::plan(&items, &pattern);
     if plan.is_empty() {
         return;
     }
@@ -146,16 +166,39 @@ pub fn do_batch_rename(state: &mut AppState, hwnd: HWND) {
     spawn_op(hwnd, ops::Op::RenameMany { items });
 }
 
+/// Every command's id and default shortcut, for seeding the bindings.
+pub fn default_bindings() -> Vec<(usize, &'static str)> {
+    COMMANDS.iter().map(|c| (c.id, c.keys)).collect()
+}
+
+pub fn label_for(id: usize) -> &'static str {
+    COMMANDS
+        .iter()
+        .find(|c| c.id == id)
+        .map(|c| c.label)
+        .unwrap_or("")
+}
+
+pub fn id_for_label(label: &str) -> Option<usize> {
+    COMMANDS
+        .iter()
+        .find(|c| c.label.eq_ignore_ascii_case(label))
+        .map(|c| c.id)
+}
+
 /// Show every command, filtered as you type.
 pub fn show_palette(state: &mut AppState, hwnd: HWND) {
     if state.modal {
         return;
     }
+    // The shortcut shown is whatever is bound now, not the default baked into
+    // the table: a rebound command that still advertised its old chord would
+    // be worse than showing none.
     let items: Vec<palette::Item> = COMMANDS
         .iter()
         .map(|c| palette::Item {
             label: c.label.to_string(),
-            detail: c.keys.to_string(),
+            detail: state.bindings.text_for(c.id),
         })
         .collect();
 
@@ -374,6 +417,135 @@ pub fn do_goto(state: &mut AppState, hwnd: HWND) {
     let expanded = fs::expand_env(path);
     let req = state.pane_mut(pid).navigate(&expanded);
     spawn_dir_load(hwnd, pid, req);
+}
+
+/// Finish an inline rename: `commit` applies what was typed, otherwise the
+/// name is left alone. Either way the editor goes.
+///
+/// A name that is unchanged, empty, or illegal is not an error worth a message
+/// box here — the box is gone and the file is untouched, which is what
+/// abandoning an edit looks like. An illegal one does say why, because that is
+/// a typo the person meant to fix rather than a change of mind.
+pub fn finish_rename(state: &mut AppState, hwnd: HWND, commit: bool) {
+    let Some(editor) = state.rename.take() else {
+        return;
+    };
+    let new_name = editor.text();
+    let old_name = editor.old_name.clone();
+    let dir = state.pane(editor.pid).current_path().to_string();
+    drop(editor);
+    invalidate(hwnd);
+
+    if !commit || new_name.is_empty() || new_name == old_name {
+        return;
+    }
+    if let Err(e) = fs::validate_file_name(&new_name) {
+        report_error(hwnd, "Invalid name", &e.message());
+        return;
+    }
+    spawn_op(
+        hwnd,
+        ops::Op::Rename {
+            source: fs::path_join(&dir, &old_name),
+            new_name,
+        },
+    );
+}
+
+/// Pick a command, then type the chord it should answer to.
+///
+/// ponytail: the chord is typed as text rather than captured by pressing it.
+/// A capture box would be nicer and means a modal window whose whole job is to
+/// swallow every key including the ones that would otherwise close it; the
+/// parser has to exist either way, and this reuses the prompt already here.
+pub fn do_bind(state: &mut AppState, hwnd: HWND) {
+    if state.modal {
+        return;
+    }
+    let items: Vec<palette::Item> = COMMANDS
+        .iter()
+        .map(|c| palette::Item {
+            label: c.label.to_string(),
+            detail: state.bindings.text_for(c.id),
+        })
+        .collect();
+
+    state.modal = true;
+    let chosen = palette::pick(hwnd, state.dpi, "Change a shortcut", items);
+    state.modal = false;
+    let Some(i) = chosen else { return };
+    let id = COMMANDS[i].id;
+
+    let current = state.bindings.text_for(id);
+    let label = COMMANDS[i].label;
+    let Some(typed) = prompt_text(
+        hwnd,
+        state,
+        "Change a shortcut",
+        &format!("Keys for {} (empty to unbind):", label),
+        &current,
+    ) else {
+        return;
+    };
+
+    if typed.trim().is_empty() {
+        state.bindings.clear(id);
+        state.status_override = Some(format!("{} has no shortcut", label));
+        return;
+    }
+    let Some(chord) = crate::keys::Chord::parse(&typed) else {
+        report_error(
+            hwnd,
+            "Not a shortcut",
+            &format!(
+                "{} is not a key combination.\n\nWrite them like Ctrl+Shift+P, Alt+Left or F5.",
+                typed
+            ),
+        );
+        return;
+    };
+    // Say what it displaced, rather than letting a shortcut quietly stop working.
+    let taken = state
+        .bindings
+        .command_for(chord)
+        .filter(|other| *other != id)
+        .map(label_for);
+    state.bindings.set(chord, id);
+    state.status_override = Some(match taken {
+        Some(other) => format!("{} is now {}, taken from {}", chord.text(), label, other),
+        None => format!("{} is now {}", chord.text(), label),
+    });
+}
+
+/// Pick from the folders visited this session and before, most recent first.
+///
+/// The palette is the list widget we already have, and a recent folder is
+/// exactly what it is good at: a short list, filtered by typing.
+pub fn do_recent(state: &mut AppState, hwnd: HWND) {
+    if state.modal || state.recent.is_empty() {
+        if state.recent.is_empty() {
+            state.status_override = Some("No folders visited yet".into());
+        }
+        return;
+    }
+    let paths = state.recent.clone();
+    let items: Vec<palette::Item> = paths
+        .iter()
+        .map(|p| palette::Item {
+            label: fs::path_leaf(p),
+            detail: p.clone(),
+        })
+        .collect();
+
+    state.modal = true;
+    let chosen = palette::pick(hwnd, state.dpi, "Recent folders", items);
+    state.modal = false;
+
+    if let Some(i) = chosen {
+        let pid = state.focused;
+        let req = state.pane_mut(pid).navigate(&paths[i]);
+        spawn_dir_load(hwnd, pid, req);
+    }
 }
 
 /// Open a shell in the focused folder, or in the selected folder if there is one.
@@ -622,12 +794,25 @@ pub fn do_delete(state: &mut AppState, hwnd: HWND, permanent: bool) {
 }
 
 pub fn do_rename(state: &mut AppState, hwnd: HWND) {
-    let pane = state.focused_pane();
+    let pid = state.focused;
+    let pane = state.pane(pid);
     let Some(entry) = pane.list().cursor_entry() else {
         return;
     };
     let old_name = entry.name.clone();
     let source = fs::path_join(pane.current_path(), &old_name);
+
+    // Type over the name where it sits. The dialog stays as the fallback for a
+    // row that is not on screen — from the command palette, say, where the
+    // selection may be anywhere in the listing.
+    if !state.modal {
+        if let Some(row) = state.pane(pid).list().cursor() {
+            state.rename = crate::rename::InlineRename::begin(hwnd, state, pid, row);
+            if state.rename.is_some() {
+                return;
+            }
+        }
+    }
 
     let Some(new_name) = prompt_text(hwnd, state, "Rename", "New name:", &old_name) else {
         return;
@@ -693,12 +878,9 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
     let row = match hit {
         Hit::ListBackground(_) | Hit::Row(..) => {
             let list = state.pane(pid).list();
-            layout.pane(pid).row_at(
-                client.y,
-                list.scroll_offset,
-                layout.metrics.row_h,
-                list.total_rows(),
-            )
+            layout
+                .pane(pid)
+                .cell_at(client.x, client.y, list.scroll_px(), list.total_rows())
         }
         _ => None,
     };
@@ -728,51 +910,57 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
         let mut themed = crate::menu::ThemedMenu::new(state.theme, state.dpi);
         // A macro rather than a closure: a closure would hold `themed`
         // borrowed for the whole block, and the separators need it too.
+        // Cloned so the menu can be built while `state` is borrowed elsewhere;
+        // a few dozen entries per right-click is nothing.
+        let binds = state.bindings.clone();
+        // The shortcut shown is whatever is bound now. Written out beside each
+        // entry it would be a second copy of the binding, free to drift from
+        // the one that actually fires.
         macro_rules! add {
-            ($cond:expr, $id:expr, $text:expr, $accel:expr) => {
+            ($cond:expr, $id:expr, $text:expr) => {
                 if $cond {
-                    themed.add(menu, $id, $text, $accel);
+                    themed.add(menu, $id, $text, &binds.text_for($id));
                 }
             };
         }
 
         if row.is_some() {
             // What you clicked on.
-            add!(true, CMD_OPEN, "Open", "Enter");
-            add!(folder && count == 1, CMD_OPEN_NEW_TAB, "Open in new tab", "");
-            add!(folder && count == 1, CMD_TERMINAL, "Open terminal here", "");
+            add!(true, CMD_OPEN, "Open");
+            add!(folder && count == 1, CMD_OPEN_NEW_TAB, "Open in new tab");
+            add!(folder && count == 1, CMD_TERMINAL, "Open terminal here");
             themed.separator(menu);
-            add!(writable, CMD_CUT, "Cut", "Ctrl+X");
-            add!(true, CMD_COPY, "Copy", "Ctrl+C");
-            add!(true, CMD_COPY_PATH, "Copy path", "Ctrl+Shift+C");
-            add!(state.pane_count > 1, CMD_COPY_TO_OTHER, "Copy to next pane", "F6");
-            add!(state.pane_count > 1 && writable, CMD_MOVE_TO_OTHER, "Move to next pane", "Ctrl+Shift+M");
-            add!(in_archive, CMD_EXTRACT, "Extract here", "");
-            add!(writable && !in_archive, CMD_ARCHIVE, "Add to archive\u{2026}", "");
+            add!(writable, CMD_CUT, "Cut");
+            add!(true, CMD_COPY, "Copy");
+            add!(true, CMD_COPY_PATH, "Copy path");
+            add!(state.pane_count > 1, CMD_COPY_TO_OTHER, "Copy to next pane");
+            add!(state.pane_count > 1 && writable, CMD_MOVE_TO_OTHER, "Move to next pane");
+            add!(in_archive, CMD_EXTRACT, "Extract here");
+            add!(writable && !in_archive, CMD_ARCHIVE, "Add to archive\u{2026}");
             themed.separator(menu);
-            add!(writable && count == 1, CMD_RENAME, "Rename", "F2");
-            add!(writable && count > 1, CMD_BATCH_RENAME, "Rename all", "Ctrl+Shift+R");
-            add!(writable, CMD_DELETE, "Delete", "Del");
+            add!(writable && count == 1, CMD_RENAME, "Rename");
+            add!(writable && count > 1, CMD_BATCH_RENAME, "Rename all");
+            add!(writable, CMD_DELETE, "Delete");
             themed.separator(menu);
-            add!(count == 1, CMD_PROPERTIES, "Properties", "");
+            add!(count == 1, CMD_PROPERTIES, "Properties");
         } else {
             // What this folder can do. Everything else lives in the palette,
             // which is one line further down and searchable.
-            add!(writable, CMD_NEW_FOLDER, "New folder", "Ctrl+Shift+N");
+            add!(writable, CMD_NEW_FOLDER, "New folder");
             let can_paste = writable && ops::clipboard_read(hwnd).is_some();
-            add!(can_paste, CMD_PASTE, "Paste", "Ctrl+V");
-            add!(in_archive, CMD_EXTRACT, "Extract all", "");
+            add!(can_paste, CMD_PASTE, "Paste");
+            add!(in_archive, CMD_EXTRACT, "Extract all");
             themed.separator(menu);
-            add!(true, CMD_GOTO, "Go to path\u{2026}", "Ctrl+L");
-            add!(true, CMD_TERMINAL, "Open terminal here", "");
-            add!(true, CMD_PIN, if pinned { "Unpin this folder" } else { "Pin this folder" }, "");
-            add!(true, CMD_REVEAL, "Show in tree", "");
+            add!(true, CMD_GOTO, "Go to path\u{2026}");
+            add!(true, CMD_TERMINAL, "Open terminal here");
+            add!(true, CMD_PIN, if pinned { "Unpin this folder" } else { "Pin this folder" });
+            add!(true, CMD_REVEAL, "Show in tree");
             themed.separator(menu);
-            add!(true, CMD_SEARCH, "Search here", "Ctrl+Shift+F");
-            add!(true, CMD_CALC_SIZES, "Calculate folder sizes", "");
-            add!(true, CMD_REFRESH, "Refresh", "F5");
+            add!(true, CMD_SEARCH, "Search here");
+            add!(true, CMD_CALC_SIZES, "Calculate folder sizes");
+            add!(true, CMD_REFRESH, "Refresh");
             themed.separator(menu);
-            add!(true, CMD_PALETTE, "All commands\u{2026}", "Ctrl+Shift+P");
+            add!(true, CMD_PALETTE, "All commands\u{2026}");
         }
         themed.apply(menu);
 
@@ -840,6 +1028,8 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_EXTRACT => do_extract(state, hwnd),
         CMD_PALETTE => show_palette(state, hwnd),
         CMD_GOTO => do_goto(state, hwnd),
+        CMD_RECENT => do_recent(state, hwnd),
+        CMD_BIND => do_bind(state, hwnd),
         CMD_TERMINAL => do_terminal(state, hwnd),
         CMD_COPY_PATH => do_copy_path(state, hwnd),
         CMD_PIN => {
@@ -857,6 +1047,29 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_TOGGLE_HIDDEN => toggle_hidden(state, hwnd),
         CMD_TOGGLE_SIDEBAR => {
             state.sidebar_visible = !state.sidebar_visible;
+            state.clamp_split();
+        }
+        CMD_GRID => {
+            state.grid = !state.grid;
+            // The cursor keeps its index, so whatever was selected stays
+            // selected; only the shape it is drawn in changes. Scroll is in
+            // lines and a line now holds a different number of entries, so it
+            // is re-derived from the cursor rather than carried over.
+            state.sync_columns();
+            let pid = state.focused;
+            let h = state.list_height(pid);
+            if let Some(c) = state.pane(pid).list().cursor() {
+                state.pane_mut(pid).list_mut().ensure_visible(c, h);
+            }
+        }
+        CMD_INSPECTOR => {
+            state.inspector = !state.inspector;
+            // Hiding it drops what it was holding, which for an image is a
+            // bitmap worth megabytes.
+            if !state.inspector {
+                state.preview = None;
+                state.preview_pending = None;
+            }
             state.clamp_split();
         }
         CMD_SINGLE_PANE => set_pane_count(state, 1),
@@ -905,5 +1118,55 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         _ => return,
     }
     invalidate(hwnd);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_default_shortcut_in_the_table_is_a_real_chord() {
+        // The table's `keys` text is not documentation any more, it is the
+        // binding. A typo here would silently leave a command unreachable.
+        for c in COMMANDS {
+            if c.keys.is_empty() {
+                continue;
+            }
+            let chord = crate::keys::Chord::parse(c.keys)
+                .unwrap_or_else(|| panic!("{}: {:?} is not a chord", c.label, c.keys));
+            assert_eq!(
+                chord.text(),
+                c.keys,
+                "{}: write it the way it is displayed",
+                c.label
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_commands_claim_the_same_default_chord() {
+        let b = crate::keys::Bindings::from_defaults(&default_bindings());
+        for c in COMMANDS {
+            if c.keys.is_empty() {
+                continue;
+            }
+            let chord = crate::keys::Chord::parse(c.keys).unwrap();
+            assert_eq!(
+                b.command_for(chord),
+                Some(c.id),
+                "{} lost {} to another command",
+                c.label,
+                c.keys
+            );
+        }
+    }
+
+    #[test]
+    fn command_ids_and_labels_resolve_both_ways() {
+        for c in COMMANDS {
+            assert_eq!(id_for_label(c.label), Some(c.id), "{}", c.label);
+            assert_eq!(label_for(c.id), c.label);
+        }
+    }
 }
 
