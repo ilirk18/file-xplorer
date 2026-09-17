@@ -1,0 +1,52 @@
+# Push a tag, get a release. `git tag v0.3.0 && git push origin v0.3.0`.
+#
+# Tests run again here rather than trusting CI's word for it: the thing being
+# published has to be the thing that passed, built from this tag on a clean
+# runner. A release is the one place where "it worked on the last commit" is
+# not good enough.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup show active-toolchain || rustup toolchain install stable
+
+      - name: Test
+        run: cargo test
+
+      - name: Build release
+        run: cargo build --release
+
+      # Published beside the exe: winget and scoop manifests both want it, and
+      # it is the only way anyone can check what they downloaded.
+      - name: Checksum
+        run: |
+          $exe = "target\release\jamb.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  jamb.exe" | Out-File -Encoding ascii jamb.exe.sha256
+          "{0:N0} bytes ({1:N2} MB), sha256 {2}" -f (Get-Item $exe).Length, ((Get-Item $exe).Length / 1MB), $hash
+
+      # gh ships on the runner, so this needs no third-party action.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create ${{ github.ref_name }}
+          target\release\jamb.exe
+          jamb.exe.sha256
+          --generate-notes

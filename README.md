@@ -1,30 +1,34 @@
 # Jamb
 
-A fast, native, multi-pane file manager for Windows. Win32 + Direct2D, no
+A fast, native, multi-pane file manager for Windows. Win32 and Direct2D, no
 runtime, no framework, under a megabyte.
 
 **Repo:** [github.com/ilirk18/jamb](https://github.com/ilirk18/jamb) · **Docs:** [docs/INDEX.md](docs/INDEX.md)
 
 ---
 
-## Requirements
+## Install
+
+Download `jamb.exe` from [Releases](https://github.com/ilirk18/jamb/releases)
+and run it. There is no installer and nothing to ship alongside it.
+
+Windows will warn you about an unsigned binary the first time. That is
+SmartScreen doing its job; the alternative is a code-signing certificate, which
+costs money this project does not have.
+
+## Build from source
 
 - **Rust** ([rustup](https://rustup.rs/))
-- **Windows 10 1703+** (Direct2D, DirectWrite, WIC, `IFileOperation`, per-monitor DPI v2)
-
-## Build and run
+- **Windows 10 1703 or later** (Direct2D, DirectWrite, WIC, `IFileOperation`, per-monitor DPI v2)
 
 ```bash
 cargo run --release
 ```
 
-The executable lands at `target/release/jamb.exe`. It is self-contained:
-no installer, no DLLs to ship.
+The executable lands at `target/release/jamb.exe`.
 
-### If `cargo` is not recognised
-
-Install Rust from [rustup.rs](https://rustup.rs/), then open a new terminal so
-`PATH` picks up `%USERPROFILE%\.cargo\bin`.
+If `cargo` is not recognised, install Rust from [rustup.rs](https://rustup.rs/)
+and open a new terminal so `PATH` picks up `%USERPROFILE%\.cargo\bin`.
 
 ---
 
@@ -46,6 +50,24 @@ tabs, so `Ctrl+1` then `Ctrl+2` comes back to what was there.
 Every tab keeps its own listing, scroll position, selection, and back/forward
 history, so switching tabs is instant. Open tabs are restored at startup; only
 the active one loads, the rest read when first shown.
+
+**Two rows of chrome, not four.** The window has no system title bar. The client
+area runs up to the top edge and the panes on the top row put their tab strips
+there, beside the app icon, the sidebar toggle and the window buttons. Empty
+space in that strip drags the window, the edges still resize it, and hovering
+Maximise still offers Windows' snap layouts.
+
+When there are more tabs than fit, they stop shrinking at a width that still
+reads and the strip scrolls to keep the active one in view. A squeezed tab drops
+its close button before its name, because the name is the only thing telling
+tabs apart and `Ctrl+W` closes one either way.
+
+**An overflow menu per pane.** The `⋮` at the right end of a breadcrumb row
+opens New, Cut, Copy, Paste, Rename, Delete, Share, Sort, View and every
+setting, acting on the pane it hangs off. Entries grey out when they would not
+work. The same row carries Home and a pin toggle, which lights up when the
+folder showing is already pinned. It is a second way to reach the commands,
+never a second implementation of them.
 
 **Real file operations.** Copy, move, delete, rename, and new-folder all run
 through the shell's `IFileOperation`. That means you get the Recycle Bin, the
@@ -71,30 +93,31 @@ archives: one guard refuses every destructive path into them rather than each
 command remembering to.
 
 **Icon view, at whatever size suits.** `Ctrl+Shift+I` lays the listing out as
-cells instead of rows, and `Ctrl+wheel` steps the icon through seven sizes from
-32 to 256 — stepping below the smallest is the details list again, because the
-view is one number rather than a mode with a flag beside it. The size is
-remembered per folder along with its sort.
-
-`Ctrl+Shift+I` lays the listing out as cells instead of rows,
-each showing the shell's own thumbnail — the same one Explorer draws, so
-whatever handler is installed does the work — with the file-type icon in its
-place until one arrives and for everything that has none. Images are fetched
-only for what is on screen, on worker threads, and cached with a ceiling.
+cells instead of rows, each showing the shell's own thumbnail — the same one
+Explorer draws, so whatever handler is installed does the work — with the
+file-type icon in its place until one arrives and for everything that has none.
+`Ctrl+wheel` steps the icon through seven sizes from 32 to 256, and stepping
+below the smallest is the details list again, because the view is one number
+rather than a mode with a flag beside it. Images are fetched only for what is on
+screen, on worker threads, and cached with a ceiling. The size is remembered per
+folder along with its sort.
 
 **Inspector.** `Alt+P` opens a panel on the right showing what the cursor is
-on: the shell's own thumbnail for an image, video, PDF or Office file — the
-same call Explorer makes, so whatever handler is installed does the work — or
-the first 64 KB of anything that reads as text, UTF-16 included. Built on a
-worker thread, never on the UI thread, and a result whose file is no longer
-selected is dropped rather than shown against the wrong name. With nothing
-selected it describes the folder you are standing in instead, because a panel
-whose only content is a sentence saying it has none reads as broken.
-Right-clicking it opens the menu for whatever it is describing.
+on: the shell's own thumbnail for an image, video, PDF or Office file, or the
+first 64 KB of anything that reads as text, UTF-16 included. Built on a worker
+thread, never on the UI thread, and a result whose file is no longer selected is
+dropped rather than shown against the wrong name. With nothing selected it
+describes the folder you are standing in instead, because a panel whose only
+content is a sentence saying it has none reads as broken. Right-clicking it
+opens the menu for whatever it is describing.
 
 **Peek into a folder.** With the inspector open, putting the cursor on a folder
 lists what is inside it without going in — folders first, marked with a
 trailing slash, and a count of whatever did not fit.
+
+**Resizable side panels.** Drag the sidebar's right edge or the inspector's
+left one. The width is kept in DIPs, so the same settings file opens at the
+same apparent width on a monitor of a different scale.
 
 **Rename in place.** `F2` types over the name where it sits, with the stem
 selected and the extension left alone. Enter commits, Escape abandons, clicking
@@ -117,28 +140,11 @@ Movement is not rebindable: arrows, Page Up and Down, Home, End, Tab and
 type-ahead mean different things with Shift and Ctrl held, and that is not
 something a settings file should try to describe.
 
-**Opens where you point it.** `jamb.exe C:\someolder` starts there
-rather than restoring the session, and a path to a *file* opens the folder
-holding it — which is what dragging a file onto the exe means. `Ctrl+N` opens a
-second window on the current folder. The session belongs to the first window;
-the others are passing through and do not overwrite its tabs.
-
-**Two rows of chrome, not four.** The window has no system title bar: the
-client area runs up to the top edge, and the panes on the top row put their tab
-strips there, beside the app icon, the sidebar toggle and the window buttons.
-Empty space in that strip drags the window, the edges still resize it, and
-hovering Maximise still offers Windows' snap layouts.
-
-**An overflow menu per pane.** The `⋮` at the right end of a breadcrumb row
-opens New, Cut, Copy, Paste, Rename, Delete, Share, Sort, View and every
-setting, acting on the pane it hangs off. Entries grey out when they would not
-work. The same row carries Home and a pin toggle, which lights up when the
-folder showing is already pinned. It is a second way to reach the commands,
-never a second implementation of them.
-
-**Resizable side panels.** Drag the sidebar's right edge or the inspector's
-left one. The width is kept in DIPs, so the same settings file opens at the
-same apparent width on a monitor of a different scale.
+**Opens where you point it.** `jamb.exe C:\somefolder` starts there rather than
+restoring the session, and a path to a *file* opens the folder holding it —
+which is what dragging a file onto the exe means. `Ctrl+N` opens a second window
+on the current folder. The session belongs to the first window; the others are
+passing through and do not overwrite its tabs.
 
 **Command palette.** `Ctrl+Shift+P` finds any command by initials, so nothing
 is hidden behind a chord you have to remember.
@@ -147,19 +153,18 @@ is hidden behind a chord you have to remember.
 streams matches in as it finds them. `*` is allowed (`*.rs`, `test*`), `ext:rs`
 or `ext:rs,toml` filters by extension, and a query of three characters or more
 that matches nothing literally falls back to subsequence matching, so `gtd`
-finds `get_tree_depth.rs`.
-`Ctrl+Shift+G` searches inside files instead of names, decoding UTF-8 and
-UTF-16 and skipping anything binary.
+finds `get_tree_depth.rs`. `Ctrl+Shift+G` searches inside files instead of
+names, decoding UTF-8 and UTF-16 and skipping anything binary.
 
 **Pinned places, with your own icons.** *Pin or unpin this folder* pins where
 you are; *Pin or unpin a path…* pins somewhere you are not, which is how a
 network share gets into the sidebar without mounting it first — the prompt
-carries the shell's own completion, so `\server\share` completes as any path
+carries the shell's own completion, so `\\server\share` completes as any path
 does. A pin can name its own icon the way Windows always has, as `file,index`
 before a `|`:
 
 ```
-pin=shell32.dll,4|\nas\media
+pin=shell32.dll,4|\\nas\media
 pin=imageres.dll,3|C:\work
 ```
 
@@ -208,27 +213,29 @@ comes everything installed software registered: 7-Zip, Git, Open with, Send to.
 **Drag and drop**, both directions, interoperating with Explorer. Copy by
 default, Shift to move; dropping on a folder row targets that folder.
 
-**Folder sizes on demand.** Never automatic - recursive sizing of a whole drive
+**Folder sizes on demand.** Never automatic — recursive sizing of a whole drive
 is how file managers earn a reputation for hanging.
 
 **Live updates.** Directories are watched, so changes made elsewhere appear
 without a refresh.
 
 **Sidebar** with drives (label, free/total, and a capacity bar that turns amber
-past 90%) and your standard folders, each with its real shell icon.
+past 90%) and your standard folders, each with its real shell icon. The row you
+are inside is marked with an accent tick, whether it is a place, a drive or a
+folder in the tree.
 
-**Themes.** Dark and light, including the window border. On first run the app takes
-whichever Windows itself is set to; after that `Ctrl+Shift+D` decides and is
-remembered. Both palettes are tested to clear WCAG AA contrast for body and
+**Themes.** Dark and light, including the window border. On first run the app
+takes whichever Windows itself is set to; after that `Ctrl+Shift+D` decides and
+is remembered. Both palettes are tested to clear WCAG AA contrast for body and
 secondary text.
 
 **Settings stick.** Pane count, theme, sidebar visibility, hidden files, the
-divider positions, the window box, pinned folders, recent folders, per-pane sort, column widths
-and every open tab live in `%APPDATA%\Jamb\settings.txt`. They are
-written a few seconds after anything changes, not only on exit, so a crash does
-not cost you the session.
-It is plain `key=value` text you can edit or delete; anything unreadable falls
-back to defaults rather than refusing to start.
+divider positions, the side panel widths, the window box, pinned folders, recent
+folders, per-pane sort, column widths and every open tab live in
+`%APPDATA%\Jamb\settings.txt`. They are written a few seconds after anything
+changes, not only on exit, so a crash does not cost you the session. It is plain
+`key=value` text you can edit or delete; anything unreadable falls back to
+defaults rather than refusing to start.
 
 **Scrolling by the pixel.** The wheel moves the list in pixels rather than whole
 rows, so a precision touchpad reporting less than a notch moves it by less than
@@ -284,6 +291,7 @@ These are the defaults; "Change a shortcut" in the palette rebinds any of them.
 | Copy / move to the next pane | `F6` / `Ctrl+Shift+M` |
 | Move or reorder a tab | drag it to another pane, or past its neighbours |
 | Resize a column | drag its left edge in the header |
+| Resize a side panel | drag the sidebar's right edge or the inspector's left one |
 | Delete | `Del` to the Recycle Bin, `Shift+Del` permanently |
 | Rename / new folder | `F2` (in place; `Enter` commits, `Esc` abandons) / `Ctrl+Shift+N` |
 | Filter this pane | `Ctrl+F`, `Esc` to clear |
@@ -295,6 +303,33 @@ These are the defaults; "Change a shortcut" in the palette rebinds any of them.
 | Icon view / details | `Ctrl+Shift+I`, `Ctrl+wheel` to resize |
 | Sort | click a column header (Name, Type, Size, Date); click again to reverse |
 | Resize panes | drag the divider, double-click it to even them up |
+
+---
+
+## What it costs
+
+Measured on Windows 11, one window, against one File Explorer window on the
+same folders. Explorer spawned its own process for the window, so that column
+is the window rather than the desktop shell.
+
+| | Jamb | One Explorer window |
+|---|---|---|
+| Binary | 0.79 MB | ~24.8 MB across five files |
+| Working set | 54–62 MB | 181 MB |
+| Private bytes | 56–67 MB | 129 MB |
+| Threads | 22 | 82 |
+| Handles | 518 | 2,147 |
+| Idle CPU over 10s | 15.6 ms | 46.9 ms |
+| Window appears | 331 ms | 403 ms |
+
+Two honest caveats. Binary size is code we wrote, not code in memory — Jamb
+still loads `shell32` and `windows.storage` for icons, thumbnails, context
+menus and the namespace. And startup is a wash: the ranges overlap across runs,
+and Explorer is prefetched by Windows besides.
+
+The memory that is there is mostly Direct2D, DirectWrite, DXGI and WIC. Only
+8 MB separates a 71-item folder from a 5,075-item one, so the listing itself is
+nearly free.
 
 ---
 
@@ -346,7 +381,7 @@ is unit-tested without a window.
 cargo test
 ```
 
-267 tests, no warnings. They cover path handling and name validation, the
+317 tests, no warnings. They cover path handling and name validation, the
 virtual list and selection model, sorting and filtering, tab and history
 behaviour, session restore, stale-load rejection, layout geometry and
 hit-testing at every pane count, undo inverses, search matching and content
@@ -358,16 +393,6 @@ the one part of the app depending on software we do not ship.
 
 Layout tests assert the property that matters: **anything drawn at a rectangle
 hit-tests back to itself.**
-
----
-
-## Size
-
-```powershell
-(Get-Item target\release\jamb.exe).Length / 1MB
-```
-
-Currently ~0.96 MB against a 3 MB budget.
 
 ---
 
