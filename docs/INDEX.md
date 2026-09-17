@@ -14,7 +14,7 @@ the current state so context is never lost.
 | 3 | [phase-3.md](phase-3.md) | Done | Dual pane, tabs, breadcrumbs, keyboard nav |
 | 4 | [phase-4.md](phase-4.md) | Done | Shell file operations, multi-select, async I/O, DPI |
 | 5 | [phase-5.md](phase-5.md) | Done | Layout module, sidebar, filter, theming, visual overhaul |
-| 6 | *(not started)* | Planned | Command palette, fuzzy search, drag & drop, settings persistence, installer |
+| 6 | [phase-6.md](phase-6.md) | Done | Palette, search, drag & drop, shell menu, watching, batch rename, settings |
 
 ---
 
@@ -56,7 +56,7 @@ the current state so context is never lost.
   failures. See [.cursor/rules/phase-tests.mdc](../.cursor/rules/phase-tests.mdc).
 - **Docs**: after each phase add or update `docs/phase-N.md` and this index.
 
-Current: **102 tests, zero warnings** (`cargo test`).
+Current: **151 tests, zero warnings** (`cargo test`).
 
 ---
 
@@ -68,4 +68,4 @@ Current: **102 tests, zero warnings** (`cargo test`).
 
 ---
 
-*Last updated: after Phase 5 (interface overhaul).*
+*Last updated: after Phase 6.*

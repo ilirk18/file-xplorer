@@ -62,6 +62,12 @@ pub enum Op {
         source: String,
         new_name: String,
     },
+    /// Several renames in one operation, so a batch rename is a single undo
+    /// step rather than N of them.
+    RenameMany {
+        /// (absolute source path, new bare name)
+        items: Vec<(String, String)>,
+    },
     NewFolder {
         parent: String,
         name: String,
@@ -84,6 +90,10 @@ impl Op {
             Op::Rename { source, .. } => {
                 crate::fs::path_parent(source).into_iter().collect()
             }
+            Op::RenameMany { items } => items
+                .iter()
+                .filter_map(|(src, _)| crate::fs::path_parent(src))
+                .collect(),
             Op::NewFolder { parent, .. } => vec![parent.clone()],
         }
     }
@@ -153,6 +163,13 @@ fn perform(op: &Op, owner: HWND) -> windows::core::Result<bool> {
             let item = shell_item(source)?;
             let name = to_wide(new_name);
             unsafe { file_op.RenameItem(&item, PCWSTR::from_raw(name.as_ptr()), None)? };
+        }
+        Op::RenameMany { items } => {
+            for (source, new_name) in items {
+                let item = shell_item(source)?;
+                let name = to_wide(new_name);
+                unsafe { file_op.RenameItem(&item, PCWSTR::from_raw(name.as_ptr()), None)? };
+            }
         }
         Op::NewFolder { parent, name } => {
             let dest = shell_item(parent)?;
@@ -292,6 +309,27 @@ pub fn clipboard_write(owner: HWND, paths: &[String], effect: DropEffect) -> win
     }
 }
 
+/// Pull the path list out of an HDROP. Shared by the clipboard and by
+/// drag-and-drop, which receive the same structure from different places.
+pub fn paths_from_hdrop(hdrop: HDROP) -> Vec<String> {
+    unsafe {
+        let count = DragQueryFileW(hdrop, u32::MAX, None);
+        let mut paths = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let len = DragQueryFileW(hdrop, i, None);
+            if len == 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            let written = DragQueryFileW(hdrop, i, Some(&mut buf));
+            if written > 0 {
+                paths.push(String::from_utf16_lossy(&buf[..written as usize]));
+            }
+        }
+        paths
+    }
+}
+
 /// Read a CF_HDROP file list off the clipboard, with the cut/copy hint.
 pub fn clipboard_read(owner: HWND) -> Option<(Vec<String>, DropEffect)> {
     unsafe {
@@ -303,21 +341,7 @@ pub fn clipboard_read(owner: HWND) -> Option<(Vec<String>, DropEffect)> {
         }
         let out = (|| {
             let handle = GetClipboardData(CF_HDROP.0 as u32).ok()?;
-            let hdrop = HDROP(handle.0);
-
-            let count = DragQueryFileW(hdrop, u32::MAX, None);
-            let mut paths = Vec::with_capacity(count as usize);
-            for i in 0..count {
-                let len = DragQueryFileW(hdrop, i, None);
-                if len == 0 {
-                    continue;
-                }
-                let mut buf = vec![0u16; len as usize + 1];
-                let written = DragQueryFileW(hdrop, i, Some(&mut buf));
-                if written > 0 {
-                    paths.push(String::from_utf16_lossy(&buf[..written as usize]));
-                }
-            }
+            let paths = paths_from_hdrop(HDROP(handle.0));
             if paths.is_empty() {
                 return None;
             }
@@ -411,6 +435,19 @@ mod tests {
             permanent: false,
         };
         assert_eq!(op.affected_dirs(), vec!["C:\\a".to_string()]);
+    }
+
+    #[test]
+    fn batch_rename_touches_every_source_directory() {
+        let op = Op::RenameMany {
+            items: vec![
+                ("C:\\a\\one.txt".into(), "1.txt".into()),
+                ("C:\\a\\two.txt".into(), "2.txt".into()),
+            ],
+        };
+        let dirs = op.affected_dirs();
+        assert!(dirs.iter().all(|d| d == "C:\\a"));
+        assert_eq!(dirs.len(), 2);
     }
 
     #[test]

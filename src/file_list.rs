@@ -360,6 +360,16 @@ impl FileList {
 
     // -- loading -----------------------------------------------------------
 
+    /// Add more entries to the current listing, keeping selection and scroll.
+    /// Used by search, which streams results in as it finds them.
+    pub fn append_entries(&mut self, more: Vec<FileEntry>) {
+        if more.is_empty() {
+            return;
+        }
+        self.all.extend(more);
+        self.rebuild_preserving_selection();
+    }
+
     /// Replace the contents for a *new* directory: selection and scroll reset.
     pub fn set_entries(&mut self, entries: Vec<FileEntry>) {
         self.all = entries;
@@ -751,6 +761,16 @@ mod tests {
         list.refresh_entries(vec![entry("docs", true), entry("src", true)]);
         let docs = list.entries.iter().find(|e| e.name == "docs").unwrap();
         assert_eq!(docs.size_display(), "2 KB");
+    }
+
+    #[test]
+    fn append_keeps_selection_and_sorts_the_whole_list() {
+        let mut list = list_of(&[("b.txt", false), ("d.txt", false)]);
+        list.select(0, SelectMode::Replace);
+        list.append_entries(vec![entry("a.txt", false), entry("c.txt", false)]);
+        let names: Vec<&str> = list.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "b.txt", "c.txt", "d.txt"]);
+        assert_eq!(list.selected_entries()[0].name, "b.txt");
     }
 
     #[test]

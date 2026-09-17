@@ -15,14 +15,21 @@
 
 #![windows_subsystem = "windows"]
 
+mod batch_rename;
 mod config;
+mod dialog;
+mod dnd;
 mod file_list;
 mod fs;
 mod icons;
 mod layout;
 mod ops;
+mod palette;
 mod pane;
+mod pidl;
 mod renderer;
+mod search;
+mod shellmenu;
 mod theme;
 mod watch;
 
@@ -33,7 +40,7 @@ use windows::core::{Result, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -55,6 +62,14 @@ const WM_APP_OP_DONE: u32 = WM_APP + 2;
 const WM_APP_SIZES_DONE: u32 = WM_APP + 3;
 /// A watched directory changed on disk. wParam is the pane index.
 const WM_APP_DIR_CHANGED: u32 = WM_APP + 4;
+/// A batch of search results, posted back from a worker thread.
+const WM_APP_SEARCH_BATCH: u32 = WM_APP + 5;
+/// Files were dropped on the window. lParam is a boxed `dnd::Dropped`.
+const WM_APP_DROPPED: u32 = WM_APP + 6;
+
+/// How far the mouse must move with the button down before it counts as a drag
+/// rather than a sloppy click.
+const DRAG_THRESHOLD: i32 = 5;
 
 /// Timer ids for coalescing change notifications, one per pane.
 const TIMER_WATCH_LEFT: usize = 1;
@@ -87,6 +102,60 @@ const CMD_REFRESH: usize = 111;
 const CMD_CALC_SIZES: usize = 112;
 const CMD_SYNC_SCROLL: usize = 113;
 const CMD_COMPARE: usize = 114;
+const CMD_SEARCH: usize = 115;
+const CMD_BATCH_RENAME: usize = 116;
+const CMD_TOGGLE_THEME: usize = 117;
+const CMD_TOGGLE_HIDDEN: usize = 118;
+const CMD_TOGGLE_SIDEBAR: usize = 119;
+const CMD_SINGLE_PANE: usize = 120;
+const CMD_DUAL_PANE: usize = 121;
+const CMD_NEW_TAB: usize = 122;
+const CMD_CLOSE_TAB: usize = 123;
+const CMD_SELECT_ALL: usize = 124;
+const CMD_FILTER: usize = 125;
+const CMD_GO_UP: usize = 126;
+const CMD_GO_BACK: usize = 127;
+const CMD_GO_FORWARD: usize = 128;
+
+/// Everything the palette can reach. The context menu builds from the same
+/// list, so a command is described in exactly one place.
+struct CommandDef {
+    id: usize,
+    label: &'static str,
+    keys: &'static str,
+}
+
+const COMMANDS: &[CommandDef] = &[
+    CommandDef { id: CMD_OPEN, label: "Open", keys: "Enter" },
+    CommandDef { id: CMD_OPEN_NEW_TAB, label: "Open in new tab", keys: "" },
+    CommandDef { id: CMD_CUT, label: "Cut", keys: "Ctrl+X" },
+    CommandDef { id: CMD_COPY, label: "Copy", keys: "Ctrl+C" },
+    CommandDef { id: CMD_PASTE, label: "Paste", keys: "Ctrl+V" },
+    CommandDef { id: CMD_COPY_TO_OTHER, label: "Copy to other pane", keys: "F6" },
+    CommandDef { id: CMD_MOVE_TO_OTHER, label: "Move to other pane", keys: "Ctrl+Shift+M" },
+    CommandDef { id: CMD_DELETE, label: "Delete", keys: "Del" },
+    CommandDef { id: CMD_RENAME, label: "Rename", keys: "F2" },
+    CommandDef { id: CMD_BATCH_RENAME, label: "Batch rename", keys: "Ctrl+Shift+R" },
+    CommandDef { id: CMD_NEW_FOLDER, label: "New folder", keys: "Ctrl+Shift+N" },
+    CommandDef { id: CMD_PROPERTIES, label: "Properties", keys: "" },
+    CommandDef { id: CMD_SEARCH, label: "Search here", keys: "Ctrl+Shift+F" },
+    CommandDef { id: CMD_FILTER, label: "Filter this pane", keys: "Ctrl+F" },
+    CommandDef { id: CMD_CALC_SIZES, label: "Calculate folder sizes", keys: "" },
+    CommandDef { id: CMD_REFRESH, label: "Refresh", keys: "F5" },
+    CommandDef { id: CMD_SELECT_ALL, label: "Select all", keys: "Ctrl+A" },
+    CommandDef { id: CMD_GO_UP, label: "Go up", keys: "Backspace" },
+    CommandDef { id: CMD_GO_BACK, label: "Go back", keys: "Alt+Left" },
+    CommandDef { id: CMD_GO_FORWARD, label: "Go forward", keys: "Alt+Right" },
+    CommandDef { id: CMD_NEW_TAB, label: "New tab", keys: "Ctrl+T" },
+    CommandDef { id: CMD_CLOSE_TAB, label: "Close tab", keys: "Ctrl+W" },
+    CommandDef { id: CMD_SINGLE_PANE, label: "Single pane", keys: "Ctrl+1" },
+    CommandDef { id: CMD_DUAL_PANE, label: "Two panes", keys: "Ctrl+2" },
+    CommandDef { id: CMD_SYNC_SCROLL, label: "Toggle synchronised scrolling", keys: "" },
+    CommandDef { id: CMD_COMPARE, label: "Toggle compare panes", keys: "" },
+    CommandDef { id: CMD_TOGGLE_HIDDEN, label: "Toggle hidden files", keys: "Ctrl+H" },
+    CommandDef { id: CMD_TOGGLE_SIDEBAR, label: "Toggle sidebar", keys: "Ctrl+B" },
+    CommandDef { id: CMD_TOGGLE_THEME, label: "Toggle dark / light theme", keys: "Ctrl+Shift+D" },
+];
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -144,6 +213,12 @@ fn select_mode() -> SelectMode {
     } else {
         SelectMode::Replace
     }
+}
+
+struct SearchBatch {
+    side: Side,
+    tab_id: u64,
+    batch: search::Batch,
 }
 
 struct SizesDone {
@@ -217,6 +292,12 @@ struct AppState {
     compare: bool,
     /// One directory watcher per pane, dropped (and cancelled) on navigation.
     watchers: [Option<Watcher>; 2],
+    /// In-flight search per pane, cancelled on drop.
+    searches: [Option<search::Search>; 2],
+    /// Drop-target registration; revoked when dropped.
+    drop_target: Option<dnd::Registration>,
+    /// Where the left button went down on a selected row, if a drag might start.
+    drag_origin: Option<(i32, i32)>,
 
     type_ahead: String,
     type_ahead_at: Option<Instant>,
@@ -266,6 +347,9 @@ impl AppState {
             sync_scroll: cfg.sync_scroll,
             compare: cfg.compare,
             watchers: [None, None],
+            searches: [None, None],
+            drop_target: None,
+            drag_origin: None,
             type_ahead: String::new(),
             type_ahead_at: None,
             modal: false,
@@ -460,9 +544,10 @@ impl AppState {
 
 fn main() -> Result<()> {
     unsafe {
-        // The shell interfaces we use (IFileOperation, SHGetFileInfoW, WIC) all
-        // want an initialised apartment on the calling thread.
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // OleInitialize rather than CoInitializeEx: it enters the same
+        // single-threaded apartment the shell interfaces need, and additionally
+        // sets up the drag-and-drop machinery RegisterDragDrop requires.
+        let _ = OleInitialize(None);
 
         let instance = GetModuleHandleW(None)?;
         let class_name = wide("FileXplorerWindow");
@@ -539,7 +624,7 @@ fn main() -> Result<()> {
             DispatchMessageW(&msg);
         }
 
-        CoUninitialize();
+        OleUninitialize();
     }
     Ok(())
 }
@@ -611,6 +696,119 @@ fn spawn_op(hwnd: HWND, op: ops::Op) {
             unsafe { drop(Box::from_raw(raw)) };
         }
     });
+}
+
+/// Rename the selection from a pattern, previewed before anything happens.
+fn do_batch_rename(state: &mut AppState, hwnd: HWND) {
+    if state.modal {
+        return;
+    }
+    let pane = state.focused_pane();
+    let dir = pane.current_path().to_string();
+    let names: Vec<String> = pane
+        .list()
+        .selected_entries()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    if names.is_empty() || dir.is_empty() {
+        return;
+    }
+
+    state.modal = true;
+    let pattern = batch_rename::prompt(hwnd, state.dpi, names.clone());
+    state.modal = false;
+
+    let Some(pattern) = pattern else { return };
+    let plan = batch_rename::plan(&names, &pattern);
+    if plan.is_empty() {
+        return;
+    }
+    let items = plan
+        .into_iter()
+        .map(|(old, new)| (fs::path_join(&dir, &old), new))
+        .collect();
+    state.status_override = Some("Renaming\u{2026}".into());
+    spawn_op(hwnd, ops::Op::RenameMany { items });
+}
+
+/// Show every command, filtered as you type.
+fn show_palette(state: &mut AppState, hwnd: HWND) {
+    if state.modal {
+        return;
+    }
+    let items: Vec<palette::Item> = COMMANDS
+        .iter()
+        .map(|c| palette::Item {
+            label: c.label.to_string(),
+            detail: c.keys.to_string(),
+        })
+        .collect();
+
+    state.modal = true;
+    let chosen = palette::pick(hwnd, state.dpi, "Commands", items);
+    state.modal = false;
+
+    if let Some(i) = chosen {
+        run_command(state, hwnd, COMMANDS[i].id);
+    }
+}
+
+/// Start a recursive search in the focused pane, rooted at its current folder.
+fn start_search(state: &mut AppState, hwnd: HWND, query: &str) {
+    let side = state.focused;
+    if state.pane(side).current_path().is_empty() {
+        return;
+    }
+    let (tab_id, generation, root) = state.pane_mut(side).begin_search(query);
+
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.searches[side_index(side)] = Some(search::Search {
+        cancel: cancel.clone(),
+    });
+
+    let owner = ops::OwnerWindow(hwnd);
+    let query = query.to_string();
+    std::thread::spawn(move || {
+        search::run(root, query, generation, cancel, |batch| {
+            let raw = Box::into_raw(Box::new(SearchBatch {
+                side,
+                tab_id,
+                batch,
+            }));
+            let posted = unsafe {
+                PostMessageW(
+                    Some(owner.hwnd()),
+                    WM_APP_SEARCH_BATCH,
+                    WPARAM(0),
+                    LPARAM(raw as isize),
+                )
+            };
+            if posted.is_err() {
+                unsafe { drop(Box::from_raw(raw)) };
+            }
+        });
+    });
+    invalidate(hwnd);
+}
+
+/// Ask for a query, then search. Separate from `start_search` so the palette
+/// and the keyboard can both reach it.
+fn prompt_search(state: &mut AppState, hwnd: HWND) {
+    let here = fs::path_leaf(state.focused_pane().current_path());
+    let Some(query) = prompt_text(
+        hwnd,
+        state,
+        "Search",
+        &format!("Find in {} and below (* allowed):", here),
+        "",
+    ) else {
+        return;
+    };
+    if query.trim().is_empty() {
+        return;
+    }
+    start_search(state, hwnd, query.trim());
 }
 
 /// Walk each named folder on a worker thread and post the totals back.
@@ -718,6 +916,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
 
+        // Shell context-menu handlers build submenus and owner-draw their
+        // items only if these reach them while the menu is on screen.
+        if let Some(result) = shellmenu::handle_menu_msg(msg, wparam, lparam) {
+            return result;
+        }
+
         let state = &mut *ptr;
         handle(state, hwnd, msg, wparam, lparam)
             .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
@@ -737,6 +941,7 @@ fn handle(
     match msg {
         WM_CREATE => {
             apply_titlebar_theme(hwnd, state.theme);
+            state.drop_target = dnd::Registration::new(hwnd, WM_APP_DROPPED);
             let start = fs::current_directory().unwrap_or_else(|_| FALLBACK_PATH.to_string());
             let l = state.left.navigate(&start);
             let r = state.right.navigate(&start);
@@ -748,6 +953,7 @@ fn handle(
         WM_DESTROY => {
             // Drop the watchers first: their threads post to this window.
             state.watchers = [None, None];
+            state.drop_target = None;
             state.config(hwnd).save();
             unsafe { PostQuitMessage(0) };
             Some(LRESULT(0))
@@ -864,6 +1070,19 @@ fn handle(
         }
 
         WM_LBUTTONUP => {
+            // A click that never became a drag still needs to reduce a
+            // multi-selection to the row that was pressed.
+            if let Some((ox, oy)) = state.drag_origin.take() {
+                if select_mode() == SelectMode::Replace {
+                    let layout = state.layout();
+                    if let Hit::Row(side, row) = layout.hit_test(ox, oy) {
+                        if state.pane(side).list().selection_count() > 1 {
+                            state.pane_mut(side).list_mut().select(row, SelectMode::Replace);
+                            invalidate(hwnd);
+                        }
+                    }
+                }
+            }
             if state.drag != Drag::None {
                 state.drag = Drag::None;
                 unsafe {
@@ -1003,6 +1222,26 @@ fn handle(
                 return Some(LRESULT(0));
             }
             None
+        }
+
+        WM_APP_DROPPED => {
+            let dropped = unsafe { Box::from_raw(lparam.0 as *mut dnd::Dropped) };
+            on_dropped(state, hwnd, *dropped);
+            Some(LRESULT(0))
+        }
+
+        WM_APP_SEARCH_BATCH => {
+            let msg = unsafe { Box::from_raw(lparam.0 as *mut SearchBatch) };
+            let applied = state.pane_mut(msg.side).finish_search_batch(
+                msg.tab_id,
+                msg.batch.generation,
+                msg.batch.entries,
+                msg.batch.done,
+            );
+            if applied {
+                invalidate(hwnd);
+            }
+            Some(LRESULT(0))
         }
 
         WM_APP_SIZES_DONE => {
@@ -1187,6 +1426,56 @@ fn default_places() -> Vec<Shortcut> {
 // Mouse
 // ---------------------------------------------------------------------------
 
+/// Files were dropped on the window: work out where, and run the operation.
+fn on_dropped(state: &mut AppState, hwnd: HWND, dropped: dnd::Dropped) {
+    let mut pt = POINT {
+        x: dropped.screen.0,
+        y: dropped.screen.1,
+    };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+    let layout = state.layout();
+    let hit = layout.hit_test(pt.x, pt.y);
+    let side = match hit {
+        Hit::Row(s, _) | Hit::ListBackground(s) => s,
+        _ => return, // Dropped on chrome, not on a listing.
+    };
+
+    // Dropping onto a folder row targets that folder, which is what the
+    // highlight under the cursor implies; anywhere else means this folder.
+    let mut dest = state.pane(side).current_path().to_string();
+    if let Hit::Row(_, row) = hit {
+        if let Some(entry) = state.pane(side).list().entries.get(row as usize) {
+            if entry.is_dir {
+                dest = fs::path_join(&dest, &entry.name);
+            }
+        }
+    }
+    if dest.is_empty() {
+        return;
+    }
+
+    state.focused = side;
+    state.status_override = Some(if dropped.move_it {
+        "Moving\u{2026}".into()
+    } else {
+        "Copying\u{2026}".to_string()
+    });
+    let op = if dropped.move_it {
+        ops::Op::Move {
+            sources: dropped.paths,
+            dest_dir: dest,
+        }
+    } else {
+        ops::Op::Copy {
+            sources: dropped.paths,
+            dest_dir: dest,
+        }
+    };
+    spawn_op(hwnd, op);
+}
+
 fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
     match state.drag {
         Drag::Divider { grab_offset } => {
@@ -1213,6 +1502,29 @@ fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             return;
         }
         Drag::None => {}
+    }
+
+    // Past the threshold with the button down on a selected row: start a drag.
+    if let Some((ox, oy)) = state.drag_origin {
+        let moved = (x - ox).abs() >= DRAG_THRESHOLD || (y - oy).abs() >= DRAG_THRESHOLD;
+        let button_down = unsafe { (GetKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+        if moved && button_down {
+            state.drag_origin = None;
+            let side = state.focused;
+            let paths = state.pane(side).selected_paths();
+            if !paths.is_empty() {
+                // Blocks until the drag ends; OLE runs its own message loop.
+                let moved_out = dnd::start_drag(&paths);
+                if moved_out {
+                    let req = state.pane_mut(side).refresh();
+                    start_load(hwnd, side, req);
+                }
+            }
+            return;
+        }
+        if !button_down {
+            state.drag_origin = None;
+        }
     }
 
     // Resolve the row under the cursor so hovering a row highlights it.
@@ -1336,8 +1648,14 @@ fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
 
         Hit::Row(side, row) => {
             state.focused = side;
-            let mode = select_mode();
-            state.pane_mut(side).list_mut().select(row, mode);
+            let already = state.pane(side).list().is_selected(row);
+            // Dragging a multi-selection must not collapse it to one row, so a
+            // plain click on an already-selected row waits for the button up.
+            if !(already && select_mode() == SelectMode::Replace) {
+                let mode = select_mode();
+                state.pane_mut(side).list_mut().select(row, mode);
+            }
+            state.drag_origin = Some((x, y));
         }
 
         Hit::ListBackground(side) => {
@@ -1550,11 +1868,19 @@ fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
         VK_DELETE => do_delete(state, hwnd, shift),
 
         VK_ESCAPE => {
-            let list = state.pane_mut(side).list_mut();
-            if list.is_filtered() {
-                list.clear_filter();
+            if state.pane(side).is_searching() {
+                // Leave the results and go back to the folder they came from.
+                state.searches[side_index(side)] = None;
+                let path = state.pane(side).current_path().to_string();
+                let req = state.pane_mut(side).navigate(&path);
+                spawn_dir_load(hwnd, side, req);
             } else {
-                list.clear_selection();
+                let list = state.pane_mut(side).list_mut();
+                if list.is_filtered() {
+                    list.clear_filter();
+                } else {
+                    list.clear_selection();
+                }
             }
             state.type_ahead.clear();
         }
@@ -1593,6 +1919,9 @@ fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
                     let req = state.pane_mut(side).refresh();
                     start_load(hwnd, side, req);
                 }
+                (true, true, 'F') => prompt_search(state, hwnd),
+                (true, true, 'P') => show_palette(state, hwnd),
+                (true, true, 'R') => do_batch_rename(state, hwnd),
                 (true, true, 'N') => do_new_folder(state, hwnd),
                 (true, true, 'C') => copy_or_move_to_other(state, hwnd, false),
                 (true, true, 'M') => copy_or_move_to_other(state, hwnd, true),
@@ -1891,8 +2220,17 @@ fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen_y: 
         add(CMD_NEW_FOLDER, "New folder\tCtrl+Shift+N", true);
         add(CMD_REFRESH, "Refresh\tF5", true);
         add(CMD_CALC_SIZES, "Calculate folder sizes", true);
+        add(CMD_SEARCH, "Search here\tCtrl+Shift+F", true);
+        add(CMD_BATCH_RENAME, "Batch rename\tCtrl+Shift+R", has_selection);
         sep();
         add(CMD_PROPERTIES, "Properties", single);
+
+        // Everything installed software registered goes below our own items.
+        let paths = state.pane(side).selected_paths();
+        let shell = shellmenu::append(menu, hwnd, &paths);
+        if shell.is_some() {
+            sep();
+        }
 
         let cmd = TrackPopupMenu(
             menu,
@@ -1904,7 +2242,18 @@ fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen_y: 
             None,
         );
         let _ = DestroyMenu(menu);
-        run_command(state, hwnd, cmd.0 as usize);
+
+        let id = cmd.0 as u32;
+        if id >= shellmenu::SHELL_ID_FIRST {
+            if let Some(shell) = &shell {
+                shell.invoke(hwnd, id);
+            }
+            // The shell just changed something; find out what.
+            let req = state.pane_mut(side).refresh();
+            start_load(hwnd, side, req);
+        } else {
+            run_command(state, hwnd, cmd.0 as usize);
+        }
     }
 }
 
@@ -1935,6 +2284,42 @@ fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
             start_load(hwnd, side, req);
         }
         CMD_CALC_SIZES => calculate_folder_sizes(state, hwnd),
+        CMD_SEARCH => prompt_search(state, hwnd),
+        CMD_BATCH_RENAME => do_batch_rename(state, hwnd),
+        CMD_TOGGLE_THEME => toggle_theme(state, hwnd),
+        CMD_TOGGLE_HIDDEN => toggle_hidden(state, hwnd),
+        CMD_TOGGLE_SIDEBAR => {
+            state.sidebar_visible = !state.sidebar_visible;
+            state.clamp_split();
+        }
+        CMD_SINGLE_PANE => set_dual(state, false),
+        CMD_DUAL_PANE => set_dual(state, true),
+        CMD_NEW_TAB => {
+            let req = if state.pane(side).current_path().is_empty() {
+                state.pane_mut(side).new_tab(FALLBACK_PATH)
+            } else {
+                state.pane_mut(side).duplicate_tab()
+            };
+            spawn_dir_load(hwnd, side, req);
+        }
+        CMD_CLOSE_TAB => {
+            let req = state.pane_mut(side).close_active_tab(FALLBACK_PATH);
+            start_load(hwnd, side, req);
+        }
+        CMD_SELECT_ALL => state.pane_mut(side).list_mut().select_all(),
+        CMD_FILTER => state.filter_focus = Some(side),
+        CMD_GO_UP => {
+            let req = state.pane_mut(side).navigate_up();
+            start_load(hwnd, side, req);
+        }
+        CMD_GO_BACK => {
+            let req = state.pane_mut(side).go_back();
+            start_load(hwnd, side, req);
+        }
+        CMD_GO_FORWARD => {
+            let req = state.pane_mut(side).go_forward();
+            start_load(hwnd, side, req);
+        }
         CMD_SYNC_SCROLL => {
             state.sync_scroll = !state.sync_scroll;
             state.mirror_scroll(side);
@@ -2057,6 +2442,11 @@ unsafe fn prompt_text_impl(
         return None;
     };
 
+    let font = dialog::UiFont::new(dpi);
+    if let Some(f) = &font {
+        f.apply_to_children(dlg);
+    }
+
     // Real modality: the owner stops accepting input until we are done.
     let _ = EnableWindow(parent, false);
     let _ = ShowWindow(dlg, SW_SHOW);
@@ -2087,6 +2477,7 @@ unsafe fn prompt_text_impl(
         let _ = DestroyWindow(dlg);
     }
 
+    drop(font);
     let st = Box::from_raw(st);
     if let Some(code) = quit_code {
         PostQuitMessage(code);
