@@ -90,6 +90,9 @@ const NAMED: &[(&str, u16)] = &[
     ("Down", 0x28),
     ("Ins", 0x2D),
     ("Del", 0x2E),
+    // The settings chord everything else uses is Ctrl+, so the comma has to
+    // have a name. It cannot be written as itself: "+" is the separator.
+    ("Comma", 0xBC),
 ];
 
 /// Names people also write, accepted on the way in but never produced.
@@ -100,6 +103,7 @@ const ALIASES: &[(&str, u16)] = &[
     ("Insert", 0x2D),
     ("PgUp", 0x21),
     ("PgDn", 0x22),
+    (",", 0xBC),
 ];
 
 fn vk_from_name(name: &str) -> Option<u16> {
@@ -215,6 +219,17 @@ impl Bindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_chord_survives_the_round_trip() {
+        // "+" separates the parts, so a comma needs a name of its own or
+        // Ctrl+, could not be written down at all.
+        let c = Chord::parse("Ctrl+Comma").expect("a chord");
+        assert_eq!(c.vk, 0xBC);
+        assert!(c.ctrl && !c.shift && !c.alt);
+        assert_eq!(c.text(), "Ctrl+Comma");
+        assert_eq!(Chord::parse("ctrl+,"), Some(c));
+    }
 
     #[test]
     fn chords_round_trip_through_text() {

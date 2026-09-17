@@ -24,8 +24,8 @@ three other things are blocked behind it.
 | 12 | ~~Searchable and pinnable context menu, richer GoTo~~ — done | Medium | Low | All of it reused the palette |
 | 12b | ~~Command bar: overflow, Share~~ — done; per-pane placement declined | Low | Low | The bar itself was done; these were what it did not cover |
 | 13 | ~~Default file manager~~ — written, yours to run | Medium | Medium | "More than both" — neither does it |
-| 14 | Customization: fonts, density, themes, Options | Medium | Low | Broad but shallow |
-| 15 | Network polish, optional always-on folder sizes | Medium | Medium | Closes the reviews' complaint about them |
+| 14 | ~~Customization: fonts, density, themes, Options~~ — done | Medium | Low | Broad but shallow |
+| 15 | ~~Network polish, optional always-on folder sizes~~ — done | Medium | Medium | Closes the reviews' complaint about them |
 
 ---
 
@@ -233,38 +233,86 @@ are yours to change deliberately.
 
 ---
 
-## 14. Customization
+## 14. Customization — done, except the dialog
 
-Broad, shallow, and worth doing after the layout work because the Options UI
-should be able to show layout settings.
-
-- **Font size and family.** `Formats` builds nine `IDWriteTextFormat`s from two
-  hardcoded families and fixed sizes. Both become settings; `Metrics::for_dpi`
-  takes a scale so row heights follow the font rather than fighting it.
-- **Density.** `row_h`, `pad` and `cell_h` from one compact/normal/roomy factor.
-- **More themes.** `Palette` is two `const`s. It becomes a table of named
-  palettes, and `theme.rs`'s contrast tests run over *all* of them — which is
-  the reason to keep them in one place rather than let anyone add a theme that
-  fails AA.
-- **Animations off.** There is nothing animated yet. Skip it until there is.
-- **Panel opacity.** Direct2D over a DWM-blurred backdrop, for a cosmetic. I
-  would argue against it; say so if you disagree.
-- **Options UI.** There are now enough settings that the palette is the wrong
-  shape for them. A tabbed dialog using the existing `dialog::UiFont` plumbing,
-  the way `batch_rename` already builds one.
+- **Themes are a table.** `THEMES` holds a name, a side and a palette, and the
+  contrast tests run over all of it — which is the only reason it is a table
+  rather than a constant each: a theme that fails AA cannot be added without
+  the suite saying so. Two new ones, *Midnight* and *Sepia*, went in that way.
+  `Theme` is an index into the table; `theme=<name>` in settings, with
+  `theme_dark=` still read from older files. Ctrl+Shift+D stays the light
+  switch — it crosses to the other side rather than touring the table —
+  and *Choose a theme…* is the rest.
+- **Font family and size.** `font=` and `font_size=` (a percentage), picked
+  from the palette; the family list comes from DirectWrite's own system font
+  collection. A family Windows does not have falls back at draw time rather
+  than failing to start.
+- **Density.** `density=`, Compact / Normal / Roomy. Rows follow text size
+  *and* density; gaps follow density alone. Two rules found by looking at it:
+  a row never ends up smaller than its text, and a drive row — two lines and
+  a capacity bar, no slack — is out of density's reach entirely, because at
+  Compact the bar was drawn through the label.
+- **One place to rebuild.** `AppState::apply_metrics` — there are now three
+  ways to change the size of text (a new monitor, a new font, a new density)
+  and a pane still scrolling by the old row height selects the wrong row.
+  Moving the window to another monitor also used to reset the text size, which
+  is the bug that made this a shared function.
+- **Animations off**, **panel opacity**: still nothing to turn off, and still
+  argued against.
+- **Options UI — built, as a menu.** I argued the palette was the right
+  shape and was told otherwise, which settles it. The command bar's ⋯
+  became a gear, and it drops a settings menu: theme, text size and density as
+  submenus with a bullet on the one in force; sidebar, details panel, command
+  bar and hidden files as checkable toggles; synchronised scrolling, compare
+  panes and automatic folder sizes under them; then the shortcut editor, the
+  default-file-manager command and the palette. `Ctrl+Comma` opens it from the
+  keyboard, so the bar is no longer entirely mouse-only.
+  - A menu rather than a tabbed dialog because `ThemedMenu` already draws in
+    the app's palette, already handles keyboard navigation, and every setting
+    is a short list of named choices. What it needed was submenus, which is
+    twenty lines: with `MF_POPUP` the id slot carries the child handle, and
+    Windows draws the arrow for owner-drawn items even though it draws nothing
+    else — so the measure reserves a column for it rather than drawing a
+    second one.
+  - The menu right-aligns under its button. A left-aligned menu hanging off a
+    button at the right edge opens off the side of the window.
+  - Column widths now follow the text size. They are stored at 100% and were
+    only scaled by DPI, so 125% text clipped the year off every date.
 
 ---
 
-## 15. Network and folder sizes
+## 15. Network and folder sizes — done
 
-- **Network.** The namespace entry exists; what is missing is not hanging on an
-  unreachable share (reads are already async, but the *watcher* and the icon
-  lookup are not), map/disconnect drive commands, and UNC completion in GoTo.
-- **Always-on folder sizes**, as a setting, off by default. On, it sizes only
-  what is on screen, on a worker, cached by path and invalidated by the watcher
-  — the same shape as thumbnails. The current on-demand behaviour stays the
-  default because recursive sizing of a drive is still how a file manager earns
-  a reputation for hanging.
+**Network.**
+
+- **The watcher no longer opens the directory on the UI thread.** That was the
+  hang: `CreateFileW` on an unreachable share sits there until SMB gives up,
+  and `rewatch` runs on every navigation. Opening moved onto the watching
+  thread, which publishes the handle under a lock; the thread is still the only
+  closer, and `stop` cancels under that same lock so it can never cancel a
+  handle Windows has already handed to somebody else. A watch that is dropped
+  while the share is still timing out closes and exits on its own.
+- **Sidebar icons no longer ask a network location about itself.** The listing
+  was already safe — entries resolve from attributes alone — but a
+  `path:` key is a real disk read, on the paint path. `PathIsNetworkPathW` now
+  sends those to the generic folder icon.
+- **Map and disconnect** are `WNetConnectionDialog` and `WNetDisconnectDialog`:
+  Windows already owns credentials, saved connections and "reconnect at
+  sign-in", and the drive list is re-read afterwards either way.
+- **UNC completion in GoTo** needed nothing: the prompt runs `SHAutoComplete`
+  with `SHACF_FILESYS_ONLY`, which completes `\\server\share` as it does any
+  other path.
+
+**Folder sizes**, as `folder_sizes=`, off by default. On, a folder that opens
+sizes its subfolders on the existing worker, and results come back in batches
+rather than one message at the end — one slow folder should not hold back
+the twenty that were quick.
+
+- Capped at 256 folders per listing, and never in the shell namespace.
+- `ponytail:` the whole listing rather than the rows on screen. On-screen-only
+  sounds cheaper and is not: twenty visible folders holding a hundred thousand
+  files each cost the same walk, and it needs sizing to re-trigger on every
+  scroll. Per-row sizing driven by the scroll position is the upgrade.
 
 ---
 

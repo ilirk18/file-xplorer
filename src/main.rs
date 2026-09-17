@@ -62,7 +62,7 @@ use commands::show_context_menu;
 use config::{Config, UNSET};
 use input::*;
 use file_list::{SelectMode, SortOrder};
-use layout::{Hit, Metrics, PaneId, Rect, MAX_PANES};
+use layout::{Hit, PaneId, Rect, MAX_PANES};
 use pane::Pane;
 use renderer::{PaneView, SidebarView};
 
@@ -500,13 +500,10 @@ fn handle(
             // lParam carries the suggested new window rect for the new monitor.
             let dpi = loword(wparam.0 as u32).max(96) as u32;
             state.dpi = dpi;
-            state.metrics = Metrics::for_dpi(dpi);
+            // Not for_dpi: the chosen text size and density survive the move
+            // to another monitor.
+            state.apply_metrics();
             let _ = state.renderer.set_dpi(dpi);
-            let row_h = state.metrics.row_h as u32;
-            for p in &mut state.panes {
-                p.set_row_height(row_h);
-            }
-            state.apply_col_widths();
             let r = unsafe { &*(lparam.0 as *const RECT) };
             unsafe {
                 let _ = SetWindowPos(
@@ -816,6 +813,7 @@ fn handle(
                     }
                 }
                 state.rewatch(pid, hwnd);
+                commands::auto_folder_sizes(state, hwnd, pid);
                 invalidate(hwnd);
             }
             Some(LRESULT(0))
@@ -915,6 +913,9 @@ fn handle(
 
         WM_APP_SIZES_DONE => {
             let done = unsafe { Box::from_raw(lparam.0 as *mut SizesDone) };
+            // Whatever it was for, the inspector's slot is free again: this is
+            // the only message that finishes one.
+            state.size_pending = None;
             if let Some(tab) = state.pane_mut(done.pid).tab_mut(done.tab_id) {
                 tab.file_list.set_dir_sizes(done.sizes);
                 invalidate(hwnd);
@@ -1063,11 +1064,15 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     // are: both read the focused pane, which `panes` would otherwise be holding.
     let bar_views: Vec<renderer::BarButtonView> = commands::BAR
         .iter()
-        .map(|b| renderer::BarButtonView {
-            glyph: b.glyph,
-            label: b.label,
-            menu: matches!(b.action, commands::BarAction::Menu(_)),
-            enabled: commands::bar_enabled(state, b.action),
+        .map(|b| {
+            let (on, glyph) = commands::bar_state(state, b.action);
+            renderer::BarButtonView {
+                glyph: if on { glyph } else { b.glyph },
+                label: b.label,
+                menu: matches!(b.action, commands::BarAction::Menu(_)),
+                enabled: commands::bar_enabled(state, b.action),
+                on,
+            }
         })
         .collect();
 

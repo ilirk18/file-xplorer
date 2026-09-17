@@ -72,6 +72,14 @@ pub const CMD_ACTIONS: usize = 151;
 pub const CMD_PIN_ACTION: usize = 152;
 pub const CMD_SHARE: usize = 153;
 pub const CMD_DEFAULT_APP: usize = 154;
+pub const CMD_THEME: usize = 155;
+pub const CMD_FONT: usize = 156;
+pub const CMD_FONT_SIZE: usize = 157;
+pub const CMD_DENSITY: usize = 158;
+pub const CMD_MAP_DRIVE: usize = 159;
+pub const CMD_DISCONNECT_DRIVE: usize = 160;
+pub const CMD_FOLDER_SIZES: usize = 161;
+pub const CMD_SETTINGS: usize = 162;
 
 /// Everything the palette can reach. The context menu builds from the same
 /// list, so a command is described in exactly one place.
@@ -142,6 +150,14 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_GRID, label: "Toggle icon view", keys: "Ctrl+Shift+I" },
     CommandDef { id: CMD_BIND, label: "Change a shortcut", keys: "" },
     CommandDef { id: CMD_TOGGLE_THEME, label: "Toggle dark / light theme", keys: "Ctrl+Shift+D" },
+    CommandDef { id: CMD_THEME, label: "Choose a theme\u{2026}", keys: "" },
+    CommandDef { id: CMD_FONT, label: "Choose a font\u{2026}", keys: "" },
+    CommandDef { id: CMD_FONT_SIZE, label: "Text size\u{2026}", keys: "" },
+    CommandDef { id: CMD_DENSITY, label: "Row density\u{2026}", keys: "" },
+    CommandDef { id: CMD_MAP_DRIVE, label: "Map a network drive\u{2026}", keys: "" },
+    CommandDef { id: CMD_DISCONNECT_DRIVE, label: "Disconnect a network drive\u{2026}", keys: "" },
+    CommandDef { id: CMD_FOLDER_SIZES, label: "Toggle automatic folder sizes", keys: "" },
+    CommandDef { id: CMD_SETTINGS, label: "Settings", keys: "Ctrl+Comma" },
 ];
 
 /// Rename the selection from a pattern, previewed before anything happens.
@@ -226,8 +242,8 @@ pub enum BarMenu {
     New,
     Sort,
     View,
-    /// Whatever did not fit on the bar, plus the palette.
-    Overflow,
+    /// Every setting, plus whatever did not fit on the bar.
+    Settings,
 }
 
 pub struct BarItem {
@@ -253,8 +269,8 @@ pub const BAR: &[BarItem] = &[
     BarItem { glyph: crate::renderer::glyph::SHARE, label: "", action: BarAction::Run(CMD_SHARE), right: false },
     BarItem { glyph: crate::renderer::glyph::SORT, label: "Sort", action: BarAction::Menu(BarMenu::Sort), right: false },
     BarItem { glyph: crate::renderer::glyph::VIEW, label: "View", action: BarAction::Menu(BarMenu::View), right: false },
-    BarItem { glyph: crate::renderer::glyph::MORE, label: "", action: BarAction::Menu(BarMenu::Overflow), right: true },
-    BarItem { glyph: crate::renderer::glyph::PANE, label: "Details", action: BarAction::Run(CMD_INSPECTOR), right: true },
+    BarItem { glyph: crate::renderer::glyph::SETTINGS, label: "", action: BarAction::Menu(BarMenu::Settings), right: true },
+    BarItem { glyph: crate::renderer::glyph::PANE_CLOSED, label: "Details", action: BarAction::Run(CMD_INSPECTOR), right: true },
 ];
 
 /// What a button is called when it is not being drawn: in the overflow menu,
@@ -263,9 +279,22 @@ pub fn bar_name(item: &BarItem) -> &'static str {
     match item.action {
         BarAction::Run(cmd) => label_for(cmd),
         // The only button that draws no name at all.
-        BarAction::Menu(BarMenu::Overflow) => "More",
+        BarAction::Menu(BarMenu::Settings) => "Settings",
         // Every other menu button carries its name on the bar already.
         BarAction::Menu(_) => item.label,
+    }
+}
+
+/// Whether a button shows something that is currently on.
+///
+/// Only toggles can be on, and the bar has one; the table carries the off
+/// glyph, so this is also where the on one is chosen.
+pub fn bar_state(state: &AppState, action: BarAction) -> (bool, &'static str) {
+    match action {
+        BarAction::Run(CMD_INSPECTOR) if state.inspector => {
+            (true, crate::renderer::glyph::PANE_OPEN)
+        }
+        _ => (false, ""),
     }
 }
 
@@ -307,9 +336,15 @@ const SORT_FIRST: usize = 9000;
 const ORDER_ASC: usize = 9100;
 const ORDER_DESC: usize = 9101;
 const ICON_FIRST: usize = 9200;
-/// `BAR_FIRST + index` reopens a bar button from the overflow menu, which is
+/// `BAR_FIRST + index` reopens a bar button from the settings menu, which is
 /// how a hidden *Sort* still drops its own menu rather than doing nothing.
 const BAR_FIRST: usize = 9300;
+/// The settings menu's own choices. Each block is `FIRST + index` into the
+/// table it comes from, and they are claimed in descending order below so no
+/// range can swallow another.
+const THEME_FIRST: usize = 9400;
+const TEXT_FIRST: usize = 9500;
+const DENSITY_FIRST: usize = 9600;
 
 /// Drop a menu under a bar button, using the same themed menu as the context
 /// menu so it looks like part of the app rather than part of Windows.
@@ -320,7 +355,7 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
     let pid = state.focused;
     // Which buttons did not fit. The layout already answered this: anything it
     // could not place got an empty rectangle and was never drawn.
-    let hidden: Vec<usize> = if which == BarMenu::Overflow {
+    let hidden: Vec<usize> = if which == BarMenu::Settings {
         let placed = state.layout().bar_items;
         BAR.iter()
             .enumerate()
@@ -337,6 +372,10 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
     let list = state.pane(pid).list();
     let (key, order) = (list.sort_key, list.sort_order);
     let icons = state.icons;
+    let theme = state.theme;
+    let font = state.font.clone();
+    let font_size = state.font_size;
+    let density = state.density;
     let binds = state.bindings.clone();
     // A bullet rather than a checkmark column: the themed menu draws one string
     // per row, and three spaces keep the unticked entries lined up with it.
@@ -387,7 +426,9 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
                     );
                 }
             }
-            BarMenu::Overflow => {
+            BarMenu::Settings => {
+                // What did not fit on the bar comes first, because it is the
+                // thing the window is currently hiding rather than a setting.
                 for i in &hidden {
                     let it = &BAR[*i];
                     let accel = match it.action {
@@ -399,6 +440,93 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
                 if !hidden.is_empty() {
                     themed.separator(menu);
                 }
+
+                // Appearance. Three lists of named choices, so three
+                // submenus with a bullet against the one in force.
+                if let Some(sub) = themed.submenu(menu, "Theme") {
+                    for (i, t) in crate::theme::THEMES.iter().enumerate() {
+                        themed.add(
+                            sub,
+                            THEME_FIRST + i,
+                            &format!("{}{}", tick(i == theme.index()), t.name),
+                            if t.dark { "Dark" } else { "Light" },
+                        );
+                    }
+                }
+                if let Some(sub) = themed.submenu(menu, "Text size") {
+                    for (i, pct) in crate::layout::FONT_STEPS.iter().enumerate() {
+                        themed.add(
+                            sub,
+                            TEXT_FIRST + i,
+                            &format!("{}{}%", tick(*pct == font_size), pct),
+                            if *pct == 100 { "Default" } else { "" },
+                        );
+                    }
+                }
+                if let Some(sub) = themed.submenu(menu, "Row density") {
+                    for (i, (name, pct)) in crate::layout::DENSITY_STEPS.iter().enumerate() {
+                        themed.add(
+                            sub,
+                            DENSITY_FIRST + i,
+                            &format!("{}{}", tick(*pct == density), name),
+                            &format!("{}%", pct),
+                        );
+                    }
+                }
+                themed.add(menu, CMD_FONT, &format!("Font: {}\u{2026}", font), "");
+                themed.separator(menu);
+
+                // What is on screen.
+                let check = |on: bool| if on { "\u{2713} " } else { "   " };
+                themed.add(
+                    menu,
+                    CMD_TOGGLE_SIDEBAR,
+                    &format!("{}Sidebar", check(state.sidebar_visible)),
+                    &binds.text_for(CMD_TOGGLE_SIDEBAR),
+                );
+                themed.add(
+                    menu,
+                    CMD_INSPECTOR,
+                    &format!("{}Details panel", check(state.inspector)),
+                    &binds.text_for(CMD_INSPECTOR),
+                );
+                themed.add(
+                    menu,
+                    CMD_TOGGLE_BAR,
+                    &format!("{}Command bar", check(state.command_bar)),
+                    &binds.text_for(CMD_TOGGLE_BAR),
+                );
+                themed.add(
+                    menu,
+                    CMD_TOGGLE_HIDDEN,
+                    &format!("{}Hidden files", check(state.show_hidden)),
+                    &binds.text_for(CMD_TOGGLE_HIDDEN),
+                );
+                themed.separator(menu);
+
+                // How it behaves.
+                themed.add(
+                    menu,
+                    CMD_SYNC_SCROLL,
+                    &format!("{}Synchronised scrolling", check(state.sync_scroll)),
+                    &binds.text_for(CMD_SYNC_SCROLL),
+                );
+                themed.add(
+                    menu,
+                    CMD_COMPARE,
+                    &format!("{}Compare panes", check(state.compare)),
+                    &binds.text_for(CMD_COMPARE),
+                );
+                themed.add(
+                    menu,
+                    CMD_FOLDER_SIZES,
+                    &format!("{}Folder sizes on opening", check(state.folder_sizes)),
+                    "",
+                );
+                themed.separator(menu);
+
+                themed.add(menu, CMD_BIND, "Change a shortcut\u{2026}", "");
+                themed.add(menu, CMD_DEFAULT_APP, "Default file manager\u{2026}", "");
                 themed.add(
                     menu,
                     CMD_PALETTE,
@@ -409,18 +537,29 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
         }
         themed.apply(menu);
 
+        // A menu hangs from the edge its button is anchored to, or the one
+        // on the right opens off the side of the window.
+        let from_right = BAR
+            .iter()
+            .any(|b| b.action == BarAction::Menu(which) && b.right);
+
         // TrackPopupMenu wants screen coordinates. The button rect is client
         // space, the same units the layout uses everywhere else — converting
         // here is what the context menu already does for its anchor.
         let mut pt = POINT {
-            x: rect.x,
+            x: if from_right { rect.right() } else { rect.x },
             y: rect.bottom(),
         };
         let _ = ClientToScreen(hwnd, &mut pt);
 
+        let align = if from_right {
+            TPM_RIGHTALIGN
+        } else {
+            TPM_LEFTALIGN
+        };
         let cmd = TrackPopupMenu(
             menu,
-            TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_NONOTIFY,
+            TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_NONOTIFY | align,
             pt.x,
             pt.y,
             None,
@@ -432,7 +571,20 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
         if id == 0 {
             return;
         }
-        if id >= BAR_FIRST {
+        if id >= DENSITY_FIRST {
+            if let Some((_, pct)) = crate::layout::DENSITY_STEPS.get(id - DENSITY_FIRST) {
+                state.density = *pct;
+                apply_font(state, hwnd);
+            }
+        } else if id >= TEXT_FIRST {
+            if let Some(pct) = crate::layout::FONT_STEPS.get(id - TEXT_FIRST) {
+                state.font_size = *pct;
+                apply_font(state, hwnd);
+            }
+        } else if id >= THEME_FIRST {
+            let want = crate::theme::Theme::at(id - THEME_FIRST);
+            crate::input::set_theme(state, hwnd, want);
+        } else if id >= BAR_FIRST {
             // A button that did not fit, run from the overflow menu. Menus
             // reopen under the overflow button, which is where the click was.
             do_bar(state, hwnd, id - BAR_FIRST, rect);
@@ -457,6 +609,236 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
         } else {
             run_command(state, hwnd, id);
         }
+    }
+}
+
+/// Open the settings menu, from the keyboard or from the palette.
+///
+/// Anchored under the gear button when the bar is showing, and under the top
+/// of the focused pane when it is not \u2014 a menu has to come from
+/// somewhere, and it is still the same menu.
+pub fn do_settings(state: &mut AppState, hwnd: HWND) {
+    let layout = state.layout();
+    let at = BAR
+        .iter()
+        .position(|b| b.action == BarAction::Menu(BarMenu::Settings))
+        .and_then(|i| layout.bar_items.get(i).copied())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| {
+            // No bar to hang from: the top-right of the pane, which is where
+            // the button would have been.
+            let b = layout.pane(state.focused).bounds;
+            crate::layout::Rect::new(b.right(), b.y, 0, 0)
+        });
+    bar_menu(state, hwnd, BarMenu::Settings, at);
+}
+
+/// Map or disconnect a network drive.
+///
+/// Windows owns both dialogs \u2014 they know about credentials, saved
+/// connections and the "reconnect at sign-in" box, none of which this app has
+/// any business reimplementing.
+pub fn do_network_drive(state: &mut AppState, hwnd: HWND, connect: bool) {
+    use windows::Win32::NetworkManagement::WNet::{
+        WNetConnectionDialog, WNetDisconnectDialog, RESOURCETYPE_DISK,
+    };
+    if state.modal {
+        return;
+    }
+    state.modal = true;
+    let result = unsafe {
+        if connect {
+            WNetConnectionDialog(hwnd, RESOURCETYPE_DISK.0)
+        } else {
+            WNetDisconnectDialog(Some(hwnd), RESOURCETYPE_DISK.0)
+        }
+    };
+    state.modal = false;
+
+    // 0 is success and 0xFFFFFFFF is "the user cancelled", which is not a
+    // failure and not worth a message box.
+    let result = result.0;
+    if result != 0 && result != u32::MAX {
+        report_error(
+            hwnd,
+            if connect { "Map network drive" } else { "Disconnect" },
+            &format!("Windows reported error {}", result),
+        );
+    }
+    // Either way the drive list may have changed.
+    state.drives = fs::drives();
+}
+
+/// Size the folders in a pane's listing, if the setting is on.
+///
+/// ponytail: the whole listing in one pass rather than only the rows on
+/// screen, capped at `AUTO_SIZE_LIMIT` folders. On-screen-only sounds cheaper
+/// but is not \u2014 twenty visible folders holding a hundred thousand files
+/// each cost the same walk \u2014 and it needs sizing to re-trigger on every
+/// scroll. Per-row sizing driven by the scroll position is the upgrade.
+pub const AUTO_SIZE_LIMIT: usize = 256;
+
+pub fn auto_folder_sizes(state: &mut AppState, hwnd: HWND, pid: PaneId) {
+    if !state.folder_sizes {
+        return;
+    }
+    let pane = state.pane(pid);
+    let dir = pane.current_path().to_string();
+    if dir.is_empty() || crate::shellns::is_shell_path(&dir) {
+        return;
+    }
+    let names: Vec<String> = pane
+        .list()
+        .entries
+        .iter()
+        .filter(|e| e.is_dir && !e.is_reparse)
+        .map(|e| e.name.clone())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    if names.len() > AUTO_SIZE_LIMIT {
+        state.status_override = Some(format!(
+            "{} folders here, so sizing them is still on request",
+            names.len()
+        ));
+        return;
+    }
+    let tab_id = state.pane(pid).active_tab_id();
+    spawn_dir_sizes(hwnd, pid, tab_id, dir, names);
+}
+
+/// Rebuild everything that is measured in text: the formats the renderer
+/// draws with, and the metrics the layout measures with.
+///
+/// One function because the two cannot disagree — a row sized for 100% text
+/// with 150% text in it is a clipped row.
+fn apply_font(state: &mut AppState, hwnd: HWND) {
+    let (font, size) = (state.font.clone(), state.font_size);
+    if let Err(e) = state.renderer.set_font(&font, size) {
+        report_error(hwnd, "Font", &format!("{}", e));
+        return;
+    }
+    state.apply_metrics();
+    invalidate(hwnd);
+}
+
+/// Every font installed, filtered as you type.
+pub fn do_font(state: &mut AppState, hwnd: HWND) {
+    if state.modal {
+        return;
+    }
+    let here = state.font.clone();
+    let families = state.renderer.font_families();
+    if families.is_empty() {
+        state.status_override = Some("Could not read the installed fonts".into());
+        return;
+    }
+    let items: Vec<palette::Item> = families
+        .iter()
+        .map(|f| palette::Item {
+            label: f.clone(),
+            detail: if f.eq_ignore_ascii_case(&here) {
+                "current".into()
+            } else {
+                String::new()
+            },
+        })
+        .collect();
+
+    state.modal = true;
+    let chosen = palette::pick(hwnd, state.dpi, "Font", items);
+    state.modal = false;
+
+    if let Some(i) = chosen {
+        state.font = families[i].clone();
+        apply_font(state, hwnd);
+    }
+}
+
+/// Text size, as a percentage of the design size.
+pub fn do_font_size(state: &mut AppState, hwnd: HWND) {
+    if state.modal {
+        return;
+    }
+    let here = state.font_size;
+    let items: Vec<palette::Item> = crate::layout::FONT_STEPS
+        .iter()
+        .map(|pct| palette::Item {
+            label: format!("{}%", pct),
+            detail: match (*pct == here, *pct == 100) {
+                (true, _) => "current".into(),
+                (_, true) => "default".into(),
+                _ => String::new(),
+            },
+        })
+        .collect();
+
+    state.modal = true;
+    let chosen = palette::pick(hwnd, state.dpi, "Text size", items);
+    state.modal = false;
+
+    if let Some(i) = chosen {
+        state.font_size = crate::layout::FONT_STEPS[i];
+        apply_font(state, hwnd);
+    }
+}
+
+/// How much room a row gets beyond what its text needs.
+pub fn do_density(state: &mut AppState, hwnd: HWND) {
+    if state.modal {
+        return;
+    }
+    let here = state.density;
+    let items: Vec<palette::Item> = crate::layout::DENSITY_STEPS
+        .iter()
+        .map(|(name, pct)| palette::Item {
+            label: (*name).to_string(),
+            detail: if *pct == here {
+                "current".into()
+            } else {
+                format!("{}%", pct)
+            },
+        })
+        .collect();
+
+    state.modal = true;
+    let chosen = palette::pick(hwnd, state.dpi, "Row density", items);
+    state.modal = false;
+
+    if let Some(i) = chosen {
+        state.density = crate::layout::DENSITY_STEPS[i].1;
+        apply_font(state, hwnd);
+    }
+}
+
+/// Pick a theme by name. Ctrl+Shift+D stays the light switch; this is the
+/// rest of the table.
+pub fn do_theme(state: &mut AppState, hwnd: HWND) {
+    use crate::theme::{Theme, THEMES};
+    if state.modal {
+        return;
+    }
+    let here = state.theme;
+    let items: Vec<palette::Item> = THEMES
+        .iter()
+        .enumerate()
+        .map(|(i, t)| palette::Item {
+            label: t.name.to_string(),
+            detail: match (i == here.index(), t.dark) {
+                (true, _) => "current".into(),
+                (_, true) => "dark".into(),
+                (_, false) => "light".into(),
+            },
+        })
+        .collect();
+
+    state.modal = true;
+    let chosen = palette::pick(hwnd, state.dpi, "Theme", items);
+    state.modal = false;
+
+    if let Some(i) = chosen {
+        crate::input::set_theme(state, hwnd, Theme::at(i));
     }
 }
 
@@ -731,33 +1113,52 @@ pub fn prompt_search_contents(state: &mut AppState, hwnd: HWND) {
     start_search(state, hwnd, search::Query::by_content(text.trim()));
 }
 
-/// Walk each named folder on a worker thread and post the totals back.
+/// Walk each named folder on a worker thread and post the totals back as they
+/// arrive.
+///
+/// In batches rather than one message per folder: the list rebuilds itself on
+/// every batch, and rebuilding once per folder would be a filter and a sort per
+/// answer. In batches rather than one message at the end, because one slow
+/// folder should not hold back the twenty that were quick — which is the
+/// difference between automatic sizing being usable and being a spinner.
 pub fn spawn_dir_sizes(hwnd: HWND, pid: PaneId, tab_id: u64, dir: String, names: Vec<String>) {
+    const BATCH: std::time::Duration = std::time::Duration::from_millis(400);
     let owner = ops::OwnerWindow(hwnd);
     std::thread::spawn(move || {
-        let sizes = names
-            .into_iter()
-            .map(|n| {
-                let size = fs::dir_size(&fs::path_join(&dir, &n));
-                (n, size)
-            })
-            .collect();
-        let raw = Box::into_raw(Box::new(SizesDone {
-            pid,
-            tab_id,
-            sizes,
-        }));
-        let posted = unsafe {
-            PostMessageW(
-                Some(owner.hwnd()),
-                WM_APP_SIZES_DONE,
-                WPARAM(0),
-                LPARAM(raw as isize),
-            )
+        let post = |sizes: Vec<(String, u64)>| -> bool {
+            if sizes.is_empty() {
+                return true;
+            }
+            let raw = Box::into_raw(Box::new(SizesDone { pid, tab_id, sizes }));
+            let posted = unsafe {
+                PostMessageW(
+                    Some(owner.hwnd()),
+                    WM_APP_SIZES_DONE,
+                    WPARAM(0),
+                    LPARAM(raw as isize),
+                )
+            };
+            if posted.is_err() {
+                // Nobody is going to take ownership of it now.
+                unsafe { drop(Box::from_raw(raw)) };
+                return false;
+            }
+            true
         };
-        if posted.is_err() {
-            unsafe { drop(Box::from_raw(raw)) };
+
+        let mut batch: Vec<(String, u64)> = Vec::new();
+        let mut since = std::time::Instant::now();
+        for n in names {
+            let size = fs::dir_size(&fs::path_join(&dir, &n));
+            batch.push((n, size));
+            if since.elapsed() >= BATCH {
+                if !post(std::mem::take(&mut batch)) {
+                    return; // the window has gone
+                }
+                since = std::time::Instant::now();
+            }
         }
+        post(batch);
     });
 }
 
@@ -1635,6 +2036,26 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_SEARCH_CONTENTS => prompt_search_contents(state, hwnd),
         CMD_BATCH_RENAME => do_batch_rename(state, hwnd),
         CMD_TOGGLE_THEME => toggle_theme(state, hwnd),
+        CMD_THEME => do_theme(state, hwnd),
+        CMD_FONT => do_font(state, hwnd),
+        CMD_FONT_SIZE => do_font_size(state, hwnd),
+        CMD_DENSITY => do_density(state, hwnd),
+        CMD_SETTINGS => do_settings(state, hwnd),
+        CMD_MAP_DRIVE | CMD_DISCONNECT_DRIVE => do_network_drive(state, hwnd, cmd == CMD_MAP_DRIVE),
+        CMD_FOLDER_SIZES => {
+            state.folder_sizes = !state.folder_sizes;
+            state.status_override = Some(
+                if state.folder_sizes {
+                    "Folder sizes will be calculated on opening a folder"
+                } else {
+                    "Folder sizes are calculated on request"
+                }
+                .into(),
+            );
+            if state.folder_sizes {
+                auto_folder_sizes(state, hwnd, state.focused);
+            }
+        }
         CMD_TOGGLE_HIDDEN => toggle_hidden(state, hwnd),
         CMD_TOGGLE_SIDEBAR => {
             state.sidebar_visible = !state.sidebar_visible;
@@ -1779,6 +2200,23 @@ mod tests {
             assert_eq!(id_for_label(c.label), Some(c.id), "{}", c.label);
             assert_eq!(label_for(c.id), c.label);
         }
+    }
+
+    #[test]
+    fn the_menus_id_blocks_cannot_swallow_one_another() {
+        // Every block is FIRST + index into a table, and `bar_menu` claims
+        // them in descending order. A table that outgrew the gap below the
+        // next block would be read as the wrong setting entirely \u2014 a
+        // theme applied as a density \u2014 so the gaps are checked against
+        // the tables rather than eyeballed.
+        assert!(COMMANDS.iter().all(|c| c.id < SORT_FIRST), "commands sit below");
+        assert!(SORT_FIRST + 4 <= ORDER_ASC);
+        assert!(ORDER_ASC < ORDER_DESC && ORDER_DESC < ICON_FIRST);
+        assert!(ICON_FIRST + 1 + crate::layout::ICON_STEPS.len() <= BAR_FIRST);
+        assert!(BAR_FIRST + BAR.len() <= THEME_FIRST);
+        assert!(THEME_FIRST + crate::theme::THEMES.len() <= TEXT_FIRST);
+        assert!(TEXT_FIRST + crate::layout::FONT_STEPS.len() <= DENSITY_FIRST);
+        assert!(!crate::layout::DENSITY_STEPS.is_empty());
     }
 
     #[test]

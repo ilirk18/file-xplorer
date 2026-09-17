@@ -174,23 +174,47 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Metrics at 100% text and normal density, which is what almost every
+    /// caller wants and every test does.
     pub fn for_dpi(dpi: u32) -> Self {
+        Self::sized(dpi, 100, 100)
+    }
+
+    /// `font` and `density` are percentages.
+    ///
+    /// Anything a line of text sits in follows both: bigger text in a row that
+    /// did not grow is clipped text, which is why density cannot shrink a row
+    /// below what the font needs. Gaps follow density alone — that is the
+    /// part that is taste rather than legibility.
+    pub fn sized(dpi: u32, font: i32, density: i32) -> Self {
         let scale = dpi as f32 / 96.0;
-        let s = |v: f32| (v * scale).round() as i32;
+        let font = (font.clamp(FONT_MIN, FONT_MAX) as f32) / 100.0;
+        let density = (density.clamp(DENSITY_MIN, DENSITY_MAX) as f32) / 100.0;
+        // Rows: the text's scale, then density on top of it.
+        let s = |v: f32| (v * scale * font * density).round() as i32;
+        // Fixed furniture: chrome that holds no text, or whose size is a
+        // pointer target rather than a reading distance.
+        let f = |v: f32| (v * scale).round() as i32;
+        // Gaps.
+        let g = |v: f32| (v * scale * density).round() as i32;
+        // Text, without density: for the one row that is already full. Density
+        // takes back the slack around a line of text, and a drive row has none
+        // — two lines and a capacity bar, stacked.
+        let t = |v: f32| (v * scale * font).round() as i32;
         Self {
             scale,
 
             tab_bar_h: s(30.0),
             tab_min_w: s(96.0),
             tab_max_w: s(190.0),
-            tab_close_w: s(18.0),
-            new_tab_w: s(26.0),
+            tab_close_w: f(18.0),
+            new_tab_w: f(26.0),
 
             toolbar_h: s(30.0),
             bar_h: s(38.0),
-            bar_btn_w: s(34.0),
-            bar_gap: s(3.0),
-            nav_btn_w: s(26.0),
+            bar_btn_w: f(34.0),
+            bar_gap: g(3.0),
+            nav_btn_w: f(26.0),
             header_h: s(24.0),
             footer_h: s(24.0),
             // Dense by design: this is a list you scan, not a form you read.
@@ -200,17 +224,17 @@ impl Metrics {
             inspector_w: s(300.0),
             sidebar_section_h: s(26.0),
             sidebar_row_h: s(24.0),
-            sidebar_drive_h: s(46.0),
-            capacity_bar_h: s(3.0),
+            sidebar_drive_h: t(46.0),
+            capacity_bar_h: f(3.0),
 
-            divider_w: s(6.0),
-            scrollbar_w: s(11.0),
-            scrollbar_min_thumb: s(28.0),
+            divider_w: f(6.0),
+            scrollbar_w: f(11.0),
+            scrollbar_min_thumb: f(28.0),
             min_pane_w: s(240.0),
             min_pane_h: s(140.0),
             icon_size: s(16.0),
             icon_steps: ICON_STEPS,
-            pad: s(8.0),
+            pad: g(8.0),
             radius: 4.0 * scale,
 
             col_type_w: s(96.0),
@@ -753,6 +777,19 @@ pub enum Hit {
 /// a screenshot in. Doubling roughly each step, so a wheel notch is a visible
 /// change rather than a nudge.
 pub const ICON_STEPS: &[i32] = &[32, 48, 72, 104, 144, 192, 256];
+
+/// Text size and density, as percentages. The bounds are where the layout
+/// still works: below the minimum the columns stop fitting their headers,
+/// above the maximum a row is taller than the list.
+pub const FONT_MIN: i32 = 80;
+pub const FONT_MAX: i32 = 200;
+pub const DENSITY_MIN: i32 = 80;
+pub const DENSITY_MAX: i32 = 140;
+/// The sizes offered, rather than a free number: every one of these is a step
+/// somebody can see.
+pub const FONT_STEPS: &[i32] = &[80, 90, 100, 110, 125, 150, 175, 200];
+pub const DENSITY_STEPS: &[(&str, i32)] =
+    &[("Compact", 85), ("Normal", 100), ("Roomy", 120)];
 
 /// The details list, as an icon size. Zero is not a size, which is what makes
 /// "one scalar decides the view" work: no separate flag to keep in step.
@@ -2518,6 +2555,38 @@ mod tests {
         for pair in drawn.windows(2) {
             assert!(pair[0].right() <= pair[1].x, "and none of them overlap");
         }
+    }
+
+    #[test]
+    fn a_row_never_ends_up_smaller_than_its_text() {
+        let base = Metrics::for_dpi(96);
+        let big = Metrics::sized(96, 150, 100);
+        assert!(big.row_h > base.row_h, "text grew, the row did not");
+
+        // Density thins a row out, but only on top of what the text needs:
+        // the most compact setting at 150% text is still roomier than normal
+        // at 100%, because the alternative is clipped glyphs.
+        let compact = Metrics::sized(96, 150, DENSITY_MIN);
+        assert!(compact.row_h > base.row_h, "density undercut the font");
+        assert!(compact.row_h < big.row_h, "and still did something");
+
+        // A scrollbar is a pointer target, not a reading distance.
+        assert_eq!(big.scrollbar_w, base.scrollbar_w);
+
+        // A drive row is two lines of text and a capacity bar with no slack
+        // between them, so density does not get to squeeze it: at compact, the
+        // bar was being drawn through the label.
+        assert_eq!(
+            Metrics::sized(96, 100, DENSITY_MIN).sidebar_drive_h,
+            base.sidebar_drive_h
+        );
+        assert!(Metrics::sized(96, 150, DENSITY_MIN).sidebar_drive_h > base.sidebar_drive_h);
+
+        // A settings file is text, and text gets typed.
+        assert_eq!(
+            Metrics::sized(96, 10_000, -5).row_h,
+            Metrics::sized(96, FONT_MAX, DENSITY_MIN).row_h
+        );
     }
 
     #[test]

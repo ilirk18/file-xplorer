@@ -91,7 +91,8 @@ pub fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             if let Some(i) = AppState::col_index(key) {
                 // The edge being dragged is the column's *left* one, so moving
                 // left makes the column wider.
-                let dip = ((start_x - x) as f32 / state.metrics.scale).round() as i32;
+                // Back to stored units, which are pixels at 100% text.
+                let dip = ((start_x - x) as f32 / state.col_scale()).round() as i32;
                 state.col_widths[i] = (start_w + dip).clamp(40, 400);
                 state.apply_col_widths();
                 invalidate(hwnd);
@@ -723,8 +724,14 @@ pub fn update_title(state: &mut AppState, hwnd: HWND) {
 }
 
 pub fn toggle_theme(state: &mut AppState, hwnd: HWND) {
-    state.theme = state.theme.toggled();
-    state.renderer.set_theme(state.theme);
-    apply_titlebar_theme(hwnd, state.theme);
+    set_theme(state, hwnd, state.theme.toggled());
+}
+
+/// The one way the theme changes: the renderer's brushes and the window's
+/// caption both follow from it, and either one left behind is visible.
+pub fn set_theme(state: &mut AppState, hwnd: HWND, theme: crate::theme::Theme) {
+    state.theme = theme;
+    state.renderer.set_theme(theme);
+    apply_titlebar_theme(hwnd, theme);
 }
 

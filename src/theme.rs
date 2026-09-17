@@ -36,11 +36,41 @@ pub fn system_dark() -> bool {
     status.is_err() || value == 0
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub enum Theme {
-    #[default]
-    Dark,
-    Light,
+/// One theme: a palette with a name and a side.
+///
+/// `dark` is not decoration — the window's caption is painted by Windows from
+/// it, and a light palette under a dark caption reads as two title bars.
+pub struct ThemeDef {
+    pub name: &'static str,
+    pub dark: bool,
+    pub palette: Palette,
+}
+
+/// Every theme this app offers.
+///
+/// One table rather than a constant each, because the contrast tests at the
+/// bottom of this file run over all of it: a new theme that fails AA cannot be
+/// added without the suite saying so. That is the only reason this is a table.
+///
+/// Dark and Light come first and stay first — `toggled` is defined in terms
+/// of the first theme of the opposite side.
+pub const THEMES: &[ThemeDef] = &[
+    ThemeDef { name: "Dark", dark: true, palette: DARK },
+    ThemeDef { name: "Light", dark: false, palette: LIGHT },
+    ThemeDef { name: "Midnight", dark: true, palette: MIDNIGHT },
+    ThemeDef { name: "Sepia", dark: false, palette: SEPIA },
+];
+
+/// Which theme, by position in `THEMES`. Constructed only through `at` and
+/// `by_name`, both of which refuse an index that is not in the table, so
+/// `palette()` never has to wonder.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Theme(usize);
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::DARK
+    }
 }
 
 pub type Rgb = (f32, f32, f32);
@@ -160,23 +190,123 @@ const LIGHT: Palette = Palette {
     capacity_full: hex(0xC2552A),
 };
 
+/// Indigo, and darker than Dark. Contrasts are checked by the tests below,
+/// like every other theme here.
+const MIDNIGHT: Palette = Palette {
+    window_bg: hex(0x0B0D16),
+    sidebar_bg: hex(0x11141F),
+    pane_bg: hex(0x171B29),
+    tab_bar_bg: hex(0x11141F),
+    toolbar_bg: hex(0x141828),
+    header_bg: hex(0x141828),
+    footer_bg: hex(0x11141F),
+    field_bg: hex(0x0B0D16),
+
+    row_hover: hex(0x222840),
+    selection: hex(0x4C5FD7),
+    selection_inactive: hex(0x2A3048),
+    cursor_outline: hex(0x8A9BFF),
+
+    text: hex(0xE6E9F5),
+    text_muted: hex(0xA6AEC9),
+    text_faint: hex(0x737B96),
+    text_on_selection: hex(0xFFFFFF),
+
+    tab_active: hex(0x171B29),
+    tab_hover: hex(0x1B2032),
+    divider: hex(0x2A3048),
+    accent: hex(0x7A8CFF),
+    scrollbar_thumb: hex(0x3A4160),
+    scrollbar_thumb_hover: hex(0x566083),
+
+    capacity_track: hex(0x2A3048),
+    capacity_fill: hex(0x4C5FD7),
+    capacity_full: hex(0xD9683A),
+};
+
+/// Paper rather than screen. The warm greys are what a light theme is for if
+/// white is what you are trying to get away from.
+const SEPIA: Palette = Palette {
+    window_bg: hex(0xEDE6D8),
+    sidebar_bg: hex(0xF3EDE1),
+    pane_bg: hex(0xFBF6EC),
+    tab_bar_bg: hex(0xE8E0D0),
+    toolbar_bg: hex(0xF6F1E6),
+    header_bg: hex(0xF6F1E6),
+    footer_bg: hex(0xF3EDE1),
+    field_bg: hex(0xFFFCF5),
+
+    row_hover: hex(0xEDE3CE),
+    selection: hex(0x8A5A12),
+    selection_inactive: hex(0xE2D8C4),
+    cursor_outline: hex(0x7A4E10),
+
+    text: hex(0x2A2318),
+    text_muted: hex(0x5F5645),
+    text_faint: hex(0x8A8170),
+    text_on_selection: hex(0xFFFFFF),
+
+    tab_active: hex(0xFBF6EC),
+    tab_hover: hex(0xF1EADC),
+    divider: hex(0xD9CFBB),
+    accent: hex(0x8A5A12),
+    scrollbar_thumb: hex(0xC3B8A2),
+    scrollbar_thumb_hover: hex(0x9C9179),
+
+    capacity_track: hex(0xDCD2BE),
+    capacity_fill: hex(0x8A5A12),
+    capacity_full: hex(0xB3491F),
+};
+
 impl Theme {
-    pub fn palette(self) -> &'static Palette {
-        match self {
-            Theme::Dark => &DARK,
-            Theme::Light => &LIGHT,
+    pub const DARK: Theme = Theme(0);
+
+    /// A theme by position, falling back to the default rather than panicking:
+    /// the index can come from a settings file somebody edited.
+    pub fn at(index: usize) -> Self {
+        if index < THEMES.len() {
+            Theme(index)
+        } else {
+            Theme::default()
         }
     }
 
-    pub fn toggled(self) -> Self {
-        match self {
-            Theme::Dark => Theme::Light,
-            Theme::Light => Theme::Dark,
-        }
+    pub fn by_name(name: &str) -> Option<Self> {
+        THEMES
+            .iter()
+            .position(|t| t.name.eq_ignore_ascii_case(name.trim()))
+            .map(Theme)
+    }
+
+    fn def(self) -> &'static ThemeDef {
+        &THEMES[self.0]
+    }
+
+    pub fn name(self) -> &'static str {
+        self.def().name
+    }
+
+    pub fn index(self) -> usize {
+        self.0
+    }
+
+    pub fn palette(self) -> &'static Palette {
+        &self.def().palette
     }
 
     pub fn is_dark(self) -> bool {
-        matches!(self, Theme::Dark)
+        self.def().dark
+    }
+
+    /// The other side. Ctrl+D is a light switch, not a tour of the table —
+    /// so from any dark theme this is the first light one, and back again.
+    pub fn toggled(self) -> Self {
+        let want = !self.is_dark();
+        THEMES
+            .iter()
+            .position(|t| t.dark == want)
+            .map(Theme)
+            .unwrap_or(self)
     }
 }
 
@@ -202,6 +332,10 @@ mod tests {
         (hi + 0.05) / (lo + 0.05)
     }
 
+    fn every_theme() -> impl Iterator<Item = Theme> {
+        (0..THEMES.len()).map(Theme::at)
+    }
+
     #[test]
     fn hex_round_trips() {
         assert_eq!(hex(0xFFFFFF), (1.0, 1.0, 1.0));
@@ -214,7 +348,7 @@ mod tests {
 
     #[test]
     fn body_text_is_comfortably_readable() {
-        for t in [Theme::Dark, Theme::Light] {
+        for t in every_theme() {
             let p = t.palette();
             assert!(
                 contrast(p.text, p.pane_bg) >= 7.0,
@@ -229,7 +363,7 @@ mod tests {
     fn muted_column_text_clears_wcag_aa() {
         // This is the improvement over the look we are chasing: secondary
         // columns there sit around 4:1 and get hard to read.
-        for t in [Theme::Dark, Theme::Light] {
+        for t in every_theme() {
             let p = t.palette();
             let c = contrast(p.text_muted, p.pane_bg);
             assert!(c >= 4.5, "{:?} muted text only {:.1}:1", t, c);
@@ -238,7 +372,7 @@ mod tests {
 
     #[test]
     fn selected_row_text_is_readable() {
-        for t in [Theme::Dark, Theme::Light] {
+        for t in every_theme() {
             let p = t.palette();
             let c = contrast(p.text_on_selection, p.selection);
             assert!(c >= 4.0, "{:?} selection text only {:.1}:1", t, c);
@@ -248,19 +382,46 @@ mod tests {
     #[test]
     fn surfaces_step_in_a_visible_order() {
         // Each surface must be perceptibly distinct from the next, or the
-        // panels blur into one flat sheet.
-        let p = Theme::Dark.palette();
-        let steps = [p.window_bg, p.sidebar_bg, p.pane_bg, p.row_hover];
-        for pair in steps.windows(2) {
-            let d = luminance(pair[1]) - luminance(pair[0]);
-            assert!(d > 0.0005, "surfaces too close: {:?} vs {:?}", pair[0], pair[1]);
+        // panels blur into one flat sheet. Light themes climb too: the window
+        // behind is the darkest thing in them.
+        for t in every_theme() {
+            let p = t.palette();
+            let steps = [p.window_bg, p.sidebar_bg, p.pane_bg];
+            for pair in steps.windows(2) {
+                let d = luminance(pair[1]) - luminance(pair[0]);
+                assert!(d > 0.0005, "{} surfaces too close: {:?}", t.name(), pair[0]);
+            }
         }
+    }
+
+    #[test]
+    fn a_theme_is_reachable_by_name_and_never_by_a_bad_index() {
+        for t in every_theme() {
+            assert_eq!(Theme::by_name(t.name()), Some(t));
+            // Settings files are text, and text gets typed.
+            assert_eq!(Theme::by_name(&t.name().to_uppercase()), Some(t));
+        }
+        assert_eq!(Theme::by_name("Chartreuse"), None);
+        assert_eq!(Theme::at(THEMES.len()), Theme::default());
+    }
+
+    #[test]
+    fn toggling_crosses_to_the_other_side_and_back() {
+        for t in every_theme() {
+            let other = t.toggled();
+            assert_ne!(other.is_dark(), t.is_dark(), "{} did not cross", t.name());
+            // And back to a theme on this side, which for Dark and Light is
+            // the one you started from.
+            assert_eq!(other.toggled().is_dark(), t.is_dark());
+        }
+        assert_eq!(Theme::DARK.toggled().name(), "Light");
+        assert_eq!(Theme::DARK.toggled().toggled(), Theme::DARK);
     }
 
     #[test]
     fn hover_is_visible_against_the_row_background() {
         // The old palette had a 1/255 difference here, which showed as nothing.
-        for t in [Theme::Dark, Theme::Light] {
+        for t in every_theme() {
             let p = t.palette();
             let d = (luminance(p.row_hover) - luminance(p.pane_bg)).abs();
             assert!(d > 0.002, "{:?} hover is invisible ({:.5})", t, d);
