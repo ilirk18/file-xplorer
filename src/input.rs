@@ -85,6 +85,17 @@ pub fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             invalidate(hwnd);
             return;
         }
+        Drag::Column { key, start_x, start_w } => {
+            if let Some(i) = AppState::col_index(key) {
+                // The edge being dragged is the column's *left* one, so moving
+                // left makes the column wider.
+                let dip = ((start_x - x) as f32 / state.metrics.scale).round() as i32;
+                state.col_widths[i] = (start_w + dip).clamp(40, 400);
+                state.apply_col_widths();
+                invalidate(hwnd);
+            }
+            return;
+        }
         Drag::Scrollbar { pid, grab_offset } => {
             let layout = state.layout();
             let p = layout.pane(pid);
@@ -173,28 +184,11 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             unsafe { SetCapture(hwnd) };
         }
 
-        Hit::Sidebar(i) => {
-            let (_, actions) = state.sidebar_model();
-            match actions.get(i) {
-                Some(SidebarAction::ToggleSection(sec)) => {
-                    state.sections_collapsed[*sec] = !state.sections_collapsed[*sec];
-                }
-                Some(SidebarAction::Go(path)) => {
-                    let path = path.clone();
-                    let pid = state.focused;
-                    let req = state.pane_mut(pid).navigate(&path);
-                    spawn_dir_load(hwnd, pid, req);
-                }
-                None => {}
-            }
-        }
+        Hit::Sidebar(i) => on_sidebar_click(state, hwnd, i, false),
 
-        Hit::SidebarChevron(i) => {
-            let (_, actions) = state.sidebar_model();
-            if let Some(SidebarAction::ToggleSection(sec)) = actions.get(i) {
-                state.sections_collapsed[*sec] = !state.sections_collapsed[*sec];
-            }
-        }
+        // The chevron is the only part of a tree row that toggles it; the rest
+        // of the row navigates, which is what the label invites.
+        Hit::SidebarChevron(i) => on_sidebar_click(state, hwnd, i, true),
 
         Hit::Nav(pid, which) => {
             state.focused = pid;
@@ -215,6 +209,9 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             state.focused = pid;
             let req = state.pane_mut(pid).switch_tab(i);
             start_load(hwnd, pid, req);
+            // Switching happens now; moving the tab, if the mouse travels far
+            // enough before it comes up, happens on the button up.
+            state.tab_drag = Some((pid, i, x, y));
         }
 
         Hit::TabClose(pid, i) => {
@@ -246,6 +243,18 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
         Hit::Column(pid, key) => {
             state.focused = pid;
             state.pane_mut(pid).list_mut().apply_sort(key);
+        }
+
+        Hit::ColumnEdge(pid, key) => {
+            state.focused = pid;
+            if let Some(i) = AppState::col_index(key) {
+                state.drag = Drag::Column {
+                    key,
+                    start_x: x,
+                    start_w: state.col_widths[i],
+                };
+                unsafe { SetCapture(hwnd) };
+            }
         }
 
         Hit::Row(pid, row) => {
@@ -303,6 +312,35 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
     invalidate(hwnd);
 }
 
+/// One handler for both halves of a sidebar row. `chevron` is true when the
+/// click landed on the expander rather than the label.
+fn on_sidebar_click(state: &mut AppState, hwnd: HWND, index: usize, chevron: bool) {
+    let (_, actions) = state.sidebar_model();
+    match actions.get(index) {
+        Some(SidebarAction::ToggleSection(sec)) => {
+            let sec = *sec;
+            state.sections_collapsed[sec] = !state.sections_collapsed[sec];
+            if sec == SECTION_TREE && !state.sections_collapsed[sec] {
+                state.refresh_tree();
+            }
+        }
+        Some(SidebarAction::Go(path)) => {
+            let path = path.clone();
+            if chevron {
+                // A chevron hit on a tree row arrives here because the row's
+                // action is Go; expanding is what the chevron means.
+                state.tree.toggle(&path);
+                state.refresh_tree();
+                return;
+            }
+            let pid = state.focused;
+            let req = state.pane_mut(pid).navigate(&path);
+            spawn_dir_load(hwnd, pid, req);
+        }
+        None => {}
+    }
+}
+
 pub fn on_double_click(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
     let layout = state.layout();
     let hit = layout.hit_test(x, y);
@@ -330,20 +368,44 @@ pub fn on_double_click(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
     activate_selection(state, hwnd, pid);
 }
 
-/// Enter or double-click: open a folder in place, or hand a file to the shell.
+/// Enter or double-click: open a folder in place, step into an archive, or
+/// hand a file to the shell.
 pub fn activate_selection(state: &mut AppState, hwnd: HWND, pid: PaneId) {
     let pane = state.pane(pid);
     let Some(entry) = pane.list().cursor_entry() else {
         return;
     };
     let dir = pane.current_path().to_string();
-    let target = fs::path_join(&dir, &entry.name);
+    let name = entry.name.clone();
+    let is_dir = entry.is_dir;
+    let target = fs::path_join(&dir, &name);
 
-    if entry.is_dir {
+    // An archive opens like a folder. The path keeps growing through it, so
+    // Back, Up and the breadcrumb work on the way out with no special case.
+    if is_dir || crate::archive::is_archive_name(&name) {
         let req = state.pane_mut(pid).navigate(&target);
         spawn_dir_load(hwnd, pid, req);
         invalidate(hwnd);
-    } else if let Err(e) = ops::shell_open(hwnd, &target) {
+        return;
+    }
+
+    // A file inside an archive has to come out before anything can open it.
+    if let Some((archive, inner)) = crate::archive::split(&target) {
+        state.status_override = Some("Extracting\u{2026}".into());
+        match crate::archive::extract_to_temp(&archive, &inner) {
+            Ok(temp) => {
+                state.status_override = Some("Opened a read-only copy".into());
+                if let Err(e) = ops::shell_open(hwnd, &temp) {
+                    report_error(hwnd, "Cannot open file", &ops::format_hresult(&e));
+                }
+            }
+            Err(e) => report_error(hwnd, "Cannot open file", &e),
+        }
+        invalidate(hwnd);
+        return;
+    }
+
+    if let Err(e) = ops::shell_open(hwnd, &target) {
         report_error(hwnd, "Cannot open file", &ops::format_hresult(&e));
     }
 }
@@ -502,6 +564,7 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
                     start_load(hwnd, pid, req);
                 }
                 (true, false, 'Z') => do_undo(state, hwnd),
+                (true, false, 'L') => do_goto(state, hwnd),
                 (true, false, 'H') => toggle_hidden(state, hwnd),
                 (true, false, 'F') => {
                     // Ctrl+F focuses the pane filter, as it does everywhere else.
@@ -520,10 +583,11 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
                     start_load(hwnd, pid, req);
                 }
                 (true, true, 'F') => prompt_search(state, hwnd),
+                (true, true, 'G') => prompt_search_contents(state, hwnd),
                 (true, true, 'P') => show_palette(state, hwnd),
                 (true, true, 'R') => do_batch_rename(state, hwnd),
                 (true, true, 'N') => do_new_folder(state, hwnd),
-                (true, true, 'C') => copy_or_move_to_other(state, hwnd, false),
+                (true, true, 'C') => do_copy_path(state, hwnd),
                 (true, true, 'M') => copy_or_move_to_other(state, hwnd, true),
                 (true, true, 'D') => toggle_theme(state, hwnd),
                 _ => handled = false,

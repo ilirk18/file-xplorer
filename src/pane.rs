@@ -325,6 +325,43 @@ impl Pane {
         Some(self.begin_load(path, LoadKind::Navigate, None))
     }
 
+    /// Detach a tab so another pane can adopt it. The last tab is never
+    /// detached: a pane with no tabs has nothing to show and nowhere to
+    /// navigate from.
+    pub fn take_tab(&mut self, index: usize) -> Option<Tab> {
+        if index >= self.tabs.len() || self.tabs.len() == 1 {
+            return None;
+        }
+        let tab = self.tabs.remove(index);
+        if self.active_tab_index >= self.tabs.len() {
+            self.active_tab_index = self.tabs.len() - 1;
+        } else if index < self.active_tab_index {
+            self.active_tab_index -= 1;
+        }
+        Some(tab)
+    }
+
+    /// Adopt a tab from another pane and make it active. Its id is reissued,
+    /// because ids only have to be unique within a pane and the one it brought
+    /// may already be taken here.
+    pub fn adopt_tab(&mut self, mut tab: Tab) -> Option<LoadRequest> {
+        tab.id = self.next_tab_id;
+        self.next_tab_id += 1;
+        tab.file_list.row_height = self.row_height;
+        tab.file_list.set_show_hidden(self.show_hidden);
+        self.tabs.push(tab);
+        self.active_tab_index = self.tabs.len() - 1;
+        // Already loaded: the listing came with it and needs no re-read.
+        if !self.active().file_list.entries.is_empty() {
+            return None;
+        }
+        let path = self.current_path().to_string();
+        if path.is_empty() {
+            return None;
+        }
+        Some(self.begin_load(path, LoadKind::Refresh, None))
+    }
+
     /// The paths of every open tab, for saving the session.
     pub fn tab_paths(&self) -> Vec<String> {
         self.tabs
@@ -560,6 +597,47 @@ mod tests {
         // Switching back must not need a reload.
         assert!(pane.switch_tab(0).is_none());
         assert_eq!(pane.list().entries.len(), 2);
+    }
+
+    #[test]
+    fn a_tab_can_move_between_panes_with_its_listing() {
+        let mut a = Pane::new();
+        let r0 = a.navigate("C:\\one");
+        load(&mut a, &r0, &[("x.txt", false)]);
+        let r1 = a.new_tab("C:\\two");
+        load(&mut a, &r1, &[("y.txt", false)]);
+
+        let mut b = Pane::new();
+        let moved = a.take_tab(1).expect("two tabs, so one can leave");
+        assert_eq!(a.tabs.len(), 1);
+        // The listing travels with it, so there is nothing to reload.
+        assert!(b.adopt_tab(moved).is_none());
+        assert_eq!(b.current_path(), "C:\\two");
+        assert_eq!(b.list().entries[0].name, "y.txt");
+    }
+
+    #[test]
+    fn the_last_tab_never_leaves_its_pane() {
+        // A pane with no tabs has nothing to show and nowhere to navigate from.
+        let mut p = Pane::new();
+        assert!(p.take_tab(0).is_none());
+    }
+
+    #[test]
+    fn an_adopted_tab_gets_an_id_that_is_free_here() {
+        let mut a = Pane::new();
+        a.new_tab("C:\\two");
+        let mut b = Pane::new();
+        b.new_tab("C:\\other");
+        let moved = a.take_tab(1).unwrap();
+        let old_id = moved.id;
+        b.adopt_tab(moved);
+        assert_ne!(b.active().id, old_id, "reissued, or a load could land twice");
+        let ids: Vec<u64> = b.tabs.iter().map(|t| t.id).collect();
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(ids.len(), uniq.len());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # File Xplorer
 
-A fast, native, dual-pane file manager for Windows. Win32 + Direct2D, no runtime,
-no framework, ~275 KB.
+A fast, native, multi-pane file manager for Windows. Win32 + Direct2D, no
+runtime, no framework, ~500 KB.
 
 **Full context and phase docs:** see **[docs/INDEX.md](docs/INDEX.md)**.
 
@@ -30,9 +30,14 @@ Install Rust from [rustup.rs](https://rustup.rs/), then open a new terminal so
 
 ## What it does
 
-**One pane by default, two on request.** `Ctrl+2` splits, `Ctrl+1` collapses back.
+**One pane by default, up to four on request.** `Ctrl+1` through `Ctrl+4` choose
+how many. Divider positions are fractions of the window, so resizing keeps the
+panes in proportion instead of squeezing the last one. Panes you hide keep their
+tabs, so `Ctrl+1` then `Ctrl+2` comes back to what was there.
+
 Every tab keeps its own listing, scroll position, selection, and back/forward
-history, so switching tabs is instant.
+history, so switching tabs is instant. Open tabs are restored at startup; only
+the active one loads, the rest read when first shown.
 
 **Real file operations.** Copy, move, delete, rename, and new-folder all run
 through the shell's `IFileOperation`. That means you get the Recycle Bin, the
@@ -54,12 +59,36 @@ is hidden behind a chord you have to remember.
 
 **Recursive search.** `Ctrl+Shift+F` walks the tree on a worker thread and
 streams matches in as it finds them. `*` is allowed (`*.rs`, `test*`).
+`Ctrl+Shift+G` searches inside files instead of names, decoding UTF-8 and
+UTF-16 and skipping anything binary.
+
+**Undo.** `Ctrl+Z` takes back the last copy, move, rename, batch rename or new
+folder. What has no honest inverse says so: a delete belongs to the Recycle
+Bin, and a move gathered from two different folders has no single folder to go
+back to. An undone copy is recycled, never erased.
+
+**Archives as folders.** Press Enter on a `.zip`, `.7z`, `.rar` or `.tar.gz`
+and walk into it; `Backspace` walks back out. Opening a file inside extracts a
+read-only copy first. "Extract from archive" unpacks the selection next to the
+archive. Requires [7-Zip](https://www.7-zip.org/); everything inside an archive
+is read-only, and every destructive operation on such a path is refused rather
+than half-applied.
+
+**Folder tree.** The sidebar's Folders section expands from the drive roots.
+Expanding reads that one folder; collapsing forgets it, which doubles as the
+refresh gesture.
 
 **Batch rename.** `{n}` name, `{e}` extension, `{#}` counter, with a live
 preview that flags collisions and illegal names before anything happens.
 
-**The real Windows context menu.** Right-click shows this app's commands, then
-everything installed software registered: 7-Zip, Git, Open with, Send to.
+**A context menu in the app's own colours.** Our entries are owner-drawn from
+the same palette as everything else, because a Win32 menu otherwise follows the
+*system* theme — a dark app on a light Windows gets a light menu hanging off it.
+
+**A context menu that knows what you clicked.** Right-clicking a row offers
+what applies to that file; right-clicking empty space offers what applies to
+the folder, and ends in "All commands…" for everything else. Below our items
+comes everything installed software registered: 7-Zip, Git, Open with, Send to.
 
 **Drag and drop**, both directions, interoperating with Explorer. Copy by
 default, Shift to move; dropping on a folder row targets that folder.
@@ -76,8 +105,11 @@ past 90%) and your standard folders, each with its real shell icon.
 **Themes.** Dark and light, including the title bar. Both palettes are tested to
 clear WCAG AA contrast for body and secondary text.
 
-**Settings stick.** Pane count, theme, sidebar visibility, hidden files and the
-divider position are written to `%APPDATA%\FileXplorer\settings.txt` on exit.
+**Settings stick.** Pane count, theme, sidebar visibility, hidden files, the
+divider positions, the window box, pinned folders, per-pane sort, column widths
+and every open tab live in `%APPDATA%\FileXplorer\settings.txt`. They are
+written a few seconds after anything changes, not only on exit, so a crash does
+not cost you the session.
 It is plain `key=value` text you can edit or delete; anything unreadable falls
 back to defaults rather than refusing to start.
 
@@ -100,13 +132,19 @@ Bindings follow Windows conventions, with the dual-pane extras on Ctrl+Shift.
 | Up / back / forward | `Backspace` or `Alt+Up` / `Alt+Left` / `Alt+Right`, or mouse buttons 4 and 5 |
 | Command palette | `Ctrl+Shift+P` |
 | Search in this folder and below | `Ctrl+Shift+F` |
+| Search inside files | `Ctrl+Shift+G` |
+| Go to a typed path | `Ctrl+L` |
+| Copy the selection's paths | `Ctrl+Shift+C` |
+| Undo the last operation | `Ctrl+Z` |
 | Batch rename | `Ctrl+Shift+R` |
-| One pane / two panes | `Ctrl+1` / `Ctrl+2` |
-| Switch pane | `Tab` |
+| One to four panes | `Ctrl+1` … `Ctrl+4` |
+| Switch pane | `Tab` (cycles rightwards) |
 | New / close / cycle tab | `Ctrl+T` / `Ctrl+W` / `Ctrl+Tab`, middle-click a tab to close |
 | Refresh | `F5` or `Ctrl+R` |
 | Cut / copy / paste | `Ctrl+X` / `Ctrl+C` / `Ctrl+V` (interoperates with Explorer via `CF_HDROP`) |
-| Copy / move to the other pane | `F6` or `Ctrl+Shift+C` / `Ctrl+Shift+M` |
+| Copy / move to the next pane | `F6` / `Ctrl+Shift+M` |
+| Move a tab to another pane | drag it there |
+| Resize a column | drag its left edge in the header |
 | Delete | `Del` to the Recycle Bin, `Shift+Del` permanently |
 | Rename / new folder | `F2` / `Ctrl+Shift+N` |
 | Filter this pane | `Ctrl+F`, `Esc` to clear |
@@ -115,7 +153,7 @@ Bindings follow Windows conventions, with the dual-pane extras on Ctrl+Shift.
 | Toggle sidebar | `Ctrl+B` |
 | Toggle dark / light | `Ctrl+Shift+D` |
 | Context menu | right-click or `Shift+F10` |
-| Sort | click a column header; click again to reverse |
+| Sort | click a column header (Name, Type, Size, Date); click again to reverse |
 | Resize panes | drag the divider, double-click it to even them up |
 
 ---
@@ -124,7 +162,11 @@ Bindings follow Windows conventions, with the dual-pane extras on Ctrl+Shift.
 
 | File | Responsibility |
 |---|---|
-| `src/main.rs` | Win32 window, message dispatch, input handling, modal prompts |
+| `src/main.rs` | Win32 window, message dispatch, painting |
+| `src/app.rs` | `AppState` and the helpers every other module needs |
+| `src/input.rs` | Mouse and keyboard handlers |
+| `src/commands.rs` | The one command table, the context menu, the file operations |
+| `src/prompt.rs` | The modal text prompt |
 | `src/layout.rs` | **All geometry.** Produces every rectangle; drawing and hit-testing both consume it |
 | `src/renderer.rs` | Direct2D / DirectWrite painting, icon bitmap cache |
 | `src/theme.rs` | Dark and light colour tokens |
@@ -135,7 +177,10 @@ Bindings follow Windows conventions, with the dual-pane extras on Ctrl+Shift.
 | `src/icons.rs` | Shell icon cache, keyed by extension or path |
 | `src/config.rs` | Settings file load/save |
 | `src/palette.rs` | Command palette and its fuzzy matcher |
-| `src/search.rs` | Recursive name search |
+| `src/search.rs` | Recursive name and content search |
+| `src/menu.rs` | Owner-drawn context menu entries |
+| `src/tree.rs` | The sidebar's folder tree |
+| `src/archive.rs` | Browsing inside archives, via 7-Zip |
 | `src/batch_rename.rs` | Rename patterns, preview, dialog |
 | `src/watch.rs` | ReadDirectoryChangesW watcher |
 | `src/dnd.rs` | Drag and drop (IDropTarget / IDropSource) |
@@ -160,9 +205,15 @@ is unit-tested without a window.
 cargo test
 ```
 
-151 tests, no warnings. They cover path handling and name validation, the virtual
-list and selection model, sorting and filtering, tab and history behaviour,
-stale-load rejection, layout geometry and hit-testing, and palette contrast.
+204 tests, no warnings. They cover path handling and name validation, the
+virtual list and selection model, sorting and filtering, tab and history
+behaviour, session restore, stale-load rejection, layout geometry and
+hit-testing at every pane count, undo inverses, search matching and content
+decoding, archive listing and extraction, tree expansion, and palette contrast.
+
+The archive round-trip test builds a real zip with 7-Zip and reads it back. It
+skips itself rather than failing when 7-Zip is not installed, because that is
+the one part of the app depending on software we do not ship.
 
 Layout tests assert the property that matters: **anything drawn at a rectangle
 hit-tests back to itself.**
@@ -175,4 +226,4 @@ hit-tests back to itself.**
 (Get-Item target\release\file-xplorer.exe).Length / 1MB
 ```
 
-Currently ~0.27 MB against a 3 MB budget.
+Currently ~0.50 MB against a 3 MB budget.

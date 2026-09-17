@@ -14,7 +14,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::Config;
-use crate::file_list::SelectMode;
+use crate::file_list::{SelectMode, SortKey, SortOrder};
 use crate::fs;
 use crate::layout::{Hit, Layout, Metrics, PaneId, PaneInput, Rect, SidebarEntry, MAX_PANES};
 use crate::ops;
@@ -45,6 +45,55 @@ pub const OP_WAS_UNDO: usize = 1;
 /// Far more than anyone reaches for, and small enough that the paths held by
 /// a forgotten stack never add up to anything.
 pub const UNDO_DEPTH: usize = 32;
+
+/// A background job finished. lParam is a boxed `TaskDone`.
+pub const WM_APP_TASK_DONE: u32 = WM_APP + 7;
+/// A content comparison finished. lParam is a boxed `DiffDone`.
+pub const WM_APP_DIFF_DONE: u32 = WM_APP + 8;
+
+/// Periodic settings save. Writing only on exit means a crash — or being
+/// killed from a terminal — loses the session, which is exactly when you
+/// most want it back.
+pub const TIMER_AUTOSAVE: usize = 90;
+pub const AUTOSAVE_MS: u32 = 4_000;
+
+/// What a background job reports when it is done.
+pub struct TaskDone {
+    /// Shown in the footer. Empty clears it.
+    pub message: String,
+    pub error: Option<String>,
+    /// Directories whose listings this may have changed.
+    pub refresh: Vec<String>,
+}
+
+/// Names whose contents differ from the pane next door.
+pub struct DiffDone {
+    pub pid: PaneId,
+    pub tab_id: u64,
+    pub differing: Vec<String>,
+}
+
+/// Run `f` on a worker thread and post its result back.
+pub fn spawn_task<F>(hwnd: HWND, f: F)
+where
+    F: FnOnce() -> TaskDone + Send + 'static,
+{
+    let owner = ops::OwnerWindow(hwnd);
+    std::thread::spawn(move || {
+        let raw = Box::into_raw(Box::new(f()));
+        let posted = unsafe {
+            PostMessageW(
+                Some(owner.hwnd()),
+                WM_APP_TASK_DONE,
+                WPARAM(0),
+                LPARAM(raw as isize),
+            )
+        };
+        if posted.is_err() {
+            unsafe { drop(Box::from_raw(raw)) };
+        }
+    });
+}
 
 /// How far the mouse must move with the button down before it counts as a drag
 /// rather than a sloppy click.
@@ -135,11 +184,14 @@ pub struct Shortcut {
 /// Which sidebar section a header row belongs to.
 pub const SECTION_DRIVES: usize = 0;
 pub const SECTION_PLACES: usize = 1;
+pub const SECTION_TREE: usize = 2;
 
 /// What clicking a sidebar row should do. Built alongside the entries so the
 /// two lists share indices with `Layout::sidebar_rows`.
 pub enum SidebarAction {
     ToggleSection(usize),
+    /// Go here. On a tree row a click on the chevron expands instead, which is
+    /// why this needs no separate "toggle" action.
     Go(String),
 }
 
@@ -148,6 +200,8 @@ pub enum SidebarAction {
 pub enum Drag {
     None,
     Divider { index: usize, grab_offset: i32 },
+    /// Resizing a column by its left edge.
+    Column { key: crate::file_list::SortKey, start_x: i32, start_w: i32 },
     Scrollbar { pid: PaneId, grab_offset: i32 },
 }
 
@@ -173,7 +227,25 @@ pub struct AppState {
     pub drives: Vec<fs::Drive>,
     pub places: Vec<Shortcut>,
     /// Collapsed state per sidebar section, indexed by SECTION_*.
-    pub sections_collapsed: [bool; 2],
+    pub sections_collapsed: [bool; 3],
+    /// How far the sidebar is scrolled. A folder tree outgrows the window
+    /// almost immediately, so it has to scroll.
+    pub sidebar_scroll: i32,
+    /// Folders the user pinned into Places.
+    pub pins: Vec<String>,
+    /// Type, Size and Date column widths in DIPs. Kept here rather than in
+    /// `Metrics` because they are a preference, not a measurement — `metrics`
+    /// holds the scaled copy the layout reads.
+    pub col_widths: [i32; 3],
+    /// The settings as last written, so the autosave only writes on a change.
+    pub last_saved: Config,
+    /// A tab being dragged: which pane, which index, and where it started.
+    pub tab_drag: Option<(PaneId, usize, i32, i32)>,
+    /// The sidebar's folder tree.
+    pub tree: crate::tree::Tree,
+    /// Its rows, rebuilt whenever the tree changes rather than on every
+    /// layout pass: `layout()` runs on every mouse move.
+    pub tree_rows: Vec<crate::tree::TreeRow>,
     /// Which pane's footer filter box is taking keystrokes, if any.
     pub filter_focus: Option<PaneId>,
 
@@ -240,7 +312,16 @@ impl AppState {
             session: cfg.clone(),
             drives: fs::drives(),
             places: default_places(),
-            sections_collapsed: [false, false],
+            // The tree starts collapsed: it is the one section that costs a
+            // directory read to show.
+            sections_collapsed: [false, false, true],
+            sidebar_scroll: 0,
+            pins: cfg.pins.clone(),
+            col_widths: cfg.col_widths,
+            last_saved: cfg.clone(),
+            tab_drag: None,
+            tree: crate::tree::Tree::default(),
+            tree_rows: Vec::new(),
             filter_focus: None,
             hover: None,
             drag: Drag::None,
@@ -315,7 +396,83 @@ impl AppState {
             }
         }
 
+        for (i, _) in self.pins.iter().enumerate() {
+            if self.sections_collapsed[SECTION_PLACES] {
+                break;
+            }
+            entries.push(SidebarEntry::Place {
+                index: self.places.len() + i,
+            });
+            actions.push(SidebarAction::Go(self.pins[i].clone()));
+        }
+
+        entries.push(SidebarEntry::Section {
+            label: "Folders".into(),
+            collapsed: self.sections_collapsed[SECTION_TREE],
+        });
+        actions.push(SidebarAction::ToggleSection(SECTION_TREE));
+        if !self.sections_collapsed[SECTION_TREE] {
+            for (i, row) in self.tree_rows.iter().enumerate() {
+                entries.push(SidebarEntry::Tree {
+                    index: i,
+                    depth: row.depth,
+                    expanded: row.expanded,
+                });
+                actions.push(SidebarAction::Go(row.path.clone()));
+            }
+        }
+
         (entries, actions)
+    }
+
+    pub fn is_pinned(&self, path: &str) -> bool {
+        self.pins.iter().any(|p| crate::pane::paths_equal(p, path))
+    }
+
+    /// Pin or unpin a folder. Toggling rather than two commands, because the
+    /// menu already knows which state it is in and can say so.
+    pub fn toggle_pin(&mut self, path: &str) {
+        if let Some(i) = self.pins.iter().position(|p| crate::pane::paths_equal(p, path)) {
+            self.pins.remove(i);
+        } else if !path.is_empty() {
+            self.pins.push(path.to_string());
+        }
+    }
+
+    /// Push the DIP column widths into the scaled metrics the layout reads.
+    /// Called on load, on a DPI change, and after a resize drag.
+    pub fn apply_col_widths(&mut self) {
+        let s = |v: i32| ((v as f32) * self.metrics.scale).round() as i32;
+        self.metrics.col_type_w = s(self.col_widths[0]);
+        self.metrics.col_size_w = s(self.col_widths[1]);
+        self.metrics.col_date_w = s(self.col_widths[2]);
+    }
+
+    /// Which of `col_widths` a sort key names, if any. Name has no entry: it
+    /// absorbs whatever the others leave.
+    pub fn col_index(key: crate::file_list::SortKey) -> Option<usize> {
+        use crate::file_list::SortKey::*;
+        match key {
+            Type => Some(0),
+            Size => Some(1),
+            Date => Some(2),
+            Name => None,
+        }
+    }
+
+    /// Keep the sidebar's scroll inside its content.
+    pub fn clamp_sidebar_scroll(&mut self) {
+        let (entries, _) = self.sidebar_model();
+        let content = crate::layout::sidebar_content_h(self.metrics, &entries);
+        let view = self.client.h.max(0);
+        self.sidebar_scroll = self.sidebar_scroll.clamp(0, (content - view).max(0));
+    }
+
+    /// Rebuild the tree's visible rows. Called after anything that changes
+    /// what is expanded, not from `layout()`, which runs on every mouse move.
+    pub fn refresh_tree(&mut self) {
+        let roots: Vec<String> = self.drives.iter().map(|d| d.root.clone()).collect();
+        self.tree_rows = self.tree.rows(&roots);
     }
 
     /// Recompute the frame. Cheap: the renderer memoises text measurement.
@@ -345,6 +502,7 @@ impl AppState {
             &self.splits,
             self.sidebar_visible,
             &entries,
+            self.sidebar_scroll,
             &inputs,
             &self.renderer,
         )
@@ -395,6 +553,16 @@ impl AppState {
             compare: self.compare,
             tabs: self.panes.iter().map(|p| p.tab_paths()).collect(),
             active_tab: self.panes.iter().map(|p| p.active_tab_index).collect(),
+            pins: self.pins.clone(),
+            sort: self
+                .panes
+                .iter()
+                .map(|p| {
+                    let l = p.list();
+                    (sort_key_id(l.sort_key), l.sort_order == SortOrder::Asc)
+                })
+                .collect(),
+            col_widths: self.col_widths,
             ..Config::default()
         };
         // rcNormalPosition is the restored box even while maximised, which is
@@ -512,7 +680,7 @@ pub fn report_error(hwnd: HWND, title: &str, message: &str) {
 pub fn spawn_dir_load(hwnd: HWND, pid: PaneId, req: LoadRequest) {
     let owner = ops::OwnerWindow(hwnd);
     std::thread::spawn(move || {
-        let result = fs::list_dir(&req.path).map_err(|e| e.to_string());
+        let result = fs::list_any(&req.path);
         let payload = Box::new(DirLoaded { pid, req, result });
         let raw = Box::into_raw(payload);
         let posted = unsafe {
@@ -544,6 +712,17 @@ pub fn spawn_op(hwnd: HWND, op: ops::Op) {
 /// operation that came off the undo stack, which must not push its own
 /// inverse back on: that would make Ctrl+Z a toggle.
 pub fn spawn_op_tagged(hwnd: HWND, op: ops::Op, tag: usize) {
+    // One guard for every destructive path in the app, drops included: nothing
+    // writes inside an archive. Refusing here rather than in each command is
+    // what makes that true of paths nobody thought about.
+    if op.touches_archive() {
+        report_error(
+            hwnd,
+            "Not supported",
+            "Files inside an archive are read-only. Extract them first.",
+        );
+        return;
+    }
     let owner = ops::OwnerWindow(hwnd);
     ops::spawn(op, owner, move |result| {
         let raw = Box::into_raw(result);
@@ -589,4 +768,43 @@ pub fn default_places() -> Vec<Shortcut> {
         }
     }
     out
+}
+
+/// Sort keys are stored in the settings file as small integers. Written out
+/// rather than derived, so reordering the enum cannot silently change what a
+/// saved file means.
+pub fn sort_key_id(key: SortKey) -> u8 {
+    match key {
+        SortKey::Name => 0,
+        SortKey::Type => 1,
+        SortKey::Size => 2,
+        SortKey::Date => 3,
+    }
+}
+
+pub fn sort_key_from_id(id: u8) -> SortKey {
+    match id {
+        1 => SortKey::Type,
+        2 => SortKey::Size,
+        3 => SortKey::Date,
+        _ => SortKey::Name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sort_key_ids_round_trip() {
+        for k in [SortKey::Name, SortKey::Type, SortKey::Size, SortKey::Date] {
+            assert_eq!(sort_key_from_id(sort_key_id(k)), k);
+        }
+    }
+
+    #[test]
+    fn an_unknown_sort_id_falls_back_to_name() {
+        // A settings file from a future build must not panic an older one.
+        assert_eq!(sort_key_from_id(99), SortKey::Name);
+    }
 }

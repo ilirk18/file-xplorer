@@ -20,6 +20,98 @@ use crate::fs::{self, FileEntry};
 const BATCH: usize = 128;
 /// A hard ceiling. Past this, a search is not an answer, it is a listing.
 const MAX_RESULTS: usize = 20_000;
+/// Files larger than this are not read for a content search. Grepping a
+/// multi-gigabyte disk image is not a search, it is a stall.
+const MAX_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// What to look for.
+#[derive(Clone, Debug, Default)]
+pub struct Query {
+    /// Name pattern, `*` allowed. Empty matches every name.
+    pub name: String,
+    /// Text that must appear inside the file. None searches names only.
+    pub content: Option<String>,
+}
+
+impl Query {
+    pub fn by_name(pattern: &str) -> Query {
+        Query {
+            name: pattern.to_string(),
+            content: None,
+        }
+    }
+
+    pub fn by_content(text: &str) -> Query {
+        Query {
+            name: String::new(),
+            content: Some(text.to_string()),
+        }
+    }
+
+    /// What the tab calls itself.
+    pub fn label(&self) -> String {
+        match (&self.content, self.name.is_empty()) {
+            (Some(text), true) => format!("Containing: {}", text),
+            (Some(text), false) => format!("{} containing: {}", self.name, text),
+            (None, _) => format!("Search: {}", self.name),
+        }
+    }
+}
+
+/// True when the file at `path` contains `needle`, ignoring case.
+///
+/// Binary files are skipped rather than matched by accident: a NUL byte early
+/// on is the same heuristic every grep uses, and it is right far more often
+/// than any amount of content sniffing would be. UTF-16 is decoded properly
+/// because that is what a lot of Windows text actually is, and a UTF-8 reader
+/// sees every second byte as a NUL and calls the file binary.
+pub fn file_contains(path: &str, needle: &str) -> bool {
+    use std::io::Read;
+
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() > MAX_CONTENT_BYTES {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    if f.read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+
+    let text = match bytes.get(..2) {
+        Some([0xFF, 0xFE]) => decode_utf16(&bytes[2..], true),
+        Some([0xFE, 0xFF]) => decode_utf16(&bytes[2..], false),
+        _ => {
+            if bytes.iter().take(8192).any(|b| *b == 0) {
+                return false; // binary
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    };
+    // Lowercasing the whole file allocates a second copy of it, which at 8 MiB
+    // is a transient the allocator will not notice. A streaming
+    // case-insensitive search would be a lot of code for a search that is
+    // already dominated by disk time.
+    text.to_lowercase().contains(needle)
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| {
+            if little_endian {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
 
 pub struct Search {
     pub cancel: Arc<AtomicBool>,
@@ -89,13 +181,15 @@ pub struct Batch {
 /// Blocking: call on a worker thread.
 pub fn run<F>(
     root: String,
-    query: String,
+    query: Query,
     generation: u64,
     cancel: Arc<AtomicBool>,
     mut deliver: F,
 ) where
     F: FnMut(Batch),
 {
+    // Lowercased once here rather than per file.
+    let needle = query.content.as_ref().map(|t| t.to_lowercase());
     let mut pending: Vec<FileEntry> = Vec::with_capacity(BATCH);
     let mut total = 0usize;
     // Relative directories still to visit. Iterative, so depth costs heap.
@@ -125,7 +219,15 @@ pub fn run<F>(
             if e.is_dir && !e.is_reparse {
                 stack.push(rel_name.clone());
             }
-            if matches(&e.name, &query) {
+            // Name first: it is free, and it narrows what has to be read.
+            let hit = matches(&e.name, &query.name)
+                && match &needle {
+                    // A folder has no contents to search, so a content search
+                    // never lists one.
+                    Some(n) => !e.is_dir && file_contains(&fs::path_join(&abs, &e.name), n),
+                    None => true,
+                };
+            if hit {
                 pending.push(FileEntry {
                     name: rel_name,
                     ..e
@@ -207,7 +309,7 @@ mod tests {
         let mut found: Vec<String> = Vec::new();
         run(
             base.to_string_lossy().into_owned(),
-            "*.rs".into(),
+            Query::by_name("*.rs"),
             1,
             Arc::new(AtomicBool::new(false)),
             |b| found.extend(b.entries.into_iter().map(|e| e.name)),
@@ -229,7 +331,7 @@ mod tests {
         let mut dones = 0;
         run(
             "C:\\definitely\\not\\here".into(),
-            "x".into(),
+            Query::by_name("x"),
             7,
             Arc::new(AtomicBool::new(false)),
             |b| {
@@ -248,11 +350,109 @@ mod tests {
         let mut entries = 0;
         run(
             std::env::temp_dir().to_string_lossy().into_owned(),
-            "".into(),
+            Query::default(),
             1,
             cancel,
             |b| entries += b.entries.len(),
         );
         assert_eq!(entries, 0);
+    }
+
+    #[test]
+    fn content_search_reads_utf8_and_ignores_case() {
+        let base = std::env::temp_dir().join("fx_content_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let hit = base.join("hit.txt");
+        std::fs::write(&hit, b"the Needle is here").unwrap();
+        assert!(file_contains(hit.to_str().unwrap(), "needle"));
+        assert!(!file_contains(hit.to_str().unwrap(), "haystack"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_utf16_file_is_decoded_rather_than_called_binary() {
+        // Notepad still writes these, and byte-wise they look binary.
+        let base = std::env::temp_dir().join("fx_content_utf16");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let p = base.join("wide.txt");
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "hello world".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(file_contains(p.to_str().unwrap(), "world"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_binary_file_is_skipped_not_matched() {
+        let base = std::env::temp_dir().join("fx_content_binary");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let p = base.join("blob.bin");
+        std::fs::write(&p, b"text\x00\x01\x02more text").unwrap();
+        assert!(!file_contains(p.to_str().unwrap(), "more"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_content_search_never_lists_a_folder() {
+        let base = std::env::temp_dir().join("fx_content_walk");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("yes.txt"), b"alpha beta").unwrap();
+        std::fs::write(base.join("no.txt"), b"gamma").unwrap();
+        std::fs::write(base.join("sub").join("deep.txt"), b"BETA again").unwrap();
+
+        let mut found: Vec<String> = Vec::new();
+        run(
+            base.to_string_lossy().into_owned(),
+            Query::by_content("beta"),
+            1,
+            Arc::new(AtomicBool::new(false)),
+            |b| found.extend(b.entries.into_iter().map(|e| e.name)),
+        );
+        found.sort();
+        assert_eq!(found, vec!["sub\\deep.txt".to_string(), "yes.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn name_and_content_must_both_match() {
+        let base = std::env::temp_dir().join("fx_content_both");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("keep.rs"), b"needle").unwrap();
+        std::fs::write(base.join("skip.txt"), b"needle").unwrap();
+
+        let mut found: Vec<String> = Vec::new();
+        run(
+            base.to_string_lossy().into_owned(),
+            Query {
+                name: "*.rs".into(),
+                content: Some("needle".into()),
+            },
+            1,
+            Arc::new(AtomicBool::new(false)),
+            |b| found.extend(b.entries.into_iter().map(|e| e.name)),
+        );
+        assert_eq!(found, vec!["keep.rs".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_query_says_what_it_is_looking_for() {
+        assert_eq!(Query::by_name("*.rs").label(), "Search: *.rs");
+        assert_eq!(Query::by_content("todo").label(), "Containing: todo");
+        assert_eq!(
+            Query {
+                name: "*.rs".into(),
+                content: Some("todo".into())
+            }
+            .label(),
+            "*.rs containing: todo"
+        );
     }
 }

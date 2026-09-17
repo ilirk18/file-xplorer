@@ -16,6 +16,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod archive;
 mod batch_rename;
 mod commands;
 mod config;
@@ -26,6 +27,7 @@ mod fs;
 mod icons;
 mod input;
 mod layout;
+mod menu;
 mod ops;
 mod palette;
 mod pane;
@@ -35,6 +37,7 @@ mod renderer;
 mod search;
 mod shellmenu;
 mod theme;
+mod tree;
 mod watch;
 
 use windows::core::{Result, PCWSTR};
@@ -52,7 +55,7 @@ use app::*;
 use commands::show_context_menu;
 use config::{Config, UNSET};
 use input::*;
-use file_list::SelectMode;
+use file_list::{SelectMode, SortOrder};
 use layout::{Hit, Metrics, PaneId, Rect, MAX_PANES};
 use pane::Pane;
 use renderer::{PaneView, SidebarView};
@@ -181,8 +184,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
 
-        // Shell context-menu handlers build submenus and owner-draw their
+        // Our own owner-drawn entries get first refusal; everything else is
+        // the shell's, whose handlers build submenus and owner-draw their
         // items only if these reach them while the menu is on screen.
+        if let Some(result) = menu::handle_menu_msg(msg, wparam, lparam) {
+            return result;
+        }
         if let Some(result) = shellmenu::handle_menu_msg(msg, wparam, lparam) {
             return result;
         }
@@ -207,6 +214,8 @@ fn handle(
         WM_CREATE => {
             apply_titlebar_theme(hwnd, state.theme);
             state.drop_target = dnd::Registration::new(hwnd, WM_APP_DROPPED);
+            state.apply_col_widths();
+            unsafe { SetTimer(Some(hwnd), TIMER_AUTOSAVE, AUTOSAVE_MS, None) };
             let start = fs::current_directory().unwrap_or_else(|_| FALLBACK_PATH.to_string());
             // Every pane opens something, including the ones that are off
             // screen: pressing Ctrl+2 should reveal a folder, not a blank panel.
@@ -220,6 +229,10 @@ fn handle(
                     Some(req) => req,
                     None => state.pane_mut(pid).navigate(&start),
                 };
+                let (key, asc) = session.sort[pid.0];
+                let list = state.pane_mut(pid).list_mut();
+                list.sort_key = sort_key_from_id(key);
+                list.sort_order = if asc { SortOrder::Asc } else { SortOrder::Desc };
                 spawn_dir_load(hwnd, pid, req);
             }
             Some(LRESULT(0))
@@ -259,6 +272,7 @@ fn handle(
             for p in &mut state.panes {
                 p.set_row_height(row_h);
             }
+            state.apply_col_widths();
             let r = unsafe { &*(lparam.0 as *const RECT) };
             unsafe {
                 let _ = SetWindowPos(
@@ -337,6 +351,16 @@ fn handle(
         }
 
         WM_LBUTTONUP => {
+            // A tab dropped on another pane moves there, keeping its history.
+            if let Some((from, index, ox, oy)) = state.tab_drag.take() {
+                let (x, y) = mouse_pos(lparam);
+                let far = (x - ox).abs() >= DRAG_THRESHOLD || (y - oy).abs() >= DRAG_THRESHOLD;
+                if let (true, Some(to)) = (far, state.layout().pane_at(x, y)) {
+                    if to != from {
+                        move_tab(state, hwnd, from, index, to);
+                    }
+                }
+            }
             // A click that never became a drag still needs to reduce a
             // multi-selection to the row that was pressed.
             if let Some((ox, oy)) = state.drag_origin.take() {
@@ -401,6 +425,15 @@ fn handle(
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
             let layout = state.layout();
+            // Over the sidebar, the wheel scrolls the sidebar. A folder tree
+            // outgrows the window in two clicks, so it has to.
+            if layout.sidebar.contains(pt.x, pt.y) {
+                let step = state.metrics.sidebar_row_h * 3;
+                state.sidebar_scroll += if delta > 0 { -step } else { step };
+                state.clamp_sidebar_scroll();
+                invalidate(hwnd);
+                return Some(LRESULT(0));
+            }
             // Scroll whatever the pointer is over, which is what people expect,
             // without stealing keyboard focus from another pane.
             let pid = layout.pane_at(pt.x, pt.y).unwrap_or(state.focused);
@@ -465,6 +498,16 @@ fn handle(
 
         WM_TIMER => {
             let id = wparam.0;
+            if id == TIMER_AUTOSAVE {
+                // Only write when something actually changed, so an idle app
+                // is not touching the disk every few seconds.
+                let now = state.config(hwnd);
+                if now != state.last_saved {
+                    now.save();
+                    state.last_saved = now;
+                }
+                return Some(LRESULT(0));
+            }
             if (TIMER_WATCH_BASE..TIMER_WATCH_BASE + MAX_PANES).contains(&id) {
                 unsafe {
                     let _ = KillTimer(Some(hwnd), id);
@@ -480,6 +523,42 @@ fn handle(
         WM_APP_DROPPED => {
             let dropped = unsafe { Box::from_raw(lparam.0 as *mut dnd::Dropped) };
             on_dropped(state, hwnd, *dropped);
+            Some(LRESULT(0))
+        }
+
+        WM_APP_TASK_DONE => {
+            let done = unsafe { Box::from_raw(lparam.0 as *mut TaskDone) };
+            if let Some(err) = &done.error {
+                state.status_override = None;
+                report_error(hwnd, "Failed", err);
+            } else {
+                state.status_override =
+                    (!done.message.is_empty()).then(|| done.message.clone());
+            }
+            for dir in &done.refresh {
+                for pid in state.visible().collect::<Vec<_>>() {
+                    if pane::paths_equal(state.pane(pid).current_path(), dir) {
+                        let req = state.pane_mut(pid).refresh();
+                        start_load(hwnd, pid, req);
+                    }
+                }
+            }
+            invalidate(hwnd);
+            Some(LRESULT(0))
+        }
+
+        WM_APP_DIFF_DONE => {
+            let done = unsafe { Box::from_raw(lparam.0 as *mut DiffDone) };
+            let n = done.differing.len();
+            if let Some(tab) = state.pane_mut(done.pid).tab_mut(done.tab_id) {
+                tab.file_list.differing = done.differing.into_iter().collect();
+            }
+            state.status_override = Some(match n {
+                0 => "Every shared file matches".to_string(),
+                1 => "1 file differs".to_string(),
+                n => format!("{} files differ", n),
+            });
+            invalidate(hwnd);
             Some(LRESULT(0))
         }
 
@@ -556,6 +635,19 @@ fn handle(
 }
 
 
+/// Move a tab from one pane to another, keeping its listing and history.
+fn move_tab(state: &mut AppState, hwnd: HWND, from: PaneId, index: usize, to: PaneId) {
+    let Some(tab) = state.pane_mut(from).take_tab(index) else {
+        return;
+    };
+    let req = state.pane_mut(to).adopt_tab(tab);
+    start_load(hwnd, to, req);
+    state.focused = to;
+    state.rewatch(from, hwnd);
+    state.rewatch(to, hwnd);
+    invalidate(hwnd);
+}
+
 // ---------------------------------------------------------------------------
 // Painting
 // ---------------------------------------------------------------------------
@@ -577,11 +669,15 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     let focused_side = state.focused;
     let filter_focus = state.filter_focus;
     let drives = state.drives.clone();
+    // Pinned folders sit after the standard ones and share their indices, so
+    // the sidebar entries the layout built still line up with this list.
     let places: Vec<(String, String)> = state
         .places
         .iter()
         .map(|p| (p.label.clone(), p.path.clone()))
+        .chain(state.pins.iter().map(|p| (fs::path_leaf(p), p.clone())))
         .collect();
+    let tree_rows = state.tree_rows.clone();
     let visible: Vec<PaneId> = state.visible().collect();
     let counts: Vec<String> = visible.iter().map(|p| state.counts_text(*p)).collect();
     // Compare mode diffs each pane against the one to its right, wrapping. With
@@ -608,6 +704,7 @@ fn paint(state: &mut AppState, hwnd: HWND) {
             drives: &drives,
             places: &places,
             current_path: &current,
+            tree: &tree_rows,
             hover,
         },
     );

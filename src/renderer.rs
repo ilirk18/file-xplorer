@@ -102,6 +102,8 @@ pub struct SidebarView<'a> {
     /// (label, path) shortcuts.
     pub places: &'a [(String, String)],
     pub current_path: &'a str,
+    /// Visible rows of the folder tree, indexed by `SidebarEntry::Tree`.
+    pub tree: &'a [crate::tree::TreeRow],
     pub hover: Option<Hit>,
 }
 
@@ -513,6 +515,25 @@ impl Renderer {
                     }
                 }
 
+                SidebarEntry::Tree {
+                    index,
+                    depth,
+                    expanded,
+                } => {
+                    let Some(tr) = v.tree.get(*index) else { continue };
+                    let active = crate::pane::paths_equal(v.current_path, &tr.path);
+                    self.draw_tree_row(
+                        m,
+                        row.rect,
+                        i,
+                        v.hover,
+                        active,
+                        &tr.label,
+                        *depth,
+                        *expanded,
+                    );
+                }
+
                 SidebarEntry::Place { index } => {
                     let Some((label, path)) = v.places.get(*index) else {
                         continue;
@@ -585,6 +606,55 @@ impl Renderer {
                 self.text(label, r, p.text, &self.formats.small.clone());
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_tree_row(
+        &mut self,
+        m: Metrics,
+        rect: Rect,
+        index: usize,
+        hover: Option<Hit>,
+        active: bool,
+        label: &str,
+        depth: usize,
+        expanded: bool,
+    ) {
+        let p = self.palette();
+        let hovered = matches!(
+            hover,
+            Some(Hit::Sidebar(h)) | Some(Hit::SidebarChevron(h)) if h == index
+        );
+        let pill = Rect::new(rect.x + m.pad / 2, rect.y, rect.w - m.pad, rect.h);
+        if active {
+            self.fill_rounded(pill, m.radius, p.selection_inactive);
+        } else if hovered {
+            self.fill_rounded(pill, m.radius, p.row_hover);
+        }
+
+        let indent = crate::layout::tree_indent(m, depth);
+        let chevron = Rect::new(rect.x + m.pad / 2 + indent, rect.y, m.icon_size, rect.h);
+        self.glyph(
+            if expanded {
+                glyph::CHEVRON_DOWN
+            } else {
+                glyph::CHEVRON_RIGHT
+            },
+            chevron,
+            if hovered { p.text } else { p.text_faint },
+        );
+
+        let icon = Rect::new(
+            chevron.right() + m.pad / 4,
+            rect.y + (rect.h - m.icon_size) / 2,
+            m.icon_size,
+            m.icon_size,
+        );
+        self.draw_icon(&icon_key(None, true), icon);
+
+        let text_x = icon.right() + m.pad / 2;
+        let text = Rect::new(text_x, rect.y, (pill.right() - text_x - m.pad / 2).max(0), rect.h);
+        self.text(label, text, p.text, &self.formats.small.clone());
     }
 
     fn draw_capacity_bar(&mut self, track: Rect, used: f32) {
@@ -661,10 +731,27 @@ impl Renderer {
             let active = i == v.active_tab;
             let hovered = matches!(v.hover, Some(Hit::Tab(s, h)) | Some(Hit::TabClose(s, h)) if s == v.pid && h == i);
 
+            // The active tab is a card that sits on top of the toolbar below
+            // it; the inactive ones are flat. That, rather than a slightly
+            // different grey, is what makes the active one obvious at a glance.
+            let card = Rect::new(t.full.x + 1, t.full.y + 3, t.full.w - 2, t.full.h - 3);
             if active {
-                self.fill(t.full, p.tab_active);
+                self.fill_rounded(card, m.radius * 1.5, p.tab_active);
+                // Square off the bottom so the card joins the toolbar instead
+                // of floating above it.
+                self.fill(
+                    Rect::new(card.x, card.bottom() - 6, card.w, 6),
+                    p.tab_active,
+                );
+                // Accent bar: which pane you are typing into, at a glance.
+                let bar_w = (card.w - m.pad * 2).max(8);
+                self.fill_rounded(
+                    Rect::new(card.x + (card.w - bar_w) / 2, card.y, bar_w, 2.max(m.scale as i32)),
+                    1.0,
+                    if v.focused { p.accent } else { p.text_faint },
+                );
             } else if hovered {
-                self.fill(t.full, p.tab_hover);
+                self.fill_rounded(card, m.radius * 1.5, p.tab_hover);
             }
 
             let icon = Rect::new(
@@ -697,8 +784,11 @@ impl Renderer {
                 self.glyph(glyph::CLOSE, t.close, c);
             }
 
-            if !active {
-                let sep = Rect::new(t.full.right() - 1, t.full.y + 6, 1, t.full.h - 12);
+            // A hairline between two inactive tabs only. Beside the active
+            // card it would cut into its rounded corner.
+            let next_active = i + 1 == v.active_tab;
+            if !active && !next_active && i + 1 < v.layout.tabs.len() {
+                let sep = Rect::new(t.full.right() - 1, t.full.y + 9, 1, t.full.h - 18);
                 self.fill(sep, p.divider);
             }
         }
@@ -710,6 +800,22 @@ impl Renderer {
             }
             let c = if hovered { p.text } else { p.text_faint };
             self.glyph(glyph::ADD, v.layout.new_tab, c);
+        }
+
+        // A hairline under the whole strip, broken where the active card meets
+        // it, so the card reads as continuous with the toolbar.
+        let under = Rect::new(
+            v.layout.tab_bar.x,
+            v.layout.tab_bar.bottom() - 1,
+            v.layout.tab_bar.w,
+            1,
+        );
+        self.fill(under, p.divider);
+        if let Some(t) = v.layout.tabs.get(v.active_tab) {
+            self.fill(
+                Rect::new(t.full.x + 1, under.y, (t.full.w - 2).max(0), 1),
+                p.tab_active,
+            );
         }
     }
 
@@ -935,12 +1041,15 @@ impl Renderer {
                 p.text_muted
             };
 
-            // Compare mode: mark what this pane has and the other does not.
-            if let Some(others) = v.other_names {
-                if !others.contains(&entry.name) {
-                    let bar = Rect::new(r.x, r.y + 2, 3.max(m.scale as i32), r.h - 4);
-                    self.fill_rounded(bar, 1.5, p.accent);
-                }
+            // Compare mode: an accent bar for what only this pane has, and a
+            // warning bar for a file that is here too but holds different
+            // bytes. Two colours rather than two columns: the marker is meant
+            // to be scanned, not read.
+            let missing = v.other_names.is_some_and(|o| !o.contains(&entry.name));
+            let differs = v.list.differing.contains(&entry.name);
+            if missing || differs {
+                let bar = Rect::new(r.x, r.y + 2, 3.max(m.scale as i32), r.h - 4);
+                self.fill_rounded(bar, 1.5, if differs { p.capacity_full } else { p.accent });
             }
 
             if let Some(nc) = name_col {

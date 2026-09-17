@@ -224,6 +224,10 @@ pub struct CrumbRect {
 pub struct ColumnRect {
     pub key: SortKey,
     pub rect: Rect,
+    /// The strip on this column's left edge that resizes it. Empty for Name,
+    /// which has no edge of its own: it absorbs whatever the others leave.
+    /// A rect rather than a constant so the grab area scales with the monitor.
+    pub edge: Rect,
 }
 
 /// What a sidebar row represents. The caller builds the list; the layout only
@@ -235,6 +239,10 @@ pub enum SidebarEntry {
     Drive { index: usize, used: Option<f32> },
     /// Index into the caller's shortcut list.
     Place { index: usize },
+    /// A folder in the tree. `index` is into the caller's row list; `depth`
+    /// drives the indent, and every folder gets a chevron because finding out
+    /// whether it has children costs a directory read.
+    Tree { index: usize, depth: usize, expanded: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +328,9 @@ pub enum Hit {
     Nav(PaneId, NavButton),
     Crumb(PaneId, usize),
     Column(PaneId, SortKey),
+    /// The grab strip on a column's left edge. Only the optional columns have
+    /// one: Name absorbs whatever is left, so there is nothing to drag on it.
+    ColumnEdge(PaneId, SortKey),
     /// Absolute row index within the pane's list.
     Row(PaneId, u32),
     ListBackground(PaneId),
@@ -349,6 +360,8 @@ impl Layout {
         splits: &[f32],
         sidebar_visible: bool,
         sidebar_entries: &[SidebarEntry],
+        // How far the sidebar is scrolled, in pixels.
+        sidebar_scroll: i32,
         panes: &[PaneInput],
         measurer: &dyn TextMeasurer,
     ) -> Layout {
@@ -361,7 +374,7 @@ impl Layout {
             (Rect::default(), body)
         };
 
-        let sidebar_rows = sidebar_rows(sidebar, m, sidebar_entries);
+        let sidebar_rows = sidebar_rows(sidebar, m, sidebar_entries, sidebar_scroll);
         let (bounds, dividers) = split_body(body, m, splits, panes.len());
 
         Layout {
@@ -532,6 +545,13 @@ fn hit_pane(p: &PaneLayout, pid: PaneId, x: i32, y: i32) -> Option<Hit> {
         return Some(Hit::Nothing);
     }
     if p.header.contains(x, y) {
+        // The edge wins over the column it belongs to, or a column could never
+        // be resized: its header button covers the same pixels.
+        for c in &p.columns {
+            if c.edge.contains(x, y) {
+                return Some(Hit::ColumnEdge(pid, c.key));
+            }
+        }
         for c in &p.columns {
             if c.rect.contains(x, y) {
                 return Some(Hit::Column(pid, c.key));
@@ -569,23 +589,46 @@ pub fn sidebar_text_offset(m: Metrics) -> i32 {
     m.pad + m.pad / 2 + m.icon_size + m.pad
 }
 
-fn sidebar_rows(sidebar: Rect, m: Metrics, entries: &[SidebarEntry]) -> Vec<SidebarRow> {
+/// How far in a tree row at `depth` sits. Shared by the layout and the
+/// renderer so the chevron, the icon and the label line up by construction.
+pub fn tree_indent(m: Metrics, depth: usize) -> i32 {
+    // Capped: past a dozen levels an indent per level leaves no room for names.
+    (depth.min(12) as i32) * (m.icon_size - m.pad / 4).max(1)
+}
+
+/// Total height every sidebar entry would need, unscrolled. The caller clamps
+/// its scroll against this.
+pub fn sidebar_content_h(m: Metrics, entries: &[SidebarEntry]) -> i32 {
+    m.pad + entries.iter().map(|e| sidebar_row_h(m, e)).sum::<i32>()
+}
+
+fn sidebar_row_h(m: Metrics, e: &SidebarEntry) -> i32 {
+    match e {
+        SidebarEntry::Section { .. } => m.sidebar_section_h,
+        SidebarEntry::Drive { used: Some(_), .. } => m.sidebar_drive_h,
+        SidebarEntry::Drive { .. } => m.sidebar_row_h,
+        SidebarEntry::Place { .. } => m.sidebar_row_h,
+        SidebarEntry::Tree { .. } => m.sidebar_row_h,
+    }
+}
+
+fn sidebar_rows(
+    sidebar: Rect,
+    m: Metrics,
+    entries: &[SidebarEntry],
+    scroll: i32,
+) -> Vec<SidebarRow> {
     if sidebar.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(entries.len());
-    let mut y = sidebar.y + m.pad / 2;
+    let mut y = sidebar.y + m.pad / 2 - scroll;
     for e in entries {
-        let h = match e {
-            SidebarEntry::Section { .. } => m.sidebar_section_h,
-            SidebarEntry::Drive { used: Some(_), .. } => m.sidebar_drive_h,
-            SidebarEntry::Drive { .. } => m.sidebar_row_h,
-            SidebarEntry::Place { .. } => m.sidebar_row_h,
-        };
+        let h = sidebar_row_h(m, e);
         let rect = Rect::new(sidebar.x, y, sidebar.w, h);
-        // Rows past the bottom get an empty rect so indices still line up with
+        // Rows off either end get an empty rect so indices still line up with
         // the caller's list; an empty rect can never be hit or drawn.
-        let rect = if rect.bottom() > sidebar.bottom() {
+        let rect = if rect.bottom() > sidebar.bottom() || rect.y < sidebar.y {
             Rect::default()
         } else {
             rect
@@ -606,6 +649,15 @@ fn sidebar_rows(sidebar: Rect, m: Metrics, entries: &[SidebarEntry]) -> Vec<Side
         let chevron = match e {
             SidebarEntry::Section { .. } if !rect.is_empty() => Rect::new(
                 rect.right() - m.pad - m.icon_size,
+                rect.y,
+                m.icon_size,
+                rect.h,
+            ),
+            // A tree row's chevron leads its label rather than trailing the
+            // row, so a click at the indent opens the folder and a click on
+            // the name goes there.
+            SidebarEntry::Tree { depth, .. } if !rect.is_empty() => Rect::new(
+                rect.x + m.pad / 2 + tree_indent(m, *depth),
                 rect.y,
                 m.icon_size,
                 rect.h,
@@ -845,6 +897,7 @@ fn column_rects(header: Rect, m: Metrics) -> Vec<ColumnRect> {
     let mut cols = vec![ColumnRect {
         key: SortKey::Name,
         rect: Rect::new(header.x, header.y, name_w, header.h),
+        edge: Rect::default(),
     }];
     let mut x = header.x + name_w;
     for key in display {
@@ -852,6 +905,7 @@ fn column_rects(header: Rect, m: Metrics) -> Vec<ColumnRect> {
             cols.push(ColumnRect {
                 key,
                 rect: Rect::new(x, header.y, *w, header.h),
+                edge: Rect::new(x - m.pad / 2, header.y, m.pad, header.h),
             });
             x += w;
         }
@@ -941,7 +995,7 @@ mod tests {
         let inputs: Vec<PaneInput> = (0..n)
             .map(|_| input(&tabs, crumbs, 100, 0))
             .collect();
-        Layout::compute(client, m, &splits, true, &sidebar_of(2), &inputs, &FixedWidth)
+        Layout::compute(client, m, &splits, true, &sidebar_of(2), 0, &inputs, &FixedWidth)
     }
 
     fn build(w: i32, h: i32, crumbs: &[String]) -> Layout {
@@ -985,7 +1039,7 @@ mod tests {
         // apart, not let two panes collapse to nothing.
         let splits = Layout::clamp_splits(client, m, true, 4, &[0.01, 0.02, 0.03]);
         let inputs: Vec<PaneInput> = (0..4).map(|_| input(&[], &[], 0, 0)).collect();
-        let l = Layout::compute(client, m, &splits, true, &[], &inputs, &FixedWidth);
+        let l = Layout::compute(client, m, &splits, true, &[], 0, &inputs, &FixedWidth);
         for p in &l.panes {
             assert!(p.bounds.w >= m.min_pane_w, "pane too narrow: {:?}", p.bounds);
         }
@@ -1019,6 +1073,7 @@ mod tests {
             &[],
             true,
             &sidebar_of(2),
+            0,
             &[input(&tabs, &crumbs, 10, 0)],
             &FixedWidth,
         );
@@ -1170,6 +1225,7 @@ mod tests {
             &splits,
             false,
             &[],
+            0,
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1194,6 +1250,7 @@ mod tests {
             &splits,
             false,
             &[],
+            0,
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1216,6 +1273,52 @@ mod tests {
         assert_eq!(narrow.panes[0].columns[0].key, SortKey::Name);
         // Whatever survives, Name never drops below its floor.
         assert!(narrow.panes[0].columns[0].rect.w >= narrow.metrics.col_min_name_w);
+    }
+
+    #[test]
+    fn a_column_edge_is_grabbable_and_does_not_swallow_the_header() {
+        let l = build_n(1, 1600, 800, &strs(&["C:\\"]));
+        let p = &l.panes[0];
+        let type_col = p.columns.iter().find(|c| c.key == SortKey::Type).unwrap();
+        let y = p.header.y + p.header.h / 2;
+
+        // On the boundary: resize.
+        assert_eq!(
+            l.hit_test(type_col.rect.x, y),
+            Hit::ColumnEdge(PaneId(0), SortKey::Type)
+        );
+        // Well inside it: sort. Otherwise the header would stop being clickable.
+        assert_eq!(
+            l.hit_test(type_col.rect.x + type_col.rect.w / 2, y),
+            Hit::Column(PaneId(0), SortKey::Type)
+        );
+        // Name has no edge of its own; the far left of the header sorts.
+        assert_eq!(
+            l.hit_test(p.header.x + 2, y),
+            Hit::Column(PaneId(0), SortKey::Name)
+        );
+        // The strip scales with the monitor rather than being a fixed 4px.
+        let hi = build_dpi(192, 1600, 800);
+        let hi_col = hi.panes[0].columns.iter().find(|c| c.key == SortKey::Type).unwrap();
+        assert_eq!(hi_col.edge.w, l.metrics.pad * 2);
+    }
+
+    /// One pane at an arbitrary DPI.
+    fn build_dpi(dpi: u32, w: i32, h: i32) -> Layout {
+        let m = Metrics::for_dpi(dpi);
+        let client = Rect::new(0, 0, w, h);
+        let tabs = strs(&["Foo"]);
+        let crumbs = strs(&["C:\\"]);
+        Layout::compute(
+            client,
+            m,
+            &[],
+            false,
+            &[],
+            0,
+            &[input(&tabs, &crumbs, 10, 0)],
+            &FixedWidth,
+        )
     }
 
     #[test]
@@ -1266,6 +1369,7 @@ mod tests {
                 &splits,
                 false,
                 &[],
+                0,
                 &[
                     input(&tabs, &crumbs, 1000, offset),
                     input(&tabs, &crumbs, 1000, offset),
@@ -1303,6 +1407,7 @@ mod tests {
             &splits,
             false,
             &[],
+            0,
             &[input(&tabs, &crumbs, 3, 0), input(&tabs, &crumbs, 3, 0)],
             &FixedWidth,
         );
@@ -1386,6 +1491,7 @@ mod tests {
             &splits,
             true,
             &entries,
+            0,
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1422,6 +1528,7 @@ mod tests {
             &[0.5],
             true,
             &sidebar_of(2),
+            0,
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );

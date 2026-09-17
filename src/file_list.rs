@@ -53,6 +53,9 @@ pub struct FileList {
     /// Folder sizes calculated on demand, kept across refreshes so a reload
     /// does not throw away work the user asked for.
     dir_sizes: HashMap<String, u64>,
+    /// Names that a content comparison found to differ from the other pane.
+    /// Empty until "Compare contents" is run, and cleared on navigation.
+    pub differing: HashSet<String>,
     pub scroll_offset: u32,
     pub row_height: u32,
     pub sort_key: SortKey,
@@ -75,6 +78,7 @@ impl Default for FileList {
             entries: Vec::new(),
             filter: String::new(),
             dir_sizes: HashMap::new(),
+            differing: HashSet::new(),
             scroll_offset: 0,
             row_height: 24,
             sort_key: SortKey::Name,
@@ -381,6 +385,8 @@ impl FileList {
 
     /// Replace the contents for a *new* directory: selection and scroll reset.
     pub fn set_entries(&mut self, entries: Vec<FileEntry>) {
+        // A comparison belongs to the listing it was run on.
+        self.differing.clear();
         self.all = entries;
         self.rebuild();
         self.scroll_offset = 0;

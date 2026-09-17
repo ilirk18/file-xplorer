@@ -39,6 +39,14 @@ pub struct Config {
     /// directory".
     pub tabs: Vec<Vec<String>>,
     pub active_tab: Vec<usize>,
+
+    /// Folders pinned into the sidebar's Places, in the order they were added.
+    pub pins: Vec<String>,
+    /// Sort key and direction per pane, as `(key, ascending)`.
+    pub sort: Vec<(u8, bool)>,
+    /// Type, Size and Date column widths in DIPs — not pixels, so a settings
+    /// file carried to a different monitor still means the same thing.
+    pub col_widths: [i32; 3],
 }
 
 /// Sentinel for "no saved position". A real window can legitimately sit at a
@@ -62,6 +70,9 @@ impl Default for Config {
             compare: false,
             tabs: vec![Vec::new(); MAX_PANES],
             active_tab: vec![0; MAX_PANES],
+            pins: Vec::new(),
+            sort: vec![(0, true); MAX_PANES],
+            col_widths: [96, 84, 124],
         }
     }
 }
@@ -87,6 +98,16 @@ fn parse_splits(value: &str) -> Vec<f32> {
         Some(v) if v.iter().all(|f| (0.0..=1.0).contains(f)) => v,
         _ => Vec::new(),
     }
+}
+
+/// Three widths, or the defaults. A column narrower than this is a sliver you
+/// cannot grab again, and one wider than this hides the Name column.
+fn parse_widths(value: &str, fallback: [i32; 3]) -> [i32; 3] {
+    let parts: Vec<i32> = value.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    if parts.len() != 3 || parts.iter().any(|w| !(40..=400).contains(w)) {
+        return fallback;
+    }
+    [parts[0], parts[1], parts[2]]
 }
 
 /// `tab2` -> Some(2), for a key in range. Anything else is an unknown key and
@@ -132,7 +153,8 @@ impl Config {
              win_h={}\n\
              maximized={}\n\
              sync_scroll={}\n\
-             compare={}\n{}",
+             compare={}\n\
+             col_widths={},{},{}\n{}",
             self.pane_count,
             self.theme_dark,
             self.sidebar_visible,
@@ -145,6 +167,9 @@ impl Config {
             self.maximized,
             self.sync_scroll,
             self.compare,
+            self.col_widths[0],
+            self.col_widths[1],
+            self.col_widths[2],
             self.session_text()
         )
     }
@@ -155,6 +180,14 @@ impl Config {
     /// in this file.
     fn session_text(&self) -> String {
         let mut out = String::new();
+        for p in &self.pins {
+            out.push_str(&format!("pin={}\n", p));
+        }
+        for (i, (key, asc)) in self.sort.iter().enumerate() {
+            if (*key, *asc) != (0, true) {
+                out.push_str(&format!("sort{}={},{}\n", i, key, asc));
+            }
+        }
         for (i, paths) in self.tabs.iter().enumerate() {
             if paths.is_empty() {
                 continue;
@@ -169,6 +202,10 @@ impl Config {
 
     pub fn from_text(text: &str) -> Self {
         let mut c = Self::default();
+        // This file is meant to be editable by hand, and a Windows editor may
+        // leave a byte-order mark on the front. Without this the first key
+        // silently stops matching and that one setting appears not to stick.
+        let text = text.trim_start_matches('\u{feff}');
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -201,8 +238,21 @@ impl Config {
                 "maximized" => c.maximized = value.parse().unwrap_or(c.maximized),
                 "sync_scroll" => c.sync_scroll = value.parse().unwrap_or(c.sync_scroll),
                 "compare" => c.compare = value.parse().unwrap_or(c.compare),
+                "pin" => {
+                    if !value.is_empty() {
+                        c.pins.push(value.to_string());
+                    }
+                }
+                "col_widths" => c.col_widths = parse_widths(value, c.col_widths),
                 k => {
-                    if let Some(i) = pane_index(k, "tab") {
+                    if let Some(i) = pane_index(k, "sort") {
+                        if let Some((key, asc)) = value.split_once(',') {
+                            c.sort[i] = (
+                                key.trim().parse().unwrap_or(0),
+                                asc.trim().parse().unwrap_or(true),
+                            );
+                        }
+                    } else if let Some(i) = pane_index(k, "tab") {
                         if !value.is_empty() {
                             c.tabs[i].push(value.to_string());
                         }
@@ -242,6 +292,9 @@ mod tests {
                 Vec::new(),
             ],
             active_tab: vec![1, 0, 0, 0],
+            pins: vec!["C:\\pinned".into()],
+            sort: vec![(2, false), (0, true), (0, true), (1, true)],
+            col_widths: [110, 90, 130],
         };
         assert_eq!(Config::from_text(&c.to_text()), c);
     }
@@ -296,6 +349,26 @@ mod tests {
         // MAX_PANES could shrink; a stale file must not index out of range.
         let c = Config::from_text("tab9=C:\\nope\ntab0=C:\\yes\n");
         assert_eq!(c.tabs[0], vec!["C:\\yes".to_string()]);
+    }
+
+    #[test]
+    fn absurd_column_widths_are_rejected_as_a_set() {
+        // A 5px column cannot be grabbed to widen it again, so the whole line
+        // is thrown away rather than half-applied.
+        assert_eq!(Config::from_text("col_widths=5,84,124\n").col_widths, [96, 84, 124]);
+        assert_eq!(Config::from_text("col_widths=110,90,130\n").col_widths, [110, 90, 130]);
+    }
+
+    #[test]
+    fn a_default_sort_is_not_written_out() {
+        // Four "sort0=0,true" lines in every settings file would be noise.
+        assert!(!Config::default().to_text().contains("sort"));
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_eat_the_first_setting() {
+        let c = Config::from_text("\u{feff}pane_count=3\n");
+        assert_eq!(c.pane_count, 3);
     }
 
     #[test]

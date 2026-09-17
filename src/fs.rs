@@ -100,6 +100,99 @@ fn decode_wide_cstr(buf: &[u16]) -> String {
 }
 
 /// List directory contents. Blocking: callers run this on a worker thread.
+/// Expand `%VAR%` the way a shell would, so a typed path can use them.
+/// Unknown names are left alone rather than blanked, which is what tells you
+/// you mistyped one.
+pub fn expand_env(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) => {
+                let name = &after[..end];
+                match std::env::var(name) {
+                    Ok(v) => out.push_str(&v),
+                    Err(_) => {
+                        out.push('%');
+                        out.push_str(name);
+                        out.push('%');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// True when two files do not hold the same bytes.
+///
+/// Size first, because a different size is a different file and costs one
+/// metadata call. Only then are both read. A file we cannot open counts as
+/// differing: "I could not tell" must not render as "these are the same".
+///
+/// ponytail: SipHash over the contents rather than a byte-by-byte compare.
+/// One pass per file instead of interleaved reads, and a 64-bit collision on
+/// two files of identical length is not a thing that happens by accident.
+pub fn files_differ(a: &str, b: &str) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return true;
+    };
+    if ma.len() != mb.len() {
+        return true;
+    }
+    match (hash_file(a), hash_file(b)) {
+        (Some(x), Some(y)) => x != y,
+        _ => true,
+    }
+}
+
+fn hash_file(path: &str) -> Option<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf[..n].hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+/// Lowercased extension with its leading dot, or None. Also the icon-cache key.
+pub fn extension_of(name: &str) -> Option<String> {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| format!(".{}", s.to_ascii_lowercase()))
+}
+
+/// Read a directory, or the inside of an archive when the path leads into one.
+///
+/// Every caller that used to call `list_dir` on a user-chosen path goes
+/// through here, which is the whole of what makes archives browsable: the path
+/// string carries the archive, so navigation, breadcrumbs and history need no
+/// idea that one is involved.
+pub fn list_any(path: &str) -> Result<Vec<FileEntry>, String> {
+    if let Some((archive, inner)) = crate::archive::split(path) {
+        return crate::archive::list(&archive, &inner);
+    }
+    list_dir(path).map_err(|e| e.to_string())
+}
+
 pub fn list_dir(path: &str) -> Result<Vec<FileEntry>, std::io::Error> {
     let extended = to_extended(path);
     let base = extended.trim_end_matches('\\');
@@ -117,14 +210,7 @@ pub fn list_dir(path: &str) -> Result<Vec<FileEntry>, std::io::Error> {
         if name != "." && name != ".." {
             let attrs = data.dwFileAttributes;
             let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
-            let extension = if is_dir {
-                None
-            } else {
-                Path::new(&name)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|s| format!(".{}", s.to_ascii_lowercase()))
-            };
+            let extension = if is_dir { None } else { extension_of(&name) };
             entries.push(FileEntry {
                 name,
                 size: ((data.nFileSizeHigh as u64) << 32) | (data.nFileSizeLow as u64),
@@ -651,5 +737,37 @@ mod tests {
         let d = drive(2048, 1024);
         assert_eq!(d.capacity_text(), "1 KB free of 2 KB");
         assert_eq!(drive(0, 0).capacity_text(), "");
+    }
+
+    #[test]
+    fn env_vars_expand_and_unknown_ones_stay_put() {
+        std::env::set_var("FX_TEST_DIR", "C:\\somewhere");
+        assert_eq!(expand_env("%FX_TEST_DIR%\\sub"), "C:\\somewhere\\sub");
+        // A name that is not set is left visible, which is how you see the typo.
+        assert_eq!(expand_env("%FX_NOT_SET%\\x"), "%FX_NOT_SET%\\x");
+        // An unmatched % is literal, not the start of something.
+        assert_eq!(expand_env("50% done"), "50% done");
+        assert_eq!(expand_env("plain"), "plain");
+    }
+
+    #[test]
+    fn files_differ_by_size_then_by_content() {
+        let base = std::env::temp_dir().join("fx_differ");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let a = base.join("a").to_string_lossy().into_owned();
+        let b = base.join("b").to_string_lossy().into_owned();
+        let c = base.join("c").to_string_lossy().into_owned();
+        std::fs::write(&a, b"hello").unwrap();
+        std::fs::write(&b, b"hello").unwrap();
+        std::fs::write(&c, b"world").unwrap();
+
+        assert!(!files_differ(&a, &b));
+        assert!(files_differ(&a, &c), "same length, different bytes");
+        std::fs::write(&c, b"hello there").unwrap();
+        assert!(files_differ(&a, &c), "different length");
+        // A file that is not there cannot be called identical.
+        assert!(files_differ(&a, &base.join("missing").to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
