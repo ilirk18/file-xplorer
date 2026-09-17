@@ -15,6 +15,8 @@ the current state so context is never lost.
 | 4 | [phase-4.md](phase-4.md) | Done | Shell file operations, multi-select, async I/O, DPI |
 | 5 | [phase-5.md](phase-5.md) | Done | Layout module, sidebar, filter, theming, visual overhaul |
 | 6 | [phase-6.md](phase-6.md) | Done | Palette, search, drag & drop, shell menu, watching, batch rename, settings |
+| 8 | [phase-8.md](phase-8.md) | Done | Themed context menu and tab strip, Ctrl+L, terminal, pins, autosave, tab moving, tree reveal, column resize, content compare, archiving |
+| 7 | [phase-7.md](phase-7.md) | Done | Split `main.rs`, four panes, undo, content search, session restore, Type column, folder tree, archives |
 
 ---
 
@@ -22,7 +24,12 @@ the current state so context is never lost.
 
 | Module | Responsibility |
 |---|---|
-| `src/main.rs` | Window creation, `wndproc`, input handling, worker-thread plumbing, modal prompts, context menu |
+| `src/main.rs` | Window creation, `wndproc`, message dispatch, painting |
+| `src/app.rs` | `AppState`, worker-thread spawners, shared helpers |
+| `src/input.rs` | Mouse and keyboard handlers |
+| `src/commands.rs` | The one `COMMANDS` table, context menu, file operations, undo |
+| `src/prompt.rs` | Modal single-line text prompt, with shell path completion |
+| `src/menu.rs` | The context menu's own owner-draw painting |
 | `src/layout.rs` | Every rectangle in the UI, plus `hit_test`. No Win32 types, fully unit-tested |
 | `src/renderer.rs` | Direct2D/DirectWrite drawing, WIC icon bitmaps, `TextMeasurer` |
 | `src/theme.rs` | `Palette` tokens for dark and light, with contrast tests |
@@ -31,7 +38,17 @@ the current state so context is never lost.
 | `src/fs.rs` | `list_dir`, path helpers, `validate_file_name`, `drives()`, size/date formatting |
 | `src/ops.rs` | `IFileOperation` for copy/move/delete/rename/new-folder, `CF_HDROP` clipboard, `ShellExecuteW` |
 | `src/icons.rs` | `HICON` cache keyed by extension or path, handles destroyed on drop |
-| `src/config.rs` | `key=value` settings file: pane count, theme, sidebar, hidden files, split |
+| `src/config.rs` | `key=value` settings file: pane count, theme, sidebar, hidden files, splits, window box, open tabs |
+| `src/search.rs` | Recursive name and content search |
+| `src/tree.rs` | The sidebar's folder tree: flat rows from a set of expanded paths |
+| `src/archive.rs` | Archives browsed as folders, via the 7-Zip CLI |
+| `src/palette.rs` | Command palette and its fuzzy matcher |
+| `src/batch_rename.rs` | Rename patterns, preview, dialog |
+| `src/watch.rs` | `ReadDirectoryChangesW` watcher, one per pane |
+| `src/dnd.rs` | Drag and drop (`IDropTarget` / `IDropSource`) |
+| `src/shellmenu.rs` | The real shell context menu |
+| `src/pidl.rs` | Shell item id lists, freed on drop |
+| `src/dialog.rs` | Shared dialog font handling |
 | `build.rs` + `app.manifest` | Embeds the manifest: PerMonitorV2 DPI, long paths, UTF-8, Common Controls v6 |
 
 ### Architectural rules
@@ -47,6 +64,10 @@ the current state so context is never lost.
    system's, not ours.
 4. **Errors are surfaced.** No `let _ = ` on anything a person needs to know about.
 5. **Sizes are physical pixels** derived from `Metrics::for_dpi`. Nothing assumes 96 DPI.
+6. **A pane is an index, not a side.** `PaneId(usize)` addresses one of up to
+   `MAX_PANES`; nothing outside `set_pane_count` may assume there are two.
+7. **Archives are read-only**, and one guard in `spawn_op_tagged` enforces it for
+   every destructive path, including ones nobody thought about.
 
 ---
 
@@ -56,7 +77,7 @@ the current state so context is never lost.
   failures. See [.cursor/rules/phase-tests.mdc](../.cursor/rules/phase-tests.mdc).
 - **Docs**: after each phase add or update `docs/phase-N.md` and this index.
 
-Current: **151 tests, zero warnings** (`cargo test`).
+Current: **204 tests, zero warnings** (`cargo test`).
 
 ---
 
@@ -68,4 +89,4 @@ Current: **151 tests, zero warnings** (`cargo test`).
 
 ---
 
-*Last updated: after Phase 6.*
+*Last updated: after Phase 8.*

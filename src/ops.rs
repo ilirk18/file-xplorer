@@ -17,7 +17,8 @@ use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Ole::CF_HDROP;
+use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::Win32::UI::Shell::*;
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -164,6 +165,28 @@ impl Op {
             }),
             Op::Delete { .. } => None,
         }
+    }
+
+    /// Every path this operation would read or write.
+    fn paths(&self) -> Vec<&str> {
+        match self {
+            Op::Copy { sources, dest_dir } | Op::Move { sources, dest_dir } => {
+                let mut v: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
+                v.push(dest_dir);
+                v
+            }
+            Op::Delete { sources, .. } => sources.iter().map(|s| s.as_str()).collect(),
+            Op::Rename { source, .. } => vec![source],
+            Op::RenameMany { items } => items.iter().map(|(s, _)| s.as_str()).collect(),
+            Op::NewFolder { parent, .. } => vec![parent],
+        }
+    }
+
+    /// True when any path leads inside an archive. Nothing here writes to one:
+    /// 7-Zip's CLI can, but a file operation that half succeeds inside a
+    /// container is not something to bolt on, so these are refused outright.
+    pub fn touches_archive(&self) -> bool {
+        self.paths().iter().any(|p| crate::archive::split(p).is_some())
     }
 
     /// What the footer says while this is running.
@@ -450,6 +473,55 @@ pub fn clipboard_read(owner: HWND) -> Option<(Vec<String>, DropEffect)> {
 }
 
 /// Open a file with its default handler, or reveal its shell property sheet.
+/// Put plain text on the clipboard. Used by "Copy path"; the file list itself
+/// goes on as CF_HDROP, which is a different thing entirely.
+pub fn clipboard_write_text(owner: HWND, text: &str) -> windows::core::Result<()> {
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        OpenClipboard(Some(owner))?;
+        let _ = EmptyClipboard();
+        let bytes = wide.len() * 2;
+        let result = (|| -> windows::core::Result<()> {
+            let mem = GlobalAlloc(GMEM_MOVEABLE, bytes)?;
+            let dst = GlobalLock(mem);
+            std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dst as *mut u8, bytes);
+            let _ = GlobalUnlock(mem);
+            // The clipboard owns the block from here; do not free it.
+            SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(mem.0)))?;
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+/// Open a shell at `dir`. Windows Terminal if it is installed, PowerShell if
+/// not — both are launched through the shell, so neither needs a full path.
+pub fn open_terminal(owner: HWND, dir: &str) -> windows::core::Result<()> {
+    let verb = to_wide("open");
+    let cwd = to_wide(dir);
+    let mut last = windows::core::Error::empty();
+    for exe in ["wt.exe", "powershell.exe", "cmd.exe"] {
+        let file = to_wide(exe);
+        let h = unsafe {
+            ShellExecuteW(
+                Some(owner),
+                PCWSTR::from_raw(verb.as_ptr()),
+                PCWSTR::from_raw(file.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::from_raw(cwd.as_ptr()),
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecuteW returns a fake HINSTANCE; anything over 32 is success.
+        if h.0 as isize > 32 {
+            return Ok(());
+        }
+        last = windows::core::Error::from_thread();
+    }
+    Err(last)
+}
+
 pub fn shell_open(owner: HWND, path: &str) -> windows::core::Result<()> {
     let wide = to_wide(path);
     let verb = to_wide("open");

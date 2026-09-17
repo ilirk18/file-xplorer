@@ -4,7 +4,6 @@
 // command is described in exactly one place: adding one here makes it
 // searchable and right-clickable at the same time.
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -14,7 +13,7 @@ use crate::file_list::SelectMode;
 use crate::input::{activate_selection, set_pane_count, toggle_hidden, toggle_theme};
 use crate::layout::{Hit, PaneId};
 use crate::prompt::prompt_text;
-use crate::{batch_rename, fs, ops, palette, search, shellmenu};
+use crate::{batch_rename, fs, ops, palette, pane, search, shellmenu};
 
 
 // Context menu command ids.
@@ -50,6 +49,16 @@ pub const CMD_GO_UP: usize = 126;
 pub const CMD_GO_BACK: usize = 127;
 pub const CMD_GO_FORWARD: usize = 128;
 pub const CMD_UNDO: usize = 131;
+pub const CMD_SEARCH_CONTENTS: usize = 132;
+pub const CMD_EXTRACT: usize = 133;
+pub const CMD_PALETTE: usize = 134;
+pub const CMD_GOTO: usize = 135;
+pub const CMD_TERMINAL: usize = 136;
+pub const CMD_COPY_PATH: usize = 137;
+pub const CMD_PIN: usize = 138;
+pub const CMD_REVEAL: usize = 139;
+pub const CMD_ARCHIVE: usize = 140;
+pub const CMD_COMPARE_CONTENT: usize = 141;
 
 /// Everything the palette can reach. The context menu builds from the same
 /// list, so a command is described in exactly one place.
@@ -65,19 +74,28 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_CUT, label: "Cut", keys: "Ctrl+X" },
     CommandDef { id: CMD_COPY, label: "Copy", keys: "Ctrl+C" },
     CommandDef { id: CMD_PASTE, label: "Paste", keys: "Ctrl+V" },
-    CommandDef { id: CMD_COPY_TO_OTHER, label: "Copy to other pane", keys: "F6" },
-    CommandDef { id: CMD_MOVE_TO_OTHER, label: "Move to other pane", keys: "Ctrl+Shift+M" },
+    CommandDef { id: CMD_COPY_TO_OTHER, label: "Copy to next pane", keys: "F6" },
+    CommandDef { id: CMD_MOVE_TO_OTHER, label: "Move to next pane", keys: "Ctrl+Shift+M" },
     CommandDef { id: CMD_DELETE, label: "Delete", keys: "Del" },
     CommandDef { id: CMD_RENAME, label: "Rename", keys: "F2" },
     CommandDef { id: CMD_BATCH_RENAME, label: "Batch rename", keys: "Ctrl+Shift+R" },
     CommandDef { id: CMD_NEW_FOLDER, label: "New folder", keys: "Ctrl+Shift+N" },
     CommandDef { id: CMD_PROPERTIES, label: "Properties", keys: "" },
     CommandDef { id: CMD_SEARCH, label: "Search here", keys: "Ctrl+Shift+F" },
+    CommandDef { id: CMD_SEARCH_CONTENTS, label: "Search file contents", keys: "Ctrl+Shift+G" },
     CommandDef { id: CMD_FILTER, label: "Filter this pane", keys: "Ctrl+F" },
     CommandDef { id: CMD_CALC_SIZES, label: "Calculate folder sizes", keys: "" },
+    CommandDef { id: CMD_EXTRACT, label: "Extract from archive", keys: "" },
     CommandDef { id: CMD_UNDO, label: "Undo last operation", keys: "Ctrl+Z" },
     CommandDef { id: CMD_REFRESH, label: "Refresh", keys: "F5" },
     CommandDef { id: CMD_SELECT_ALL, label: "Select all", keys: "Ctrl+A" },
+    CommandDef { id: CMD_GOTO, label: "Go to path", keys: "Ctrl+L" },
+    CommandDef { id: CMD_TERMINAL, label: "Open terminal here", keys: "" },
+    CommandDef { id: CMD_COPY_PATH, label: "Copy path", keys: "Ctrl+Shift+C" },
+    CommandDef { id: CMD_PIN, label: "Pin or unpin this folder", keys: "" },
+    CommandDef { id: CMD_REVEAL, label: "Show this folder in the tree", keys: "" },
+    CommandDef { id: CMD_ARCHIVE, label: "Add to archive", keys: "" },
+    CommandDef { id: CMD_COMPARE_CONTENT, label: "Compare contents with next pane", keys: "" },
     CommandDef { id: CMD_GO_UP, label: "Go up", keys: "Backspace" },
     CommandDef { id: CMD_GO_BACK, label: "Go back", keys: "Alt+Left" },
     CommandDef { id: CMD_GO_FORWARD, label: "Go forward", keys: "Alt+Right" },
@@ -151,12 +169,12 @@ pub fn show_palette(state: &mut AppState, hwnd: HWND) {
 }
 
 /// Start a recursive search in the focused pane, rooted at its current folder.
-pub fn start_search(state: &mut AppState, hwnd: HWND, query: &str) {
+pub fn start_search(state: &mut AppState, hwnd: HWND, query: search::Query) {
     let pid = state.focused;
     if state.pane(pid).current_path().is_empty() {
         return;
     }
-    let (tab_id, generation, root) = state.pane_mut(pid).begin_search(query);
+    let (tab_id, generation, root) = state.pane_mut(pid).begin_search(&query.label());
 
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     state.searches[pid.0] = Some(search::Search {
@@ -164,7 +182,6 @@ pub fn start_search(state: &mut AppState, hwnd: HWND, query: &str) {
     });
 
     let owner = ops::OwnerWindow(hwnd);
-    let query = query.to_string();
     std::thread::spawn(move || {
         search::run(root, query, generation, cancel, |batch| {
             let raw = Box::into_raw(Box::new(SearchBatch {
@@ -188,11 +205,11 @@ pub fn start_search(state: &mut AppState, hwnd: HWND, query: &str) {
     invalidate(hwnd);
 }
 
-/// Ask for a query, then search. Separate from `start_search` so the palette
-/// and the keyboard can both reach it.
+/// Ask for a name pattern, then search. Separate from `start_search` so the
+/// palette and the keyboard can both reach it.
 pub fn prompt_search(state: &mut AppState, hwnd: HWND) {
     let here = fs::path_leaf(state.focused_pane().current_path());
-    let Some(query) = prompt_text(
+    let Some(pattern) = prompt_text(
         hwnd,
         state,
         "Search",
@@ -201,10 +218,28 @@ pub fn prompt_search(state: &mut AppState, hwnd: HWND) {
     ) else {
         return;
     };
-    if query.trim().is_empty() {
+    if pattern.trim().is_empty() {
         return;
     }
-    start_search(state, hwnd, query.trim());
+    start_search(state, hwnd, search::Query::by_name(pattern.trim()));
+}
+
+/// Ask for text and search inside files rather than names.
+pub fn prompt_search_contents(state: &mut AppState, hwnd: HWND) {
+    let here = fs::path_leaf(state.focused_pane().current_path());
+    let Some(text) = prompt_text(
+        hwnd,
+        state,
+        "Search file contents",
+        &format!("Text to find in files under {}:", here),
+        "",
+    ) else {
+        return;
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    start_search(state, hwnd, search::Query::by_content(text.trim()));
 }
 
 /// Walk each named folder on a worker thread and post the totals back.
@@ -274,6 +309,227 @@ pub fn calculate_folder_sizes(state: &mut AppState, hwnd: HWND) {
 // ---------------------------------------------------------------------------
 // File operations
 // ---------------------------------------------------------------------------
+
+/// Unpack the selection, or the whole archive when nothing is selected, into
+/// the folder the archive itself lives in.
+pub fn do_extract(state: &mut AppState, hwnd: HWND) {
+    let pid = state.focused;
+    let here = state.pane(pid).current_path().to_string();
+    let Some((archive, inner)) = crate::archive::split(&here) else {
+        state.status_override = Some("Not inside an archive".into());
+        return;
+    };
+    let Some(dest) = fs::path_parent(&archive) else {
+        return;
+    };
+
+    // Paths relative to the archive root are what 7-Zip's filter wants, and
+    // they are exactly what the current inner path plus the row name gives.
+    let selected: Vec<String> = state
+        .pane(pid)
+        .list()
+        .selected_entries()
+        .iter()
+        .map(|e| {
+            if inner.is_empty() {
+                e.name.clone()
+            } else {
+                fs::path_join(&inner, &e.name)
+            }
+        })
+        .collect();
+
+    state.status_override = Some("Extracting\u{2026}".into());
+    match crate::archive::extract_to(&archive, &selected, &dest) {
+        Ok(()) => {
+            state.status_override = Some(format!("Extracted to {}", fs::path_leaf(&dest)));
+            // Whichever pane is showing the destination now has more in it.
+            for p in state.visible().collect::<Vec<_>>() {
+                if pane::paths_equal(state.pane(p).current_path(), &dest) {
+                    let req = state.pane_mut(p).refresh();
+                    start_load(hwnd, p, req);
+                }
+            }
+        }
+        Err(e) => {
+            state.status_override = None;
+            report_error(hwnd, "Extract", &e);
+        }
+    }
+}
+
+/// Type a path and go there. The edit box gets the shell's own completion, so
+/// this is a folder picker without a folder picker.
+pub fn do_goto(state: &mut AppState, hwnd: HWND) {
+    let pid = state.focused;
+    let here = state.pane(pid).current_path().to_string();
+    let Some(path) = crate::prompt::prompt_path(hwnd, state, "Go to", "Path:", &here) else {
+        return;
+    };
+    let path = path.trim().trim_matches('"');
+    if path.is_empty() {
+        return;
+    }
+    // Environment variables are how people actually write these down.
+    let expanded = fs::expand_env(path);
+    let req = state.pane_mut(pid).navigate(&expanded);
+    spawn_dir_load(hwnd, pid, req);
+}
+
+/// Open a shell in the focused folder, or in the selected folder if there is one.
+pub fn do_terminal(state: &mut AppState, hwnd: HWND) {
+    let pid = state.focused;
+    let mut dir = state.pane(pid).current_path().to_string();
+    if let Some(e) = state.pane(pid).list().cursor_entry() {
+        if e.is_dir && state.pane(pid).list().selection_count() == 1 {
+            dir = fs::path_join(&dir, &e.name);
+        }
+    }
+    // A path inside an archive is not a directory anything can start in.
+    if dir.is_empty() || crate::archive::split(&dir).is_some() {
+        state.status_override = Some("No folder to open a terminal in".into());
+        return;
+    }
+    if let Err(e) = ops::open_terminal(hwnd, &dir) {
+        report_error(hwnd, "Open terminal", &ops::format_hresult(&e));
+    }
+}
+
+/// The selection's full paths as text, one per line; the folder's own path
+/// when nothing is selected.
+pub fn do_copy_path(state: &mut AppState, hwnd: HWND) {
+    let pid = state.focused;
+    let mut paths = state.pane(pid).selected_paths();
+    if paths.is_empty() {
+        paths.push(state.pane(pid).current_path().to_string());
+    }
+    let n = paths.len();
+    if let Err(e) = ops::clipboard_write_text(hwnd, &paths.join("\r\n")) {
+        report_error(hwnd, "Clipboard", &ops::format_hresult(&e));
+        return;
+    }
+    state.status_override = Some(format!("{} path{} copied", n, if n == 1 { "" } else { "s" }));
+}
+
+/// Open the sidebar tree down to the focused folder and scroll it into view.
+pub fn do_reveal(state: &mut AppState, hwnd: HWND) {
+    let path = state.focused_pane().current_path().to_string();
+    if path.is_empty() || crate::archive::split(&path).is_some() {
+        return;
+    }
+    let landed = state.tree.reveal(&path);
+    state.sections_collapsed[SECTION_TREE] = false;
+    state.refresh_tree();
+
+    // Find where that row ended up and scroll so it is on screen. Laying the
+    // sidebar out twice is cheaper than duplicating its row arithmetic here.
+    let index = state
+        .tree_rows
+        .iter()
+        .position(|r| crate::pane::paths_equal(&r.path, &landed));
+    if let Some(i) = index {
+        let (entries, _) = state.sidebar_model();
+        let offset = entries
+            .iter()
+            .position(|e| matches!(e, crate::layout::SidebarEntry::Tree { index, .. } if *index == i));
+        if let Some(entry_index) = offset {
+            let before: i32 = entries[..entry_index]
+                .iter()
+                .map(|e| crate::layout::sidebar_content_h(state.metrics, std::slice::from_ref(e)) - state.metrics.pad)
+                .sum();
+            // Put it a third of the way down rather than at the very top, so
+            // its parents stay visible.
+            state.sidebar_scroll = before - state.client.h / 3;
+            state.clamp_sidebar_scroll();
+        }
+    }
+    invalidate(hwnd);
+}
+
+/// Pack the selection into a new archive beside it.
+pub fn do_archive(state: &mut AppState, hwnd: HWND) {
+    let pid = state.focused;
+    let sources = state.pane(pid).selected_paths();
+    if sources.is_empty() {
+        state.status_override = Some("Nothing selected".into());
+        return;
+    }
+    let dir = state.pane(pid).current_path().to_string();
+    let suggested = format!("{}.zip", fs::path_leaf(&sources[0]));
+    let Some(name) = prompt_text(hwnd, state, "Add to archive", "Archive name:", &suggested) else {
+        return;
+    };
+    if let Err(e) = fs::validate_file_name(&name) {
+        report_error(hwnd, "Invalid name", &e.message());
+        return;
+    }
+    let target = fs::path_join(&dir, &name);
+    state.status_override = Some("Archiving\u{2026}".into());
+    spawn_task(hwnd, move || match crate::archive::create(&target, &sources) {
+        Ok(()) => TaskDone {
+            message: format!("Created {}", fs::path_leaf(&target)),
+            error: None,
+            refresh: vec![dir],
+        },
+        Err(e) => TaskDone {
+            message: String::new(),
+            error: Some(e),
+            refresh: Vec::new(),
+        },
+    });
+}
+
+/// Compare this pane's files with the pane next door, by contents rather than
+/// by name. Runs on a worker thread: it reads both sides of every match.
+pub fn do_compare_contents(state: &mut AppState, hwnd: HWND) {
+    if state.pane_count < 2 {
+        state.status_override = Some("Press Ctrl+2 for a second pane".into());
+        return;
+    }
+    let pid = state.focused;
+    let other = state.other_side();
+    let dir_a = state.pane(pid).current_path().to_string();
+    let dir_b = state.pane(other).current_path().to_string();
+    let names_b = state.pane(other).list().names();
+    let names: Vec<String> = state
+        .pane(pid)
+        .list()
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir && names_b.contains(&e.name))
+        .map(|e| e.name.clone())
+        .collect();
+    if names.is_empty() {
+        state.status_override = Some("No files in common".into());
+        return;
+    }
+
+    let tab_id = state.pane(pid).active_tab_id();
+    state.status_override = Some(format!("Comparing {} files\u{2026}", names.len()));
+    let owner = ops::OwnerWindow(hwnd);
+    std::thread::spawn(move || {
+        let differing: Vec<String> = names
+            .into_iter()
+            .filter(|n| fs::files_differ(&fs::path_join(&dir_a, n), &fs::path_join(&dir_b, n)))
+            .collect();
+        let raw = Box::into_raw(Box::new(DiffDone {
+            pid,
+            tab_id,
+            differing,
+        }));
+        let posted = unsafe {
+            PostMessageW(
+                Some(owner.hwnd()),
+                WM_APP_DIFF_DONE,
+                WPARAM(0),
+                LPARAM(raw as isize),
+            )
+        };
+        if posted.is_err() {
+            unsafe { drop(Box::from_raw(raw)) };
+        }
+    });
+}
 
 /// Put back whatever the last undoable operation did.
 pub fn do_undo(state: &mut AppState, hwnd: HWND) {
@@ -430,65 +686,104 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
     };
     state.focused = pid;
 
+    // Which row, if any, was actually under the cursor. This — not "is
+    // anything selected" — decides which menu appears: right-clicking the
+    // empty space below a list is a question about the folder, even when a
+    // row further up is still selected.
+    let row = match hit {
+        Hit::ListBackground(_) | Hit::Row(..) => {
+            let list = state.pane(pid).list();
+            layout.pane(pid).row_at(
+                client.y,
+                list.scroll_offset,
+                layout.metrics.row_h,
+                list.total_rows(),
+            )
+        }
+        _ => None,
+    };
     // Right-clicking an unselected row selects it first, as Explorer does.
-    if let Hit::ListBackground(_) | Hit::Row(..) = hit {
-        let p = layout.pane(pid);
-        let list = state.pane(pid).list();
-        if let Some(row) = p.row_at(
-            client.y,
-            list.scroll_offset,
-            layout.metrics.row_h,
-            list.total_rows(),
-        ) {
-            if !state.pane(pid).list().is_selected(row) {
-                state.pane_mut(pid).list_mut().select(row, SelectMode::Replace);
-            }
+    if let Some(row) = row {
+        if !state.pane(pid).list().is_selected(row) {
+            state.pane_mut(pid).list_mut().select(row, SelectMode::Replace);
         }
     }
     invalidate(hwnd);
 
-    let has_selection = state.pane(pid).list().selection_count() > 0;
-    let single = state.pane(pid).list().selection_count() == 1;
-    let can_paste = ops::clipboard_read(hwnd).is_some();
+    let count = state.pane(pid).list().selection_count();
+    let folder = state
+        .pane(pid)
+        .list()
+        .cursor_entry()
+        .map(|e| e.is_dir)
+        .unwrap_or(false);
+    // Nothing writes inside an archive, so none of the commands that would be
+    // refused are offered.
+    let in_archive = crate::archive::split(state.pane(pid).current_path()).is_some();
+    let writable = !in_archive;
+    let pinned = state.is_pinned(state.pane(pid).current_path());
 
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let add = |id: usize, text: &str, enabled: bool| {
-            let t = wide(text);
-            let flags = if enabled { MF_STRING } else { MF_STRING | MF_GRAYED };
-            let _ = AppendMenuW(menu, flags, id, PCWSTR::from_raw(t.as_ptr()));
-        };
-        let sep = || {
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        };
-
-        add(CMD_OPEN, "Open\tEnter", single);
-        add(CMD_OPEN_NEW_TAB, "Open in new tab", single);
-        sep();
-        add(CMD_CUT, "Cut\tCtrl+X", has_selection);
-        add(CMD_COPY, "Copy\tCtrl+C", has_selection);
-        add(CMD_PASTE, "Paste\tCtrl+V", can_paste);
-        sep();
-        add(CMD_COPY_TO_OTHER, "Copy to other pane\tF6", has_selection);
-        add(CMD_MOVE_TO_OTHER, "Move to other pane\tCtrl+Shift+M", has_selection);
-        sep();
-        add(CMD_DELETE, "Delete\tDel", has_selection);
-        add(CMD_RENAME, "Rename\tF2", single);
-        sep();
-        add(CMD_NEW_FOLDER, "New folder\tCtrl+Shift+N", true);
-        add(CMD_REFRESH, "Refresh\tF5", true);
-        add(CMD_CALC_SIZES, "Calculate folder sizes", true);
-        add(CMD_SEARCH, "Search here\tCtrl+Shift+F", true);
-        add(CMD_BATCH_RENAME, "Batch rename\tCtrl+Shift+R", has_selection);
-        sep();
-        add(CMD_PROPERTIES, "Properties", single);
-
-        // Everything installed software registered goes below our own items.
-        let paths = state.pane(pid).selected_paths();
-        let shell = shellmenu::append(menu, hwnd, &paths);
-        if shell.is_some() {
-            sep();
+        let mut themed = crate::menu::ThemedMenu::new(state.theme, state.dpi);
+        // A macro rather than a closure: a closure would hold `themed`
+        // borrowed for the whole block, and the separators need it too.
+        macro_rules! add {
+            ($cond:expr, $id:expr, $text:expr, $accel:expr) => {
+                if $cond {
+                    themed.add(menu, $id, $text, $accel);
+                }
+            };
         }
+
+        if row.is_some() {
+            // What you clicked on.
+            add!(true, CMD_OPEN, "Open", "Enter");
+            add!(folder && count == 1, CMD_OPEN_NEW_TAB, "Open in new tab", "");
+            add!(folder && count == 1, CMD_TERMINAL, "Open terminal here", "");
+            themed.separator(menu);
+            add!(writable, CMD_CUT, "Cut", "Ctrl+X");
+            add!(true, CMD_COPY, "Copy", "Ctrl+C");
+            add!(true, CMD_COPY_PATH, "Copy path", "Ctrl+Shift+C");
+            add!(state.pane_count > 1, CMD_COPY_TO_OTHER, "Copy to next pane", "F6");
+            add!(state.pane_count > 1 && writable, CMD_MOVE_TO_OTHER, "Move to next pane", "Ctrl+Shift+M");
+            add!(in_archive, CMD_EXTRACT, "Extract here", "");
+            add!(writable && !in_archive, CMD_ARCHIVE, "Add to archive\u{2026}", "");
+            themed.separator(menu);
+            add!(writable && count == 1, CMD_RENAME, "Rename", "F2");
+            add!(writable && count > 1, CMD_BATCH_RENAME, "Rename all", "Ctrl+Shift+R");
+            add!(writable, CMD_DELETE, "Delete", "Del");
+            themed.separator(menu);
+            add!(count == 1, CMD_PROPERTIES, "Properties", "");
+        } else {
+            // What this folder can do. Everything else lives in the palette,
+            // which is one line further down and searchable.
+            add!(writable, CMD_NEW_FOLDER, "New folder", "Ctrl+Shift+N");
+            let can_paste = writable && ops::clipboard_read(hwnd).is_some();
+            add!(can_paste, CMD_PASTE, "Paste", "Ctrl+V");
+            add!(in_archive, CMD_EXTRACT, "Extract all", "");
+            themed.separator(menu);
+            add!(true, CMD_GOTO, "Go to path\u{2026}", "Ctrl+L");
+            add!(true, CMD_TERMINAL, "Open terminal here", "");
+            add!(true, CMD_PIN, if pinned { "Unpin this folder" } else { "Pin this folder" }, "");
+            add!(true, CMD_REVEAL, "Show in tree", "");
+            themed.separator(menu);
+            add!(true, CMD_SEARCH, "Search here", "Ctrl+Shift+F");
+            add!(true, CMD_CALC_SIZES, "Calculate folder sizes", "");
+            add!(true, CMD_REFRESH, "Refresh", "F5");
+            themed.separator(menu);
+            add!(true, CMD_PALETTE, "All commands\u{2026}", "Ctrl+Shift+P");
+        }
+        themed.apply(menu);
+
+        // Everything installed software registered goes below our own items,
+        // and only when there is something selected for it to act on.
+        let paths = if row.is_some() {
+            state.pane(pid).selected_paths()
+        } else {
+            Vec::new()
+        };
+        let shell = shellmenu::append(menu, hwnd, &paths);
 
         let cmd = TrackPopupMenu(
             menu,
@@ -542,8 +837,21 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
             start_load(hwnd, pid, req);
         }
         CMD_UNDO => do_undo(state, hwnd),
+        CMD_EXTRACT => do_extract(state, hwnd),
+        CMD_PALETTE => show_palette(state, hwnd),
+        CMD_GOTO => do_goto(state, hwnd),
+        CMD_TERMINAL => do_terminal(state, hwnd),
+        CMD_COPY_PATH => do_copy_path(state, hwnd),
+        CMD_PIN => {
+            let path = state.pane(pid).current_path().to_string();
+            state.toggle_pin(&path);
+        }
+        CMD_REVEAL => do_reveal(state, hwnd),
+        CMD_ARCHIVE => do_archive(state, hwnd),
+        CMD_COMPARE_CONTENT => do_compare_contents(state, hwnd),
         CMD_CALC_SIZES => calculate_folder_sizes(state, hwnd),
         CMD_SEARCH => prompt_search(state, hwnd),
+        CMD_SEARCH_CONTENTS => prompt_search_contents(state, hwnd),
         CMD_BATCH_RENAME => do_batch_rename(state, hwnd),
         CMD_TOGGLE_THEME => toggle_theme(state, hwnd),
         CMD_TOGGLE_HIDDEN => toggle_hidden(state, hwnd),

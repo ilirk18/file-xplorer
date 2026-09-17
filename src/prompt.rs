@@ -9,6 +9,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::app::{wide, AppState};
 use crate::dialog;
+use windows::Win32::UI::Shell::{
+    SHAutoComplete, SHACF_AUTOSUGGEST_FORCE_ON, SHACF_FILESYS_ONLY, SHACF_USETAB,
+};
 
 // ---------------------------------------------------------------------------
 // Modal text prompt
@@ -31,6 +34,8 @@ pub const EM_SETSEL: u32 = 0x00B1;
 pub struct PromptState {
     label: String,
     initial: String,
+    /// Hand the edit box to the shell's own path completion.
+    complete_paths: bool,
     result: Option<String>,
     accepted: bool,
     dpi: u32,
@@ -43,11 +48,34 @@ pub fn prompt_text(
     label: &str,
     initial: &str,
 ) -> Option<String> {
+    prompt_impl(hwnd, state, title, label, initial, false)
+}
+
+/// Same box, with the shell's filesystem auto-complete attached. That is a
+/// folder picker's worth of behaviour for one API call.
+pub fn prompt_path(
+    hwnd: HWND,
+    state: &mut AppState,
+    title: &str,
+    label: &str,
+    initial: &str,
+) -> Option<String> {
+    prompt_impl(hwnd, state, title, label, initial, true)
+}
+
+fn prompt_impl(
+    hwnd: HWND,
+    state: &mut AppState,
+    title: &str,
+    label: &str,
+    initial: &str,
+    complete_paths: bool,
+) -> Option<String> {
     if state.modal {
         return None; // Refuse to stack dialogs.
     }
     state.modal = true;
-    let out = unsafe { prompt_text_impl(hwnd, title, label, initial, state.dpi) };
+    let out = unsafe { prompt_text_impl(hwnd, title, label, initial, state.dpi, complete_paths) };
     state.modal = false;
     out
 }
@@ -58,6 +86,7 @@ pub unsafe fn prompt_text_impl(
     label: &str,
     initial: &str,
     dpi: u32,
+    complete_paths: bool,
 ) -> Option<String> {
     let instance = GetModuleHandleW(None).ok()?;
     let class = wide(PROMPT_CLASS);
@@ -88,6 +117,7 @@ pub unsafe fn prompt_text_impl(
     let st = Box::into_raw(Box::new(PromptState {
         label: label.to_string(),
         initial: initial.to_string(),
+        complete_paths,
         result: None,
         accepted: false,
         dpi,
@@ -255,6 +285,14 @@ extern "system" fn prompt_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                         Some(WPARAM(0)),
                         Some(LPARAM(stem_len as isize)),
                     );
+                    if state.complete_paths {
+                        // SHACF_FILESYS_ONLY plus a forced dropdown: typing a
+                        // parent folder then a backslash lists what is in it.
+                        let _ = SHAutoComplete(
+                            edit,
+                            SHACF_FILESYS_ONLY | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_USETAB,
+                        );
+                    }
                     let _ = SetFocus(Some(edit));
                 }
                 LRESULT(0)

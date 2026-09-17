@@ -41,6 +41,10 @@ impl UiFont {
         }
     }
 
+    pub fn handle(&self) -> HFONT {
+        self.0
+    }
+
     /// Apply to every child control of `parent`.
     pub fn apply_to_children(&self, parent: HWND) {
         unsafe {
