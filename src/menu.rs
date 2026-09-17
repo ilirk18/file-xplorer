@@ -86,6 +86,11 @@ impl ThemedMenu {
     }
 
     fn push(&mut self, menu: HMENU, id: usize, item: MenuItem) {
+        self.place(menu, None, id, item)
+    }
+
+    /// `at` None appends; Some(pos) inserts before that position.
+    fn place(&mut self, menu: HMENU, at: Option<u32>, id: usize, item: MenuItem) {
         let boxed = Box::new(item);
         let ptr = &*boxed as *const MenuItem as usize;
         self.items.push(boxed);
@@ -97,7 +102,20 @@ impl ThemedMenu {
         unsafe {
             // With MF_OWNERDRAW the last argument is not a string: it is the
             // `dwItemData` the draw and measure messages come back with.
-            let _ = AppendMenuW(menu, MF_OWNERDRAW, id, PCWSTR(ptr as *const u16));
+            match at {
+                None => {
+                    let _ = AppendMenuW(menu, MF_OWNERDRAW, id, PCWSTR(ptr as *const u16));
+                }
+                Some(pos) => {
+                    let _ = InsertMenuW(
+                        menu,
+                        pos,
+                        MF_OWNERDRAW | MF_BYPOSITION,
+                        id,
+                        PCWSTR(ptr as *const u16),
+                    );
+                }
+            }
         }
     }
 
@@ -109,6 +127,35 @@ impl ThemedMenu {
                 text: wide(text),
                 accel: wide(accel),
                 separator: false,
+            },
+        );
+    }
+
+    /// Put an entry at a position rather than at the end. Used to hoist
+    /// pinned shell verbs above everything else, which is the whole point of
+    /// pinning one.
+    pub fn insert(&mut self, menu: HMENU, at: u32, id: usize, text: &str) {
+        self.place(
+            menu,
+            Some(at),
+            id,
+            MenuItem {
+                text: wide(text),
+                accel: Vec::new(),
+                separator: false,
+            },
+        );
+    }
+
+    pub fn insert_separator(&mut self, menu: HMENU, at: u32) {
+        self.place(
+            menu,
+            Some(at),
+            0,
+            MenuItem {
+                text: Vec::new(),
+                accel: Vec::new(),
+                separator: true,
             },
         );
     }

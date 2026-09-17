@@ -34,6 +34,29 @@ pub const PLACES: &[(&str, &str)] = &[
     ("Network", "shell:NetworkPlacesFolder"),
 ];
 
+/// The GUIDs the shell hands out for the places the sidebar already names.
+/// It passes one of these when this app is the default file manager and
+/// somebody opens This PC.
+const ALIASES: &[(&str, &str)] = &[
+    ("{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "shell:MyComputerFolder"),
+    ("{645FF040-5081-101B-9F08-00AA002F954E}", "shell:RecycleBinFolder"),
+    ("{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", "shell:NetworkPlacesFolder"),
+];
+
+/// The spelling this app uses for a location, given the shell's.
+///
+/// Both reach the same folder; only one of them has a name anybody can read,
+/// and matching the sidebar is also what highlights the row you are in.
+pub fn canonical(path: &str) -> String {
+    let p = path.trim();
+    if let Some(guid) = p.strip_prefix("::") {
+        if let Some((_, name)) = ALIASES.iter().find(|(g, _)| g.eq_ignore_ascii_case(guid)) {
+            return (*name).to_string();
+        }
+    }
+    p.to_string()
+}
+
 /// True when `path` is a namespace location rather than a file path.
 ///
 /// Two spellings reach us: what we put in the sidebar (`shell:...`) and what
@@ -147,6 +170,30 @@ pub fn list(path: &str) -> Result<Vec<FileEntry>, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_shells_guid_for_a_place_becomes_the_name_the_sidebar_uses() {
+        assert_eq!(
+            canonical("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"),
+            "shell:MyComputerFolder"
+        );
+        // Lower case is the same GUID.
+        assert_eq!(
+            canonical("::{645ff040-5081-101b-9f08-00aa002f954e}"),
+            "shell:RecycleBinFolder"
+        );
+        // Everything else is left exactly as it arrived, including a GUID with
+        // children under it, which is a location inside a place and not the
+        // place itself.
+        let deep = r"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\C:";
+        assert_eq!(canonical(deep), deep);
+        assert_eq!(canonical(r"C:\\Users"), r"C:\\Users");
+        // And every alias names a place the sidebar actually offers.
+        for (_, name) in ALIASES {
+            assert!(PLACES.iter().any(|(_, p)| p == name), "{}", name);
+        }
+    }
+
     use super::*;
 
     #[test]

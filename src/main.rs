@@ -20,6 +20,7 @@ mod archive;
 mod batch_rename;
 mod commands;
 mod config;
+mod default_app;
 mod dialog;
 mod dnd;
 mod file_list;
@@ -103,6 +104,12 @@ fn start_path_from_args() -> Option<String> {
         return None;
     }
     let expanded = fs::expand_env(&arg);
+    // The shell hands out a CLSID rather than a path for This PC and the
+    // Recycle Bin, which is what the Folder class passes when this app is the
+    // default. It is not a path on disk and must not be measured as one.
+    if crate::shellns::is_shell_path(&expanded) {
+        return Some(crate::shellns::canonical(&expanded));
+    }
     let path = std::path::Path::new(&expanded);
     if path.is_dir() {
         Some(expanded)
@@ -484,7 +491,6 @@ fn handle(
             state.client = Rect::new(0, 0, w, h);
             // Splits are fractions of the body, so a resize keeps the panes in
             // proportion; the clamp only steps in when one would get too narrow.
-            state.clamp_split();
             let _ = state.renderer.resize(hwnd, w.max(0) as u32, h.max(0) as u32);
             invalidate(hwnd);
             Some(LRESULT(0))
@@ -513,7 +519,6 @@ fn handle(
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
-            state.clamp_split();
             invalidate(hwnd);
             Some(LRESULT(0))
         }
@@ -1046,7 +1051,7 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     let counts: Vec<String> = visible.iter().map(|p| state.counts_text(*p)).collect();
     // Compare mode diffs each pane against the one to its right, wrapping. With
     // two panes that is exactly "the other pane".
-    let comparing = state.compare && state.pane_count > 1;
+    let comparing = state.compare && state.pane_count() > 1;
     let names: Vec<HashSet<String>> = if comparing {
         visible.iter().map(|p| state.pane(*p).list().names()).collect()
     } else {

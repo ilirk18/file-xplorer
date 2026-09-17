@@ -236,11 +236,13 @@ pub struct AppState {
     /// keep their tabs and scroll, so Ctrl+1 then Ctrl+2 comes back to what
     /// was there.
     pub panes: Vec<Pane>,
-    pub pane_count: usize,
+    /// How the body is divided. A pane is a leaf, and `PaneId` still means an
+    /// index into `panes` — only its old second meaning, "the n-th column from
+    /// the left", is gone. Not to be confused with `tree`, which is the
+    /// sidebar's folders.
+    pub layout_tree: crate::layout::Node,
     pub focused: PaneId,
 
-    /// One fraction of the body width per divider; `pane_count - 1` of them.
-    pub splits: Vec<f32>,
     pub sidebar_visible: bool,
     /// The settings as they were read at startup. Only the saved tab list is
     /// still wanted after `new`, and only until WM_CREATE has restored it.
@@ -254,6 +256,8 @@ pub struct AppState {
     pub sidebar_scroll: i32,
     /// Folders the user pinned into Places.
     pub pins: Vec<String>,
+    /// Shell verbs hoisted to the top of the context menu, by menu text.
+    pub pin_actions: Vec<String>,
     /// Type, Size and Date column widths in DIPs. Kept here rather than in
     /// `Metrics` because they are a preference, not a measurement — `metrics`
     /// holds the scaled copy the layout reads.
@@ -367,9 +371,8 @@ impl AppState {
             dpi,
             client: Rect::default(),
             panes,
-            pane_count: cfg.pane_count.clamp(1, MAX_PANES),
+            layout_tree: cfg.tree(),
             focused: PaneId(0),
-            splits: cfg.splits.clone(),
             sidebar_visible: cfg.sidebar_visible,
             session: cfg.clone(),
             drives: fs::drives(),
@@ -379,6 +382,7 @@ impl AppState {
             sections_collapsed: [false, false, true],
             sidebar_scroll: 0,
             pins: cfg.pins.clone(),
+            pin_actions: cfg.pin_actions.clone(),
             col_widths: cfg.col_widths,
             last_saved: cfg.clone(),
             tab_drag: None,
@@ -447,12 +451,20 @@ impl AppState {
     }
     /// Every pane currently on screen, left to right.
     pub fn visible(&self) -> impl Iterator<Item = PaneId> {
-        (0..self.pane_count).map(PaneId)
+        self.layout_tree.leaves().into_iter()
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.layout_tree.count()
     }
     /// The next pane to the right, wrapping. With two panes this is "the other
     /// one", which is what every copy-to-other-pane command means.
+    /// The next pane Tab moves to: the next leaf, wrapping. For a row of
+    /// columns that is still "the one to the right", which is what it was.
     pub fn other_side(&self) -> PaneId {
-        PaneId((self.focused.0 + 1) % self.pane_count.max(1))
+        let leaves = self.layout_tree.leaves();
+        let at = leaves.iter().position(|p| *p == self.focused).unwrap_or(0);
+        leaves[(at + 1) % leaves.len().max(1)]
     }
 
     /// Build the sidebar's rows and, in lockstep, what clicking each one does.
@@ -516,6 +528,21 @@ impl AppState {
         }
 
         (entries, actions)
+    }
+
+    /// Toggle a shell verb's pin, by the text the menu showed for it.
+    pub fn toggle_action_pin(&mut self, label: &str) -> bool {
+        if let Some(i) = self
+            .pin_actions
+            .iter()
+            .position(|a| a.eq_ignore_ascii_case(label))
+        {
+            self.pin_actions.remove(i);
+            false
+        } else {
+            self.pin_actions.push(label.to_string());
+            true
+        }
     }
 
     pub fn is_pinned(&self, path: &str) -> bool {
@@ -607,7 +634,7 @@ impl AppState {
         Layout::compute(
             self.client,
             self.metrics,
-            &self.splits,
+            &self.layout_tree,
             self.sidebar_visible,
             &entries,
             self.sidebar_scroll,
@@ -792,22 +819,17 @@ impl AppState {
         self.layout().pane(pid).list.h.max(0) as u32
     }
 
-    pub fn clamp_split(&mut self) {
-        self.splits = Layout::clamp_splits(
-            self.client,
-            self.metrics,
-            self.sidebar_visible,
-            self.inspector,
-            self.pane_count,
-            &self.splits,
-        );
+    /// Move one divider. Minimum sizes are enforced when the tree is placed,
+    /// so there is nothing to clamp here.
+    pub fn set_divider(&mut self, index: usize, ratio: f32) {
+        self.layout_tree.set_ratio(index, ratio);
     }
 
     /// Show `n` panes. Shrinking while a doomed pane is focused moves it into
     /// range first, so the folder you were looking at is the one that stays.
     pub fn set_pane_count(&mut self, n: usize) {
         let n = n.clamp(1, MAX_PANES);
-        if n == self.pane_count {
+        if n == self.pane_count() {
             return;
         }
         if self.focused.0 >= n {
@@ -816,11 +838,37 @@ impl AppState {
             self.searches.swap(self.focused.0, n - 1);
             self.focused = PaneId(n - 1);
         }
-        self.pane_count = n;
-        // A different count means different dividers; even shares is the only
-        // sane starting point, and the clamp would force it anyway.
-        self.splits = Vec::new();
-        self.clamp_split();
+        // Ctrl+1..4 means "this many columns", which throws away any nesting.
+        // That is what asking for a number of panes has to mean; splitting
+        // without losing a layout is what Split right and Split down are for.
+        self.layout_tree = crate::layout::Node::columns(n);
+    }
+
+    /// Split the focused pane, and move into the new one.
+    ///
+    /// `vertical` puts it to the right, otherwise underneath. Fails only when
+    /// every pane id is already in use.
+    pub fn split_focused(&mut self, vertical: bool) -> Option<PaneId> {
+        let fresh = *self.layout_tree.unused().first()?;
+        if !self.layout_tree.split(self.focused, fresh, vertical) {
+            return None;
+        }
+        // The new pane inherits where you were, which is what makes splitting
+        // useful: two views of one folder, then navigate one of them away.
+        self.focused = fresh;
+        Some(fresh)
+    }
+
+    /// Close the focused pane, unless it is the only one.
+    pub fn close_focused(&mut self) -> bool {
+        let going = self.focused;
+        if !self.layout_tree.close(going) {
+            return false;
+        }
+        self.watchers[going.0] = None;
+        self.searches[going.0] = None;
+        self.focused = *self.layout_tree.leaves().first().unwrap_or(&PaneId(0));
+        true
     }
 
     /// What the inspector should be showing: the focused pane's cursor entry,
@@ -919,16 +967,16 @@ impl AppState {
 
     pub fn config(&self, hwnd: HWND) -> Config {
         let mut c = Config {
-            pane_count: self.pane_count,
+            layout: crate::config::tree_to_text(&self.layout_tree),
             theme_dark: self.theme.is_dark(),
             sidebar_visible: self.sidebar_visible,
             show_hidden: self.show_hidden,
-            splits: self.splits.clone(),
             sync_scroll: self.sync_scroll,
             compare: self.compare,
             tabs: self.panes.iter().map(|p| p.tab_paths()).collect(),
             active_tab: self.panes.iter().map(|p| p.active_tab_index).collect(),
             pins: self.pins.clone(),
+            pin_actions: self.pin_actions.clone(),
             recent: self.recent.clone(),
             inspector: self.inspector,
             command_bar: self.command_bar,
@@ -984,7 +1032,7 @@ impl AppState {
 
     /// Keep every visible pane on the same row when sync scrolling is on.
     pub fn mirror_scroll(&mut self, from: PaneId) {
-        if !self.sync_scroll || self.pane_count < 2 {
+        if !self.sync_scroll || self.pane_count() < 2 {
             return;
         }
         let offset = self.pane(from).list().scroll_offset;
@@ -1070,6 +1118,22 @@ pub fn invalidate(hwnd: HWND) {
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
+}
+
+/// Ask before doing something the user would have to undo by hand. Defaults
+/// to No, so a stray Enter cannot agree to anything.
+pub fn confirm(hwnd: HWND, title: &str, message: &str) -> bool {
+    let t = wide(title);
+    let m = wide(message);
+    let answer = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            PCWSTR::from_raw(m.as_ptr()),
+            PCWSTR::from_raw(t.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        )
+    };
+    answer == IDYES
 }
 
 pub fn report_error(hwnd: HWND, title: &str, message: &str) {

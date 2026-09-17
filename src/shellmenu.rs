@@ -105,6 +105,100 @@ impl Drop for ShellMenu {
     }
 }
 
+/// One entry of a shell menu that can actually be run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Action {
+    /// What the menu said, with a submenu's own name in front of it.
+    pub label: String,
+    /// The id `TrackPopupMenu` would have returned, which `invoke` takes.
+    pub id: u32,
+}
+
+/// Flatten a shell menu into the actions it offers, submenus included.
+///
+/// Our own entries are MF_OWNERDRAW, so `GetMenuStringW` returns nothing for
+/// them and they drop out on their own — what comes back is the shell's half
+/// of the menu, which is the half nobody can search by eye.
+pub fn list(hmenu: HMENU) -> Vec<Action> {
+    let mut out = Vec::new();
+    unsafe { walk(hmenu, "", &mut out, 0) };
+    out
+}
+
+/// Nested deeper than any shell menu goes, and a stop if one ever loops.
+const MAX_DEPTH: u32 = 3;
+
+unsafe fn walk(hmenu: HMENU, prefix: &str, out: &mut Vec<Action>, depth: u32) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let count = GetMenuItemCount(Some(hmenu)).max(0);
+    for i in 0..count {
+        let mut buf = [0u16; 256];
+        let n = GetMenuStringW(hmenu, i as u32, Some(&mut buf), MF_BYPOSITION);
+        if n <= 0 {
+            continue; // separator, or somebody else's owner-drawn item
+        }
+        let label = clean(&String::from_utf16_lossy(&buf[..n as usize]));
+        if label.is_empty() {
+            continue;
+        }
+        let full = if prefix.is_empty() {
+            label
+        } else {
+            format!("{} \u{203a} {}", prefix, label)
+        };
+
+        let sub = GetSubMenu(hmenu, i as i32);
+        if !sub.is_invalid() {
+            // Some handlers fill their submenu only when it is about to be
+            // shown. This is that message, sent by hand — without it "Send to"
+            // and "Open with" are empty lists.
+            let _ = handle_menu_msg(
+                WM_INITMENUPOPUP,
+                WPARAM(sub.0 as usize),
+                LPARAM(i as isize),
+            );
+            walk(sub, &full, out, depth + 1);
+            continue;
+        }
+
+        let state = GetMenuState(hmenu, i as u32, MF_BYPOSITION);
+        if state != u32::MAX && state & (MF_DISABLED.0 | MF_GRAYED.0) != 0 {
+            continue; // offering it would be a promise the shell will refuse
+        }
+        let id = GetMenuItemID(hmenu, i as i32);
+        if (SHELL_ID_FIRST..=SHELL_ID_LAST).contains(&id) {
+            out.push(Action { label: full, id });
+        }
+    }
+}
+
+/// Menu text as a person would read it: no `&` mnemonics, no accelerator
+/// column, no trailing ellipsis to trip up matching against a pinned name.
+fn clean(raw: &str) -> String {
+    let no_accel = raw.split(['\t', '\u{8}']).next().unwrap_or("");
+    let mut out = String::with_capacity(no_accel.len());
+    let mut chars = no_accel.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            // "&&" is a literal ampersand; a lone one marks the next letter.
+            if chars.peek() == Some(&'&') {
+                chars.next();
+                out.push('&');
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    // Both spellings of "and then a dialog": one character, or three dots.
+    out.trim()
+        .trim_end_matches('\u{2026}')
+        .trim_end_matches("...")
+        .trim()
+        .to_string()
+}
+
 /// Forward the messages a shell menu needs while it is on screen.
 /// Returns Some when the message was consumed.
 pub fn handle_menu_msg(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
@@ -140,6 +234,22 @@ mod tests {
         // must start well above them or TrackPopupMenu results are ambiguous.
         assert!(SHELL_ID_FIRST > 1000);
         assert!(SHELL_ID_LAST > SHELL_ID_FIRST);
+    }
+
+#[test]
+    fn menu_text_is_cleaned_for_reading_and_matching() {
+        assert_eq!(clean("&Open"), "Open");
+        assert_eq!(clean("Cu&t\tCtrl+X"), "Cut");
+        assert_eq!(clean("Rock && Roll"), "Rock & Roll");
+        assert_eq!(clean("Open &with\u{2026}"), "Open with");
+        assert_eq!(clean("Extract files..."), "Extract files");
+        // A separator's text is empty, which is how it gets dropped.
+        assert_eq!(clean(""), "");
+    }
+
+    #[test]
+    fn an_empty_menu_offers_no_actions() {
+        assert!(list(HMENU::default()).is_empty());
     }
 
     #[test]

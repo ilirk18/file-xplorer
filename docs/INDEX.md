@@ -19,6 +19,8 @@ the current state so context is never lost.
 | 9+ | [phase-9-plan.md](phase-9-plan.md) | Planned | Nested layouts, view modes, default manager, and the rest of the File Pilot gap |
 | 7 | [phase-7.md](phase-7.md) | Done | Split `main.rs`, four panes, undo, content search, session restore, Type column, folder tree, archives |
 
+**Ideas (not phased yet):** [file-pilot-comparison.md](file-pilot-comparison.md) · [powertoys-inspired-ideas.md](powertoys-inspired-ideas.md)
+
 ---
 
 ## Current codebase
@@ -70,8 +72,9 @@ the current state so context is never lost.
    system's, not ours.
 4. **Errors are surfaced.** No `let _ = ` on anything a person needs to know about.
 5. **Sizes are physical pixels** derived from `Metrics::for_dpi`. Nothing assumes 96 DPI.
-6. **A pane is an index, not a side.** `PaneId(usize)` addresses one of up to
-   `MAX_PANES`; nothing outside `set_pane_count` may assume there are two.
+6. **A pane is an index, not a position.** `PaneId(usize)` addresses one of up
+   to `MAX_PANES` entries in the pane array. Where it sits on screen is what
+   the layout tree says, and nothing may infer one from the other.
 7. **Archives and the shell namespace are read-only**, and one guard in
    `spawn_op_tagged` enforces it for every destructive path, including ones
    nobody thought about.
@@ -84,7 +87,7 @@ the current state so context is never lost.
   failures. See [.cursor/rules/phase-tests.mdc](../.cursor/rules/phase-tests.mdc).
 - **Docs**: after each phase add or update `docs/phase-N.md` and this index.
 
-Current: **260 tests, zero warnings** (`cargo test`).
+Current: **267 tests, zero warnings** (`cargo test`).
 
 ---
 
