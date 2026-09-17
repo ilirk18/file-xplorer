@@ -65,6 +65,13 @@ pub const CMD_GRID: usize = 144;
 pub const CMD_BIND: usize = 145;
 pub const CMD_NEW_WINDOW: usize = 146;
 pub const CMD_TOGGLE_BAR: usize = 147;
+pub const CMD_SPLIT_RIGHT: usize = 148;
+pub const CMD_SPLIT_DOWN: usize = 149;
+pub const CMD_CLOSE_PANE: usize = 150;
+pub const CMD_ACTIONS: usize = 151;
+pub const CMD_PIN_ACTION: usize = 152;
+pub const CMD_SHARE: usize = 153;
+pub const CMD_DEFAULT_APP: usize = 154;
 
 /// Everything the palette can reach. The context menu builds from the same
 /// list, so a command is described in exactly one place.
@@ -89,6 +96,10 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_BATCH_RENAME, label: "Batch rename", keys: "Ctrl+Shift+R" },
     CommandDef { id: CMD_NEW_FOLDER, label: "New folder", keys: "Ctrl+Shift+N" },
     CommandDef { id: CMD_PROPERTIES, label: "Properties", keys: "" },
+    CommandDef { id: CMD_ACTIONS, label: "Search shell actions", keys: "Ctrl+Shift+A" },
+    CommandDef { id: CMD_PIN_ACTION, label: "Pin or unpin a shell action", keys: "" },
+    CommandDef { id: CMD_SHARE, label: "Share", keys: "" },
+    CommandDef { id: CMD_DEFAULT_APP, label: "Default file manager\u{2026}", keys: "" },
     CommandDef { id: CMD_SEARCH, label: "Search here", keys: "Ctrl+Shift+F" },
     CommandDef { id: CMD_SEARCH_CONTENTS, label: "Search file contents", keys: "Ctrl+Shift+G" },
     CommandDef { id: CMD_FILTER, label: "Filter this pane", keys: "Ctrl+F" },
@@ -98,7 +109,7 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_REFRESH, label: "Refresh", keys: "F5" },
     CommandDef { id: CMD_SELECT_ALL, label: "Select all", keys: "Ctrl+A" },
     CommandDef { id: CMD_GOTO, label: "Go to path", keys: "Ctrl+L" },
-    CommandDef { id: CMD_RECENT, label: "Recent folders", keys: "" },
+    CommandDef { id: CMD_RECENT, label: "Go to a known folder", keys: "Ctrl+Shift+L" },
     CommandDef { id: CMD_TERMINAL, label: "Open terminal here", keys: "" },
     CommandDef { id: CMD_COPY_PATH, label: "Copy path", keys: "Ctrl+Shift+C" },
     CommandDef { id: CMD_PIN, label: "Pin or unpin this folder", keys: "" },
@@ -119,6 +130,9 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_DUAL_PANE, label: "Two panes", keys: "Ctrl+2" },
     CommandDef { id: CMD_THREE_PANES, label: "Three panes", keys: "Ctrl+3" },
     CommandDef { id: CMD_FOUR_PANES, label: "Four panes", keys: "Ctrl+4" },
+    CommandDef { id: CMD_SPLIT_RIGHT, label: "Split right", keys: "Ctrl+Shift+E" },
+    CommandDef { id: CMD_SPLIT_DOWN, label: "Split down", keys: "Ctrl+Shift+O" },
+    CommandDef { id: CMD_CLOSE_PANE, label: "Close pane", keys: "Ctrl+Shift+W" },
     CommandDef { id: CMD_SYNC_SCROLL, label: "Toggle synchronised scrolling", keys: "" },
     CommandDef { id: CMD_COMPARE, label: "Toggle compare panes", keys: "" },
     CommandDef { id: CMD_TOGGLE_HIDDEN, label: "Toggle hidden files", keys: "Ctrl+H" },
@@ -212,6 +226,8 @@ pub enum BarMenu {
     New,
     Sort,
     View,
+    /// Whatever did not fit on the bar, plus the palette.
+    Overflow,
 }
 
 pub struct BarItem {
@@ -234,11 +250,24 @@ pub const BAR: &[BarItem] = &[
     BarItem { glyph: crate::renderer::glyph::PASTE, label: "", action: BarAction::Run(CMD_PASTE), right: false },
     BarItem { glyph: crate::renderer::glyph::RENAME, label: "", action: BarAction::Run(CMD_RENAME), right: false },
     BarItem { glyph: crate::renderer::glyph::DELETE, label: "", action: BarAction::Run(CMD_DELETE), right: false },
+    BarItem { glyph: crate::renderer::glyph::SHARE, label: "", action: BarAction::Run(CMD_SHARE), right: false },
     BarItem { glyph: crate::renderer::glyph::SORT, label: "Sort", action: BarAction::Menu(BarMenu::Sort), right: false },
     BarItem { glyph: crate::renderer::glyph::VIEW, label: "View", action: BarAction::Menu(BarMenu::View), right: false },
-    BarItem { glyph: crate::renderer::glyph::MORE, label: "", action: BarAction::Run(CMD_PALETTE), right: false },
+    BarItem { glyph: crate::renderer::glyph::MORE, label: "", action: BarAction::Menu(BarMenu::Overflow), right: true },
     BarItem { glyph: crate::renderer::glyph::PANE, label: "Details", action: BarAction::Run(CMD_INSPECTOR), right: true },
 ];
+
+/// What a button is called when it is not being drawn: in the overflow menu,
+/// and in anything else that has to say what it does in words.
+pub fn bar_name(item: &BarItem) -> &'static str {
+    match item.action {
+        BarAction::Run(cmd) => label_for(cmd),
+        // The only button that draws no name at all.
+        BarAction::Menu(BarMenu::Overflow) => "More",
+        // Every other menu button carries its name on the bar already.
+        BarAction::Menu(_) => item.label,
+    }
+}
 
 /// Whether a button is live.
 ///
@@ -255,6 +284,7 @@ pub fn bar_enabled(state: &AppState, action: BarAction) -> bool {
         BarAction::Run(CMD_PASTE) => writable && ops::clipboard_has_files(),
         BarAction::Run(CMD_RENAME) => selected == 1 && writable,
         BarAction::Run(CMD_DELETE) => selected > 0 && writable,
+        BarAction::Run(CMD_SHARE) => selected > 0,
         BarAction::Menu(BarMenu::New) => writable,
         _ => true,
     }
@@ -277,6 +307,9 @@ const SORT_FIRST: usize = 9000;
 const ORDER_ASC: usize = 9100;
 const ORDER_DESC: usize = 9101;
 const ICON_FIRST: usize = 9200;
+/// `BAR_FIRST + index` reopens a bar button from the overflow menu, which is
+/// how a hidden *Sort* still drops its own menu rather than doing nothing.
+const BAR_FIRST: usize = 9300;
 
 /// Drop a menu under a bar button, using the same themed menu as the context
 /// menu so it looks like part of the app rather than part of Windows.
@@ -285,6 +318,22 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
     use crate::layout::{ICONS_OFF, ICON_STEPS};
 
     let pid = state.focused;
+    // Which buttons did not fit. The layout already answered this: anything it
+    // could not place got an empty rectangle and was never drawn.
+    let hidden: Vec<usize> = if which == BarMenu::Overflow {
+        let placed = state.layout().bar_items;
+        BAR.iter()
+            .enumerate()
+            .filter(|(i, it)| {
+                !it.right
+                    && placed.get(*i).map(|r| r.is_empty()).unwrap_or(true)
+                    && bar_enabled(state, it.action)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let list = state.pane(pid).list();
     let (key, order) = (list.sort_key, list.sort_order);
     let icons = state.icons;
@@ -338,14 +387,42 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
                     );
                 }
             }
+            BarMenu::Overflow => {
+                for i in &hidden {
+                    let it = &BAR[*i];
+                    let accel = match it.action {
+                        BarAction::Run(cmd) => binds.text_for(cmd),
+                        BarAction::Menu(_) => String::new(),
+                    };
+                    themed.add(menu, BAR_FIRST + i, bar_name(it), &accel);
+                }
+                if !hidden.is_empty() {
+                    themed.separator(menu);
+                }
+                themed.add(
+                    menu,
+                    CMD_PALETTE,
+                    "All commands\u{2026}",
+                    &binds.text_for(CMD_PALETTE),
+                );
+            }
         }
         themed.apply(menu);
+
+        // TrackPopupMenu wants screen coordinates. The button rect is client
+        // space, the same units the layout uses everywhere else — converting
+        // here is what the context menu already does for its anchor.
+        let mut pt = POINT {
+            x: rect.x,
+            y: rect.bottom(),
+        };
+        let _ = ClientToScreen(hwnd, &mut pt);
 
         let cmd = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_NONOTIFY,
-            rect.x,
-            rect.bottom(),
+            pt.x,
+            pt.y,
             None,
             hwnd,
             None,
@@ -355,7 +432,11 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
         if id == 0 {
             return;
         }
-        if id >= ICON_FIRST {
+        if id >= BAR_FIRST {
+            // A button that did not fit, run from the overflow menu. Menus
+            // reopen under the overflow button, which is where the click was.
+            do_bar(state, hwnd, id - BAR_FIRST, rect);
+        } else if id >= ICON_FIRST {
             let step = id - ICON_FIRST;
             state.icons = if step == 0 {
                 ICONS_OFF
@@ -375,6 +456,168 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
             state.remember_current_view();
         } else {
             run_command(state, hwnd, id);
+        }
+    }
+}
+
+/// Take over opening folders, or hand it back.
+///
+/// One command for both directions: which one it is depends on what the
+/// registry currently says, and the message box spells out what will change
+/// before anything is written. This is a system default, so it is never
+/// silent and never a side effect of anything else.
+pub fn do_default_app(state: &mut AppState, hwnd: HWND) {
+    use crate::default_app;
+
+    let exe = match default_app::exe_path() {
+        Ok(e) => e,
+        Err(e) => {
+            report_error(hwnd, "Default file manager", &e);
+            return;
+        }
+    };
+
+    if default_app::is_default() {
+        let ok = crate::app::confirm(
+            hwnd,
+            "Restore Windows Explorer",
+            "Folders, drives and This PC will open in Windows Explorer again.\n\n\
+             Whatever these keys said before File Xplorer claimed them is put \
+             back exactly. Nothing outside your own user account is touched.\n\n\
+             Restore Windows Explorer?",
+        );
+        if !ok {
+            return;
+        }
+        match default_app::restore() {
+            Ok(()) => state.status_override = Some("Windows Explorer restored".into()),
+            Err(e) => report_error(hwnd, "Restore Windows Explorer", &e),
+        }
+        return;
+    }
+
+    let ok = crate::app::confirm(
+        hwnd,
+        "Default file manager",
+        &format!(
+            "Folders, drives and This PC will open in File Xplorer instead of \
+             Windows Explorer.\n\n\
+             This writes three keys under HKEY_CURRENT_USER only \u{2014} your \
+             account, not the machine \u{2014} and records what each one said \
+             first so this command can put them back. Windows Explorer itself \
+             keeps working.\n\n{}\n\n\
+             Make File Xplorer the default?",
+            default_app::command_for(&exe)
+        ),
+    );
+    if !ok {
+        return;
+    }
+    match default_app::make_default() {
+        Ok(()) => {
+            state.status_override = Some("File Xplorer opens folders now".into());
+        }
+        Err(e) => report_error(hwnd, "Default file manager", &e),
+    }
+}
+
+/// Run the shell verb whose menu entry reads `name`, if it offered one.
+///
+/// ponytail: matched on the menu's text, so a Windows running in another
+/// language will not find it and says so. The upgrade is
+/// IDataTransferManagerInterop, which is the documented way to raise the share
+/// sheet and a great deal more code than this.
+fn invoke_named(state: &mut AppState, hwnd: HWND, name: &str) -> bool {
+    let pid = state.focused;
+    let selected = state.pane(pid).selected_pidls();
+    if selected.is_empty() {
+        return false;
+    }
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return false };
+        let shell = shellmenu::append(menu, hwnd, &selected);
+        let found = shellmenu::list(menu)
+            .into_iter()
+            .find(|a| a.label.eq_ignore_ascii_case(name));
+        let _ = DestroyMenu(menu);
+        match (found, &shell) {
+            (Some(a), Some(shell)) => {
+                shell.invoke(hwnd, a.id);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Every verb the shell offers for the selection, filtered as you type.
+///
+/// The menu is built and never shown. `QueryContextMenu` fills an HMENU
+/// whether or not anyone looks at it, and a searchable list is a better way to
+/// read forty entries than a column that runs off the bottom of the screen.
+///
+/// `pin` picks from the same list but stores the choice instead of running it,
+/// which is how a verb gets hoisted to the top of the context menu.
+pub fn do_actions(state: &mut AppState, hwnd: HWND, pin: bool) {
+    if state.modal {
+        return;
+    }
+    let pid = state.focused;
+    let selected = state.pane(pid).selected_pidls();
+    if selected.is_empty() {
+        state.status_override = Some("Select a file or folder first".into());
+        return;
+    }
+
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        // Held until after the choice: the id is an offset into this menu's
+        // command range, so the object that allocated it has to invoke it.
+        let shell = shellmenu::append(menu, hwnd, &selected);
+        let actions = shellmenu::list(menu);
+        let _ = DestroyMenu(menu);
+
+        if actions.is_empty() {
+            state.status_override = Some("The shell offered nothing here".into());
+            return;
+        }
+        let items: Vec<palette::Item> = actions
+            .iter()
+            .map(|a| palette::Item {
+                label: a.label.clone(),
+                detail: if state
+                    .pin_actions
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&a.label))
+                {
+                    "pinned".into()
+                } else {
+                    String::new()
+                },
+            })
+            .collect();
+
+        let title = if pin { "Pin an action" } else { "Actions" };
+        state.modal = true;
+        let chosen = palette::pick(hwnd, state.dpi, title, items);
+        state.modal = false;
+
+        let Some(i) = chosen else { return };
+        let action = &actions[i];
+        if pin {
+            let now = state.toggle_action_pin(&action.label);
+            state.status_override = Some(format!(
+                "{} {}",
+                if now { "Pinned" } else { "Unpinned" },
+                action.label
+            ));
+            return;
+        }
+        if let Some(shell) = &shell {
+            shell.invoke(hwnd, action.id);
+            // The shell just changed something; find out what.
+            let req = state.pane_mut(pid).refresh();
+            start_load(hwnd, pid, req);
         }
     }
 }
@@ -720,28 +963,84 @@ pub fn do_bind(state: &mut AppState, hwnd: HWND) {
     });
 }
 
-/// Pick from the folders visited this session and before, most recent first.
-///
-/// The palette is the list widget we already have, and a recent folder is
-/// exactly what it is good at: a short list, filtered by typing.
-pub fn do_recent(state: &mut AppState, hwnd: HWND) {
-    if state.modal || state.recent.is_empty() {
-        if state.recent.is_empty() {
-            state.status_override = Some("No folders visited yet".into());
+/// The go-to list, in the order it is offered: visited, pinned, named,
+/// mounted, open. A folder reached two ways is one entry — the first way wins,
+/// which is why recents lead: the label you last saw is the label you get.
+fn go_to_list(
+    recent: &[String],
+    pins: &[String],
+    places: &[crate::app::Shortcut],
+    drives: &[fs::Drive],
+    tree: &[crate::tree::TreeRow],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut add = |path: &str, label: String| {
+        if !path.is_empty() && !label.is_empty() && seen.insert(path.to_lowercase()) {
+            out.push((label, path.to_string()));
         }
+    };
+
+    for p in recent {
+        add(p, fs::path_leaf(p));
+    }
+    for p in pins {
+        add(p, fs::path_leaf(p));
+    }
+    // The sidebar's own shortcuts — Downloads, Documents, Home. Named there,
+    // so named here too rather than reduced to the folder's leaf.
+    for sc in places {
+        add(&sc.path, sc.label.clone());
+    }
+    for d in drives {
+        // The letter goes in the label, not just the detail: "c:" is how
+        // people reach for a drive, and only the label is matched against.
+        add(
+            &d.root,
+            format!("{} {}", d.root.trim_end_matches('\\'), d.label),
+        );
+    }
+    for row in tree {
+        add(&row.path, row.label.clone());
+    }
+    out
+}
+
+/// Everywhere this window already knows about, as one fuzzy list: folders
+/// visited, folders pinned, the sidebar's places, the drives, and whatever the
+/// tree has open.
+///
+/// Ctrl+L stays a path box with the shell's own completion, because that is
+/// the right tool for a path you can type. This is for the ones you would
+/// rather not type.
+pub fn do_places(state: &mut AppState, hwnd: HWND) {
+    if state.modal {
         return;
     }
-    let paths = state.recent.clone();
-    let items: Vec<palette::Item> = paths
-        .iter()
-        .map(|p| palette::Item {
-            label: fs::path_leaf(p),
-            detail: p.clone(),
+    let roots: Vec<String> = state.drives.iter().map(|d| d.root.clone()).collect();
+    let found = go_to_list(
+        &state.recent,
+        &state.pins,
+        &state.places,
+        &state.drives,
+        &state.tree.rows(&roots),
+    );
+    if found.is_empty() {
+        state.status_override = Some("No folders to go to yet".into());
+        return;
+    }
+
+    let paths: Vec<String> = found.iter().map(|(_, p)| p.clone()).collect();
+    let items: Vec<palette::Item> = found
+        .into_iter()
+        .map(|(label, path)| palette::Item {
+            label,
+            detail: path,
         })
         .collect();
 
     state.modal = true;
-    let chosen = palette::pick(hwnd, state.dpi, "Recent folders", items);
+    let chosen = palette::pick(hwnd, state.dpi, "Go to", items);
     state.modal = false;
 
     if let Some(i) = chosen {
@@ -857,7 +1156,7 @@ pub fn do_archive(state: &mut AppState, hwnd: HWND) {
 /// Compare this pane's files with the pane next door, by contents rather than
 /// by name. Runs on a worker thread: it reads both sides of every match.
 pub fn do_compare_contents(state: &mut AppState, hwnd: HWND) {
-    if state.pane_count < 2 {
+    if state.pane_count() < 2 {
         state.status_override = Some("Press Ctrl+2 for a second pane".into());
         return;
     }
@@ -957,7 +1256,7 @@ pub fn do_paste(state: &mut AppState, hwnd: HWND) {
 }
 
 pub fn copy_or_move_to_other(state: &mut AppState, hwnd: HWND, move_it: bool) {
-    if state.pane_count < 2 {
+    if state.pane_count() < 2 {
         state.status_override = Some("Press Ctrl+2 for a second pane".into());
         return;
     }
@@ -1163,8 +1462,8 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
             add!(writable, CMD_CUT, "Cut");
             add!(true, CMD_COPY, "Copy");
             add!(true, CMD_COPY_PATH, "Copy path");
-            add!(state.pane_count > 1, CMD_COPY_TO_OTHER, "Copy to next pane");
-            add!(state.pane_count > 1 && writable, CMD_MOVE_TO_OTHER, "Move to next pane");
+            add!(state.pane_count() > 1, CMD_COPY_TO_OTHER, "Copy to next pane");
+            add!(state.pane_count() > 1 && writable, CMD_MOVE_TO_OTHER, "Move to next pane");
             add!(in_archive, CMD_EXTRACT, "Extract here");
             add!(writable && !in_archive, CMD_ARCHIVE, "Add to archive\u{2026}");
             themed.separator(menu);
@@ -1172,6 +1471,7 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
             add!(writable && count > 1, CMD_BATCH_RENAME, "Rename all");
             add!(writable, CMD_DELETE, "Delete");
             themed.separator(menu);
+            add!(true, CMD_ACTIONS, "Search actions\u{2026}");
             add!(count == 1, CMD_PROPERTIES, "Properties");
         } else {
             // What this folder can do. Everything else lives in the palette,
@@ -1202,6 +1502,24 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
             Vec::new()
         };
         let shell = shellmenu::append(menu, hwnd, &selected);
+
+        // Pinned verbs go above our own items: reading down to find them is
+        // the problem pinning exists to solve. They keep the shell's id, so
+        // the dispatch below cannot tell the two copies apart — which is the
+        // point.
+        if shell.is_some() && !state.pin_actions.is_empty() {
+            let offered = shellmenu::list(menu);
+            let mut at = 0;
+            for name in &state.pin_actions {
+                if let Some(a) = offered.iter().find(|a| a.label.eq_ignore_ascii_case(name)) {
+                    themed.insert(menu, at, a.id as usize, &a.label);
+                    at += 1;
+                }
+            }
+            if at > 0 {
+                themed.insert_separator(menu, at);
+            }
+        }
 
         let cmd = TrackPopupMenu(
             menu,
@@ -1257,9 +1575,40 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_UNDO => do_undo(state, hwnd),
         CMD_EXTRACT => do_extract(state, hwnd),
         CMD_PALETTE => show_palette(state, hwnd),
+        CMD_ACTIONS => do_actions(state, hwnd, false),
+        CMD_DEFAULT_APP => do_default_app(state, hwnd),
+        CMD_SHARE => {
+            if !invoke_named(state, hwnd, "Share") {
+                state.status_override =
+                    Some("Nothing to share, or Windows offered no Share here".into());
+            }
+        }
+        CMD_PIN_ACTION => do_actions(state, hwnd, true),
         CMD_GOTO => do_goto(state, hwnd),
-        CMD_RECENT => do_recent(state, hwnd),
+        CMD_RECENT => do_places(state, hwnd),
         CMD_TOGGLE_BAR => state.command_bar = !state.command_bar,
+        CMD_SPLIT_RIGHT | CMD_SPLIT_DOWN => {
+            let here = state.pane(pid).current_path().to_string();
+            match state.split_focused(cmd == CMD_SPLIT_RIGHT) {
+                Some(new) => {
+                    // The new pane opens where you were: two views of one
+                    // folder, then navigate one of them away. Starting it
+                    // empty would make splitting a two-step gesture.
+                    let req = state.pane_mut(new).navigate(&here);
+                    spawn_dir_load(hwnd, new, req);
+                    state.rewatch(new, hwnd);
+                }
+                None => {
+                    state.status_override =
+                        Some(format!("Already showing {} panes", crate::layout::MAX_PANES))
+                }
+            }
+        }
+        CMD_CLOSE_PANE => {
+            if !state.close_focused() {
+                state.status_override = Some("This is the only pane".into());
+            }
+        }
         CMD_NEW_WINDOW => {
             // Opens on this folder rather than restoring the session: the
             // session belongs to one window, and this is not it.
@@ -1289,7 +1638,6 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_TOGGLE_HIDDEN => toggle_hidden(state, hwnd),
         CMD_TOGGLE_SIDEBAR => {
             state.sidebar_visible = !state.sidebar_visible;
-            state.clamp_split();
         }
         CMD_GRID => {
             // Toggling goes to the default size and back, rather than to
@@ -1322,7 +1670,6 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
                 state.preview = None;
                 state.preview_pending = None;
             }
-            state.clamp_split();
         }
         CMD_SINGLE_PANE => set_pane_count(state, 1),
         CMD_DUAL_PANE => set_pane_count(state, 2),
@@ -1432,6 +1779,57 @@ mod tests {
             assert_eq!(id_for_label(c.label), Some(c.id), "{}", c.label);
             assert_eq!(label_for(c.id), c.label);
         }
+    }
+
+    #[test]
+    fn every_bar_button_can_say_what_it_is() {
+        // The overflow menu shows names, not glyphs, so a button whose name is
+        // empty would appear there as a blank row nobody can read.
+        for it in BAR {
+            assert!(!bar_name(it).is_empty(), "{:?} has no name", it.glyph);
+        }
+    }
+
+    #[test]
+    fn the_go_to_list_offers_each_folder_once_under_its_first_name() {
+        let drive = fs::Drive {
+            root: "C:\\".to_string(),
+            label: "Local Disk".into(),
+            total_bytes: 0,
+            free_bytes: 0,
+        };
+        let place = crate::app::Shortcut {
+            label: "Downloads".into(),
+            path: "C:\\Users\\me\\Downloads".into(),
+        };
+        let row = crate::tree::TreeRow {
+            path: "C:\\Users\\me\\downloads".into(), // the same folder, spelled otherwise
+            label: "downloads".into(),
+            depth: 1,
+            expanded: false,
+        };
+        let recent = vec!["C:\\Users\\me\\Downloads".to_string()];
+
+        let all = go_to_list(&recent, &[], &[place], &[drive], &[row]);
+        let labels: Vec<&str> = all.iter().map(|(l, _)| l.as_str()).collect();
+        // Once, under the name the recents gave it, and case is not a second
+        // folder. The drive still gets its letter in the label, which is how
+        // typing "c:" reaches it.
+        assert_eq!(labels, vec!["Downloads", "C: Local Disk"]);
+    }
+
+    #[test]
+    fn a_drive_already_visited_keeps_the_name_it_was_visited_under() {
+        let drive = fs::Drive {
+            root: "C:\\".to_string(),
+            label: "Local Disk".into(),
+            total_bytes: 0,
+            free_bytes: 0,
+        };
+        let all = go_to_list(&["C:\\".to_string()], &[], &[], &[drive], &[]);
+        // One entry, not two. A root's leaf is the root itself, so it reads
+        // the same either way — and "c:" still matches it.
+        assert_eq!(all, vec![("C:\\".to_string(), "C:\\".to_string())]);
     }
 }
 

@@ -19,11 +19,11 @@ three other things are blocked behind it.
 | # | Work | Cost | Risk | Why here |
 |---|---|---|---|---|
 | 9 | Command line, multiple windows | Low | Low | Blocks 13; two-line feature, long-standing hole |
-| 10 | Nested H/V layouts, saved layouts | **High** | **High** | Their headline; rewrites the pane model |
+| 10 | ~~Nested H/V layouts~~ — done. Saved layouts remain | **High** | **High** | Their headline; rewrote the pane model |
 | 11 | View continuum, tiles and list modes | Medium | Low | Grid machinery already generalises |
-| 12 | Searchable and pinnable context menu, richer GoTo | Medium | Low | All of it reuses the palette |
-| 12b | Command bar: overflow, Share, per-pane placement | Low | Low | The bar itself is done; these are what it does not cover yet |
-| 13 | Default file manager, shell verbs | Medium | Medium | "More than both" — neither does it |
+| 12 | ~~Searchable and pinnable context menu, richer GoTo~~ — done | Medium | Low | All of it reused the palette |
+| 12b | ~~Command bar: overflow, Share~~ — done; per-pane placement declined | Low | Low | The bar itself was done; these were what it did not cover |
+| 13 | ~~Default file manager~~ — written, yours to run | Medium | Medium | "More than both" — neither does it |
 | 14 | Customization: fonts, density, themes, Options | Medium | Low | Broad but shallow |
 | 15 | Network polish, optional always-on folder sizes | Medium | Medium | Closes the reviews' complaint about them |
 
@@ -89,7 +89,23 @@ enum Node {
 - Saved layouts fall out almost free once the tree is a string:
   `savedlayout:<name>=V(0,H(1,2))` plus two palette commands.
 
-### Risk
+### How it went
+
+Done. The port was made first with columns only, and 263 tests passed with no
+behaviour change — the five that failed were a test of `clamp_splits`, which no
+longer exists, and four mistakes of my own in rewriting fixtures. One of those
+was worth the whole exercise: a fixture commented "one pane" that I handed two,
+which halved its width until a column stopped fitting. The test noticed.
+
+`clamp_splits` is gone. Minimum sizes are enforced during placement instead,
+because a ratio is a fraction of whatever space its node actually got and only
+placement knows what that was. `Layout.client` went with it, having lost its
+last reader.
+
+Still to do: **saved named layouts**. The tree is already a string, so this is
+`savedlayout:<name>=` lines and two palette commands.
+
+### Risk (as written beforehand)
 
 `layout.rs` is 2001 lines and the most thoroughly tested module in the project.
 The property its tests assert — *anything drawn at a rectangle hit-tests back to
@@ -125,65 +141,95 @@ cache's memory ceiling is in *entries*, and a 256px thumbnail is sixteen times a
 
 ---
 
-## 12. Searchable, pinnable context menu, and richer GoTo
+## 12. Searchable, pinnable context menu, and richer GoTo — done
 
-Three features, one mechanism: the palette, which already fuzzy-matches.
+Three features, one mechanism: the palette, which already fuzzy-matched.
 
-- **Type-to-run in the context menu.** The shell's items come back in an HMENU;
-  `GetMenuString` over `GetMenuItemCount` turns them into palette items, and
-  `ShellMenu::invoke(id)` already runs one by id. So: build the menu, offer
-  "Search these actions…", pick, invoke. No new COM.
-- **Pinned actions** hoist named verbs to the top. Store the verb *text* in
-  config, match on it, insert before everything else. Localisation makes this
-  approximate, which is honest for a convenience feature.
-- **GoTo by name.** `Ctrl+L` completes paths; it should also match recents,
-  pins, drives and expanded tree folders by fuzzy name. `palette::score` is
-  already the matcher, and phase 5 proved the pattern: offer the list, let
-  typing narrow it.
-- **Local vs global search toggle** is presentation — `Ctrl+Shift+F` and
-  `Ctrl+Shift+G` already exist. One prompt with a scope line beats two chords.
+- **Type-to-run in the context menu.** `shellmenu::list` walks the HMENU with
+  `GetMenuStringW` and returns `(label, id)` for everything the shell offered,
+  submenus flattened as "7-Zip › Extract here". Ctrl+Shift+A, or *Search
+  actions…* in the menu. The menu is built and never shown —
+  `QueryContextMenu` fills an HMENU whether or not anyone looks at it.
+  - Submenus are populated by hand: `WM_INITMENUPOPUP` is sent to the handler
+    through the forwarding that already existed, or "Send to" and "Open with"
+    come back empty.
+  - Disabled items are dropped; our own entries are MF_OWNERDRAW and have no
+    menu string, so they fall out without being filtered for.
+- **Pinned actions** hoist verbs above our own items, keeping the shell's id so
+  the dispatch cannot tell the two copies apart. `pinaction=<label>` in config;
+  *Pin or unpin a shell action* picks from the same list. Matching is on the
+  menu text, which a change of display language makes approximate — honest
+  for a convenience feature.
+- **GoTo by name** is `Ctrl+Shift+L`: recents, pins, the sidebar's places, the
+  drives and every open tree folder in one fuzzy list, each folder once. Ctrl+L
+  stays a path box with the shell's own completion, which is the right tool for
+  a path you can type.
+- **Local vs global search** needed nothing: the prompt already reads "Find in
+  *here* and below", and searching from `C:\` is the global case. A toggle
+  would add a control to say what the sentence says.
+
+Still open: the palette is a stock LISTBOX and so renders in the *system*
+theme, which is visible when the app's theme and Windows' disagree. Owner-draw
+would fix it and costs more than it returns until something else needs it.
 
 ---
 
-## 12b. What the command bar does not do yet
+## 12b. The command bar, continued
 
-The bar landed with New, Cut, Copy, Paste, Rename, Delete, Sort, View, the
-palette and Details. What Explorer's has and this does not:
+- **Overflow — done.** The ⋯ button moved to the right-hand end, where
+  placement reserves its width before the left-hand buttons flow; an overflow
+  button that could itself overflow would hide the buttons it exists to reach.
+  Its menu lists whatever got an empty rectangle, by name rather than glyph, and
+  a hidden *Sort* still drops its own menu — the entry re-enters `do_bar`
+  with the button’s index. Disabled buttons are left out, as the context
+  menu leaves out what it would refuse. The palette moved into this menu, which
+  is where Explorer keeps its own leftovers.
+- **Share — done.** `invoke_named` builds the shell menu for the selection,
+  finds the entry called *Share*, and invokes it. Matching on menu text means a
+  Windows running in another language will not find it and says so; the upgrade
+  is `IDataTransferManagerInterop`, which is the documented route and a great
+  deal more code.
+- **Per-pane placement.** Still one bar for the window, acting on the focused
+  pane. Nested layouts did not change that trade: four panes with four bars is
+  four times the chrome for the same commands.
+- **Keyboard reach and UIA — deliberately not built.** Every button is a
+  command that already has a chord or sits in the palette, so nothing on the bar
+  is mouse-only in the sense that matters: the *functions* are all keyboard
+  reachable. What is missing is a focus ring on a redundant surface. Worth doing
+  when the bar grows something that is not also a command — or on request,
+  since it is the kind of judgement a user should get to overrule.
 
-- **An overflow menu.** When the window is too narrow, buttons stop being drawn
-  rather than collapsing into a "..." — the layout already returns an empty
-  rectangle for anything that did not fit, so the overflow button only needs to
-  know which indices those were.
-- **Share.** A shell verb we do not invoke. It belongs with the searchable
-  context menu in 12, where verbs are already being enumerated.
-- **Per-pane placement.** One bar spans the window and acts on the focused
-  pane. With four panes that is the right trade; if nested layouts make panes
-  feel more like separate windows, it may stop being.
-- **Keyboard reach.** The buttons are mouse-only. Every one of them is already
-  a command with a shortcut, so this is a gap in appearance rather than in
-  ability — but the bar is not in the automation tree either, which phase 7
-  left at the listing.
+---
 
-## 13. Default file manager
+## 13. Default file manager — written, not run
 
-Neither app does this. It is the clearest "more than both" on the list, and it
-is mostly registry writes plus item 9.
+`src/default_app.rs`, reached from the palette as *Default file manager…*
+— one command for both directions, because which one it is depends on what
+the registry currently says.
 
-- `HKCU\Software\Classes\Directory\shell\open\command`
-- `HKCU\Software\Classes\Drive\shell\open\command`
-- `Folder\shell\open\command`, and the `CLSID` verb for This PC.
+- Writes `Directory`, `Drive` and `Folder`'s `shell\open\command` under
+  `HKCU\Software\Classes`. HKCU only: this user's account, no administrator
+  rights, no other account affected, Explorer itself untouched.
+- Records what each key said first under `HKCU\Software\FileXplorer`, and
+  never records our own command over that — the first backup is the true
+  one, so pressing it twice cannot lose the original.
+- **Restore undoes exactly what was done**, and no more: our default value,
+  then each key above it *only if it is now completely empty*. Deleting the
+  `shell` branch outright, which is what the first draft did, would have taken
+  this machine's own `Directory\shell\Cursor` verb with it.
+- A message box spells out what will change before anything is written, and
+  defaults to No.
+- The shell passes This PC as `::{20D04FE0-…}` rather than a path, so
+  `shellns::canonical` maps the three well-known GUIDs onto the `shell:` names
+  the sidebar already uses. Verified: launching with that argument opens a
+  window titled *This PC*.
 
-Rules this has to follow or it is malware behaviour:
+Skipped: This PC's own CLSID verb. It is a different shape of key, and a window
+that opens folders is not improved by also claiming the desktop icon.
 
-1. **Opt-in, from a command the user runs.** Never on install, never on launch.
-2. **Record what was there first**, and offer *Restore Windows Explorer* that
-   puts it back exactly.
-3. **HKCU only.** Never HKLM, never a machine-wide change.
-4. Explorer itself keeps working — this changes the default verb, not the shell.
-
-I will write this; **I will not run it against your registry.** Setting it is
-your call to make deliberately, and a session like this one is the wrong place
-for a system default to change by accident.
+**I have not run this against your registry.** The registry layer is tested
+against a scratch key of its own that it creates and removes; the class keys
+are yours to change deliberately.
 
 ---
 

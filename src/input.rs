@@ -77,11 +77,13 @@ pub fn on_dropped(state: &mut AppState, hwnd: HWND, dropped: dnd::Dropped) {
 pub fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
     match state.drag {
         Drag::Divider { index, grab_offset } => {
-            let f = state.layout().split_fraction_at(x - grab_offset);
-            if index < state.splits.len() {
-                state.splits[index] = f;
-            }
-            state.clamp_split();
+            // The grab offset is along whichever axis the divider runs, so one
+            // subtraction serves both: the other coordinate is ignored by
+            // `split_fraction_at` anyway.
+            let f = state
+                .layout()
+                .split_fraction_at(index, x - grab_offset, y - grab_offset);
+            state.set_divider(index, f);
             invalidate(hwnd);
             return;
         }
@@ -199,9 +201,10 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
 
     match hit {
         Hit::Divider(i) => {
+            let d = layout.dividers[i];
             state.drag = Drag::Divider {
                 index: i,
-                grab_offset: x - layout.dividers[i].x,
+                grab_offset: if d.vertical { x - d.rect.x } else { y - d.rect.y },
             };
             unsafe { SetCapture(hwnd) };
         }
@@ -386,9 +389,10 @@ pub fn on_double_click(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
 
     // Double-clicking a divider shares the width out evenly, like a window
     // splitter should.
-    if let Hit::Divider(_) = hit {
-        state.splits = Vec::new();
-        state.clamp_split();
+    if let Hit::Divider(i) = hit {
+        // Even shares for this divider's own two sides, not for the window:
+        // with a tree, halving one split must leave the others alone.
+        state.set_divider(i, 0.5);
         invalidate(hwnd);
         return;
     }
@@ -615,10 +619,7 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
                     // Ctrl+F focuses the pane filter, as it does everywhere else.
                     state.filter_focus = Some(pid);
                 }
-                (true, false, 'B') => {
-                    state.sidebar_visible = !state.sidebar_visible;
-                    state.clamp_split();
-                }
+                (true, false, 'B') => state.sidebar_visible = !state.sidebar_visible,
                 (true, false, '1') => set_pane_count(state, 1),
                 (true, false, '2') => set_pane_count(state, 2),
                 (true, false, '3') => set_pane_count(state, 3),

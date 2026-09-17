@@ -30,6 +30,14 @@ Install Rust from [rustup.rs](https://rustup.rs/), then open a new terminal so
 
 ## What it does
 
+**Panes split where you want them.** "Split right" and "Split down" divide the
+focused pane, so a layout is a tree rather than a row: two panes down the left
+and one tall one on the right is a thing you can have. Dragging a divider moves
+only its own split; double-clicking one evens out its own two sides and leaves
+the rest alone. The whole arrangement is one line in the settings file —
+`layout=V(0,0.450,H(1,0.500,2))` — which is also all a saved layout would need
+to be.
+
 **One pane by default, up to four on request.** `Ctrl+1` through `Ctrl+4` choose
 how many. Divider positions are fractions of the window, so resizing keeps the
 panes in proportion instead of squeezing the last one. Panes you hide keep their
@@ -226,6 +234,7 @@ These are the defaults; "Change a shortcut" in the palette rebinds any of them.
 | Undo the last operation | `Ctrl+Z` |
 | Batch rename | `Ctrl+Shift+R` |
 | One to four panes | `Ctrl+1` … `Ctrl+4` |
+| Split right / down / close pane | `Ctrl+Shift+E` / `Ctrl+Shift+O` / `Ctrl+Shift+W` |
 | Switch pane | `Tab` (cycles rightwards) |
 | New window | `Ctrl+N` |
 | New / close / cycle tab | `Ctrl+T` / `Ctrl+W` / `Ctrl+Tab`, middle-click a tab to close |
@@ -295,7 +304,7 @@ is unit-tested without a window.
 cargo test
 ```
 
-260 tests, no warnings. They cover path handling and name validation, the
+267 tests, no warnings. They cover path handling and name validation, the
 virtual list and selection model, sorting and filtering, tab and history
 behaviour, session restore, stale-load rejection, layout geometry and
 hit-testing at every pane count, undo inverses, search matching and content

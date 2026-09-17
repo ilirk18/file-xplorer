@@ -155,6 +155,7 @@ pub struct Metrics {
     pub scrollbar_w: i32,
     pub scrollbar_min_thumb: i32,
     pub min_pane_w: i32,
+    pub min_pane_h: i32,
     pub icon_size: i32,
     /// One cell of the icon view, and the icon drawn inside it. Wide enough
     /// for a readable two-line name under a thumbnail.
@@ -206,6 +207,7 @@ impl Metrics {
             scrollbar_w: s(11.0),
             scrollbar_min_thumb: s(28.0),
             min_pane_w: s(240.0),
+            min_pane_h: s(140.0),
             icon_size: s(16.0),
             icon_steps: ICON_STEPS,
             pad: s(8.0),
@@ -224,6 +226,222 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::for_dpi(96)
+    }
+}
+
+/// How the body is divided between panes.
+///
+/// A tree rather than a list of fractions, because a pane is no longer "the
+/// n-th column from the left": it is a leaf, and where it sits is what the tree
+/// above it says. `PaneId` keeps meaning what it always meant — an index into
+/// the caller's pane array — so tabs, sessions and settings are untouched.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Node {
+    Leaf(PaneId),
+    Split {
+        /// True when the dividing line is vertical, i.e. the children sit side
+        /// by side. False stacks them.
+        vertical: bool,
+        /// Where the line falls across this node, 0..1.
+        ratio: f32,
+        a: Box<Node>,
+        b: Box<Node>,
+    },
+}
+
+/// One dividing line, and which way it runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Divider {
+    pub rect: Rect,
+    pub vertical: bool,
+}
+
+impl Node {
+    /// `n` panes side by side in even columns: what every layout was before
+    /// there were trees, and what Ctrl+1..4 still builds.
+    pub fn columns(n: usize) -> Node {
+        let n = n.clamp(1, MAX_PANES);
+        let mut node = Node::Leaf(PaneId(n - 1));
+        // Built from the right so the ratios come out even: the first split
+        // gives away 1/n, the next 1/(n-1) of what is left, and so on.
+        for i in (0..n - 1).rev() {
+            let remaining = (n - i) as f32;
+            node = Node::Split {
+                vertical: true,
+                ratio: 1.0 / remaining,
+                a: Box::new(Node::Leaf(PaneId(i))),
+                b: Box::new(node),
+            };
+        }
+        node
+    }
+
+    /// Every pane in the tree, left to right and top to bottom. The order Tab
+    /// cycles in, and the order the caller's `visible()` reports.
+    pub fn leaves(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves(&self, out: &mut Vec<PaneId>) {
+        match self {
+            Node::Leaf(id) => out.push(*id),
+            Node::Split { a, b, .. } => {
+                a.collect_leaves(out);
+                b.collect_leaves(out);
+            }
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.leaves().len()
+    }
+
+    /// Ids not used by any leaf, so a new pane can take one without colliding.
+    pub fn unused(&self) -> Vec<PaneId> {
+        let used = self.leaves();
+        (0..MAX_PANES)
+            .map(PaneId)
+            .filter(|p| !used.contains(p))
+            .collect()
+    }
+
+    /// Replace the leaf for `id` with a split holding it and `with`.
+    /// `vertical` puts the new pane to the right, otherwise underneath.
+    pub fn split(&mut self, id: PaneId, with: PaneId, vertical: bool) -> bool {
+        match self {
+            Node::Leaf(mine) if *mine == id => {
+                *self = Node::Split {
+                    vertical,
+                    ratio: 0.5,
+                    a: Box::new(Node::Leaf(id)),
+                    b: Box::new(Node::Leaf(with)),
+                };
+                true
+            }
+            Node::Leaf(_) => false,
+            Node::Split { a, b, .. } => a.split(id, with, vertical) || b.split(id, with, vertical),
+        }
+    }
+
+    /// Drop a pane, collapsing the split that held it. The last pane cannot go.
+    pub fn close(&mut self, id: PaneId) -> bool {
+        if self.count() < 2 {
+            return false;
+        }
+        self.close_inner(id)
+    }
+
+    fn close_inner(&mut self, id: PaneId) -> bool {
+        let replacement = match self {
+            Node::Leaf(_) => return false,
+            Node::Split { a, b, .. } => match (a.as_ref(), b.as_ref()) {
+                (Node::Leaf(x), _) if *x == id => (**b).clone(),
+                (_, Node::Leaf(y)) if *y == id => (**a).clone(),
+                _ => {
+                    return a.close_inner(id) || b.close_inner(id);
+                }
+            },
+        };
+        *self = replacement;
+        true
+    }
+
+    /// Set the ratio of the `index`-th split, in the order `place` produces
+    /// dividers. Keeping dividers addressed by position is what lets the drag
+    /// handler stay as it was.
+    pub fn set_ratio(&mut self, index: usize, ratio: f32) {
+        let mut seen = 0;
+        self.set_ratio_inner(index, ratio, &mut seen);
+    }
+
+    fn set_ratio_inner(&mut self, index: usize, ratio: f32, seen: &mut usize) {
+        if let Node::Split { a, b, ratio: r, .. } = self {
+            // Depth-first, own split before children, matching `place`.
+            if *seen == index {
+                *r = ratio.clamp(0.0, 1.0);
+                *seen += 1;
+                return;
+            }
+            *seen += 1;
+            a.set_ratio_inner(index, ratio, seen);
+            b.set_ratio_inner(index, ratio, seen);
+        }
+    }
+
+    /// Lay the tree out in `rect`, producing one rectangle per pane and one per
+    /// divider.
+    ///
+    /// Minimum sizes are enforced here rather than by clamping the ratios
+    /// beforehand: a ratio is a fraction of whatever space its node actually
+    /// got, and only placement knows what that was.
+    pub fn place(&self, rect: Rect, m: Metrics) -> (Vec<(PaneId, Rect)>, Vec<Divider>) {
+        let mut panes = Vec::new();
+        let mut dividers = Vec::new();
+        place_into(self, rect, m, &mut panes, &mut dividers);
+        (panes, dividers)
+    }
+}
+
+fn place_into(
+    node: &Node,
+    rect: Rect,
+    m: Metrics,
+    panes: &mut Vec<(PaneId, Rect)>,
+    dividers: &mut Vec<Divider>,
+) {
+    match node {
+        Node::Leaf(id) => panes.push((*id, rect)),
+        Node::Split {
+            vertical,
+            ratio,
+            a,
+            b,
+        } => {
+            let (span, min) = if *vertical {
+                (rect.w, m.min_pane_w)
+            } else {
+                (rect.h, m.min_pane_h)
+            };
+            if span < min * 2 + m.divider_w {
+                // No room to divide: the first child takes it all. Better than
+                // two panes too narrow to use.
+                place_into(a, rect, m, panes, dividers);
+                return;
+            }
+            let at = ((span - m.divider_w) as f32 * ratio).round() as i32;
+            let at = at.clamp(min, span - min - m.divider_w);
+            let (first, divider, second) = if *vertical {
+                (
+                    Rect::new(rect.x, rect.y, at, rect.h),
+                    Rect::new(rect.x + at, rect.y, m.divider_w, rect.h),
+                    Rect::new(
+                        rect.x + at + m.divider_w,
+                        rect.y,
+                        rect.w - at - m.divider_w,
+                        rect.h,
+                    ),
+                )
+            } else {
+                (
+                    Rect::new(rect.x, rect.y, rect.w, at),
+                    Rect::new(rect.x, rect.y + at, rect.w, m.divider_w),
+                    Rect::new(
+                        rect.x,
+                        rect.y + at + m.divider_w,
+                        rect.w,
+                        rect.h - at - m.divider_w,
+                    ),
+                )
+            };
+            dividers.push(Divider {
+                rect: divider,
+                vertical: *vertical,
+            });
+            place_into(a, first, m, panes, dividers);
+            place_into(b, second, m, panes, dividers);
+        }
     }
 }
 
@@ -479,7 +697,6 @@ impl PaneLayout {
 #[derive(Clone, Debug, Default)]
 pub struct Layout {
     pub metrics: Metrics,
-    pub client: Rect,
     pub sidebar: Rect,
     pub sidebar_rows: Vec<SidebarRow>,
     /// The inspector panel, or empty when it is hidden. Mirrors the sidebar:
@@ -491,9 +708,11 @@ pub struct Layout {
     /// One rectangle per item the caller passed, in the same order. An item
     /// that did not fit gets an empty one and is neither drawn nor clickable.
     pub bar_items: Vec<Rect>,
+    /// Indexed by `PaneId`, always `MAX_PANES` long. A pane not in the tree
+              /// gets an empty layout, which draws nothing and hit-tests to nothing.
     pub panes: Vec<PaneLayout>,
-    /// One fewer than `panes`. Empty when a single pane fills the window.
-    pub dividers: Vec<Rect>,
+    /// One fewer than there are panes. Empty when one pane fills the window.
+    pub dividers: Vec<Divider>,
     /// Returned for a pane id that is not on screen. Every rect in it is empty,
     /// so drawing it paints nothing and hit-testing it matches nothing — which
     /// is why no caller needs a "is this pane visible" branch.
@@ -605,7 +824,7 @@ impl Layout {
     pub fn compute(
         client: Rect,
         metrics: Metrics,
-        splits: &[f32],
+        tree: &Node,
         sidebar_visible: bool,
         sidebar_entries: &[SidebarEntry],
         // How far the sidebar is scrolled, in pixels.
@@ -638,21 +857,27 @@ impl Layout {
         };
 
         let sidebar_rows = sidebar_rows(sidebar, m, sidebar_entries, sidebar_scroll);
-        let (bounds, dividers) = split_body(body, m, splits, panes.len());
+        let (placed, dividers) = tree.place(body, m);
 
         Layout {
             metrics: m,
-            client,
             sidebar,
             sidebar_rows,
             inspector,
             bar,
             bar_items: bar_rects,
-            panes: bounds
-                .iter()
-                .zip(panes)
-                .map(|(b, input)| pane_layout(*b, m, input, measurer))
-                .collect(),
+            // Indexed by id, not by position: with a tree the two are no
+            // longer the same thing. The caller's inputs arrive in leaf order,
+            // which is the order `place` produced them in.
+            panes: {
+                let mut out = vec![PaneLayout::default(); MAX_PANES];
+                for ((id, rect), input) in placed.iter().zip(panes) {
+                    if let Some(slot) = out.get_mut(id.0) {
+                        *slot = pane_layout(*rect, m, input, measurer);
+                    }
+                }
+                out
+            },
             dividers,
             fallback: PaneLayout::default(),
         }
@@ -661,57 +886,47 @@ impl Layout {
     /// Clamp proposed divider fractions so every pane keeps a usable width.
     /// A count that does not match the fractions, or a window too narrow to
     /// honour the minimums, falls back to equal shares.
-    pub fn clamp_splits(
-        client: Rect,
-        m: Metrics,
-        sidebar_visible: bool,
-        inspector_visible: bool,
-        count: usize,
-        splits: &[f32],
-    ) -> Vec<f32> {
-        if count < 2 {
-            return Vec::new();
-        }
-        let even = || (1..count).map(|i| i as f32 / count as f32).collect::<Vec<f32>>();
-        let body_x = client.x + if sidebar_visible { m.sidebar_w } else { 0 };
-        let body_w =
-            client.right() - body_x - if inspector_visible { m.inspector_w } else { 0 };
-        let needed = m.min_pane_w * count as i32 + m.divider_w * (count as i32 - 1);
-        if splits.len() != count - 1 || body_w < needed {
-            return even();
-        }
-
-        let mut px: Vec<i32> = splits
-            .iter()
-            .map(|f| (f * body_w as f32).round() as i32)
-            .collect();
-        // Left to right pushes each divider past its predecessor's minimum,
-        // then right to left does the same from the far edge. Both passes are
-        // needed: one alone can only protect one end.
-        for i in 0..px.len() {
-            let low = if i == 0 {
-                m.min_pane_w
-            } else {
-                px[i - 1] + m.divider_w + m.min_pane_w
-            };
-            px[i] = px[i].max(low);
-        }
-        for i in (0..px.len()).rev() {
-            let high = if i + 1 == px.len() {
-                body_w - m.min_pane_w - m.divider_w
-            } else {
-                px[i + 1] - m.divider_w - m.min_pane_w
-            };
-            px[i] = px[i].min(high);
-        }
-        px.iter().map(|p| *p as f32 / body_w as f32).collect()
-    }
 
     /// The fraction that puts divider `index` at client x `x`.
-    pub fn split_fraction_at(&self, x: i32) -> f32 {
-        let body_x = self.sidebar.right().max(self.client.x);
-        let body_w = (self.client.right() - body_x).max(1);
-        ((x - body_x) as f32 / body_w as f32).clamp(0.0, 1.0)
+    /// Where a divider dragged to (`x`, `y`) falls within the space its own
+    /// split node owns, as a fraction.
+    ///
+    /// The node's space is the two panes either side of it plus the divider,
+    /// which is the whole body only when there is one divider — so this asks
+    /// the rectangles rather than assuming, the way it used to.
+    pub fn split_fraction_at(&self, index: usize, x: i32, y: i32) -> f32 {
+        let Some(d) = self.dividers.get(index) else {
+            return 0.5;
+        };
+        let (lo, hi, at) = if d.vertical {
+            let (mut lo, mut hi) = (d.rect.x, d.rect.right());
+            for p in self.panes.iter().filter(|p| !p.bounds.is_empty()) {
+                let b = p.bounds;
+                let overlaps = b.y < d.rect.bottom() && b.bottom() > d.rect.y;
+                if overlaps && b.right() == d.rect.x {
+                    lo = lo.min(b.x);
+                }
+                if overlaps && b.x == d.rect.right() {
+                    hi = hi.max(b.right());
+                }
+            }
+            (lo, hi, x)
+        } else {
+            let (mut lo, mut hi) = (d.rect.y, d.rect.bottom());
+            for p in self.panes.iter().filter(|p| !p.bounds.is_empty()) {
+                let b = p.bounds;
+                let overlaps = b.x < d.rect.right() && b.right() > d.rect.x;
+                if overlaps && b.bottom() == d.rect.y {
+                    lo = lo.min(b.y);
+                }
+                if overlaps && b.y == d.rect.bottom() {
+                    hi = hi.max(b.bottom());
+                }
+            }
+            (lo, hi, y)
+        };
+        let span = (hi - lo - self.metrics.divider_w).max(1);
+        ((at - lo) as f32 / span as f32).clamp(0.0, 1.0)
     }
 
     pub fn hit_test(&self, x: i32, y: i32) -> Hit {
@@ -724,7 +939,7 @@ impl Layout {
             return Hit::Nothing;
         }
         for (i, d) in self.dividers.iter().enumerate() {
-            if d.contains(x, y) {
+            if d.rect.contains(x, y) {
                 return Hit::Divider(i);
             }
         }
@@ -763,27 +978,6 @@ impl Layout {
 }
 
 /// Carve the body into `count` pane rectangles with a divider between each.
-fn split_body(body: Rect, m: Metrics, splits: &[f32], count: usize) -> (Vec<Rect>, Vec<Rect>) {
-    if count == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    if count == 1 {
-        return (vec![body], Vec::new());
-    }
-    let mut dividers = Vec::with_capacity(count - 1);
-    for f in splits.iter().take(count - 1) {
-        let x = body.x + (f * body.w as f32).round() as i32;
-        dividers.push(Rect::new(x.clamp(body.x, body.right()), body.y, m.divider_w, body.h));
-    }
-    let mut bounds = Vec::with_capacity(count);
-    let mut left = body.x;
-    for d in &dividers {
-        bounds.push(Rect::new(left, body.y, (d.x - left).max(0), body.h));
-        left = d.right();
-    }
-    bounds.push(Rect::new(left, body.y, (body.right() - left).max(0), body.h));
-    (bounds, dividers)
-}
 
 fn hit_pane(p: &PaneLayout, pid: PaneId, x: i32, y: i32) -> Option<Hit> {
     if !p.bounds.contains(x, y) {
@@ -1328,14 +1522,22 @@ mod tests {
 
     /// `n` panes sharing the body evenly.
     fn build_n(n: usize, w: i32, h: i32, crumbs: &[String]) -> Layout {
+        build_tree(&Node::columns(n), w, h, crumbs)
+    }
+
+    fn build_tree(tree: &Node, w: i32, h: i32, crumbs: &[String]) -> Layout {
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, w, h);
         let tabs = strs(&["Foo"]);
-        let splits = Layout::clamp_splits(client, m, true, false, n, &[]);
-        let inputs: Vec<PaneInput> = (0..n)
+        let inputs: Vec<PaneInput> = (0..tree.count())
             .map(|_| input(&tabs, crumbs, 100, 0))
             .collect();
-        Layout::compute(client, m, &splits, true, &sidebar_of(2), 0, false, &[], &inputs, &FixedWidth)
+        Layout::compute(client, m, tree, true, &sidebar_of(2), 0, false, &[], &inputs, &FixedWidth)
+    }
+
+    /// Panes that are actually on screen, in tree order.
+    fn placed(l: &Layout, tree: &Node) -> Vec<Rect> {
+        tree.leaves().iter().map(|p| l.pane(*p).bounds).collect()
     }
 
     fn build(w: i32, h: i32, crumbs: &[String]) -> Layout {
@@ -1359,46 +1561,70 @@ mod tests {
     #[test]
     fn panes_do_not_overlap_and_fill_the_body() {
         for n in 1..=MAX_PANES {
-            let l = build_n(n, 1800, 800, &strs(&["C:\\", "Users"]));
-            assert_eq!(l.panes.len(), n);
+            let tree = Node::columns(n);
+            let l = build_tree(&tree, 1800, 800, &strs(&["C:\\", "Users"]));
+            let b = placed(&l, &tree);
+            assert_eq!(b.len(), n);
             assert_eq!(l.dividers.len(), n - 1);
-            assert_eq!(l.panes[0].bounds.x, l.sidebar.right(), "n={}", n);
+            assert_eq!(b[0].x, l.sidebar.right(), "n={}", n);
             for i in 0..n - 1 {
-                assert_eq!(l.panes[i].bounds.right(), l.dividers[i].x, "n={}", n);
-                assert_eq!(l.dividers[i].right(), l.panes[i + 1].bounds.x, "n={}", n);
+                assert_eq!(b[i].right(), l.dividers[i].rect.x, "n={}", n);
+                assert_eq!(l.dividers[i].rect.right(), b[i + 1].x, "n={}", n);
+                assert!(l.dividers[i].vertical, "columns divide vertically");
             }
-            assert_eq!(l.panes[n - 1].bounds.right(), l.client.right(), "n={}", n);
+            assert_eq!(b[n - 1].right(), 1800, "n={}", n);
         }
     }
 
     #[test]
     fn every_pane_keeps_its_minimum_width() {
+        // Four dividers crowded into the left edge. Placement is what enforces
+        // the minimum now — a ratio is a fraction of whatever space its node
+        // actually got, and only placement knows what that was.
         let m = Metrics::for_dpi(96);
-        let client = Rect::new(0, 0, 1800, 800);
-        // Three dividers crowded into the left edge: the clamp has to push them
-        // apart, not let two panes collapse to nothing.
-        let splits = Layout::clamp_splits(client, m, true, false, 4, &[0.01, 0.02, 0.03]);
-        let inputs: Vec<PaneInput> = (0..4).map(|_| input(&[], &[], 0, 0)).collect();
-        let l = Layout::compute(client, m, &splits, true, &[], 0, false, &[], &inputs, &FixedWidth);
-        for p in &l.panes {
-            assert!(p.bounds.w >= m.min_pane_w, "pane too narrow: {:?}", p.bounds);
+        let mut tree = Node::columns(4);
+        for i in 0..3 {
+            tree.set_ratio(i, 0.01);
+        }
+        let l = build_tree(&tree, 1800, 800, &[]);
+        for p in tree.leaves() {
+            let b = l.pane(p).bounds;
+            assert!(b.w >= m.min_pane_w, "pane too narrow: {:?}", b);
         }
     }
 
     #[test]
-    fn a_window_too_narrow_for_the_minimums_shares_evenly() {
+    fn a_window_too_narrow_to_divide_gives_the_space_to_one_pane() {
+        // Two panes that cannot both meet the minimum is not two panes.
+        // Placement stops dividing rather than producing a pair too narrow to
+        // use, which is the same answer the old even-share clamp reached by a
+        // longer route.
         let m = Metrics::for_dpi(96);
-        let client = Rect::new(0, 0, 400, 600);
-        let splits = Layout::clamp_splits(client, m, false, false, 4, &[0.9, 0.92, 0.95]);
-        assert_eq!(splits, vec![0.25, 0.5, 0.75]);
+        let tree = Node::columns(4);
+        let l = build_tree(&tree, 400, 600, &[]);
+        let on_screen: Vec<Rect> = placed(&l, &tree)
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .collect();
+        assert_eq!(on_screen.len(), 1, "no room for a second");
+        assert!(l.dividers.is_empty());
+        // It gets the whole body. Not the minimum — a window narrower than one
+        // pane's minimum cannot be made wider by refusing to draw in it.
+        assert_eq!(on_screen[0].x, l.sidebar.right());
+        assert_eq!(on_screen[0].right(), 400);
+        let _ = m;
     }
 
     #[test]
     fn a_dropped_pane_leaves_no_divider_behind() {
-        // Ctrl+1 after Ctrl+4: the count changes, the stale fractions do not.
-        let m = Metrics::for_dpi(96);
-        let client = Rect::new(0, 0, 1800, 800);
-        assert!(Layout::clamp_splits(client, m, true, false, 1, &[0.25, 0.5, 0.75]).is_empty());
+        // Ctrl+1 after Ctrl+4. The tree is rebuilt, so there is nothing stale
+        // left to leave a divider behind — which is what the fraction list
+        // could do and why it had to be cleared by hand.
+        let tree = Node::columns(1);
+        let l = build_tree(&tree, 1800, 800, &[]);
+        assert!(l.dividers.is_empty());
+        assert_eq!(l.pane(PaneId(0)).bounds.right(), 1800);
+        assert!(l.pane(PaneId(1)).bounds.is_empty(), "pane 1 is not in the tree");
     }
 
     #[test]
@@ -1410,7 +1636,7 @@ mod tests {
         let l = Layout::compute(
             client,
             m,
-            &[],
+            &Node::columns(1),
             true,
             &sidebar_of(2),
             0,
@@ -1443,23 +1669,28 @@ mod tests {
     }
 
     #[test]
-    fn clamp_split_keeps_both_panes_usable() {
+    fn a_divider_dragged_past_the_end_stops_at_the_minimum() {
+        // Ratios are not clamped when they are set — they are a fraction of
+        // whatever space the node actually got, and only placement knows what
+        // that was. So placement is what keeps both sides usable.
         let m = Metrics::for_dpi(96);
-        let client = Rect::new(0, 0, 1000, 600);
-        let low = Layout::clamp_splits(client, m, false, false, 2, &[-5.0]);
-        let high = Layout::clamp_splits(client, m, false, false, 2, &[5.0]);
-        assert_eq!((low[0] * 1000.0).round() as i32, m.min_pane_w);
-        assert_eq!(
-            (high[0] * 1000.0).round() as i32,
-            1000 - m.min_pane_w - m.divider_w
-        );
-    }
-
-    #[test]
-    fn clamp_split_centres_when_the_window_is_too_narrow() {
-        let m = Metrics::for_dpi(96);
-        let client = Rect::new(0, 0, 200, 600);
-        assert_eq!(Layout::clamp_splits(client, m, false, false, 2, &[0.05]), vec![0.5]);
+        for (ratio, expect_left) in [(-5.0, true), (5.0, false)] {
+            let mut tree = Node::columns(2);
+            tree.set_ratio(0, ratio);
+            let l = build_tree(&tree, 1000, 600, &[]);
+            let a = l.pane(PaneId(0)).bounds;
+            let b = l.pane(PaneId(1)).bounds;
+            assert!(a.w >= m.min_pane_w, "left pane {:?}", a);
+            assert!(b.w >= m.min_pane_w, "right pane {:?}", b);
+            assert_eq!(a.right() + m.divider_w, b.x, "and they still meet");
+            // Dragged hard left it is the left pane that sits at the minimum,
+            // and hard right the other one.
+            if expect_left {
+                assert_eq!(a.w, m.min_pane_w);
+            } else {
+                assert_eq!(b.w, m.min_pane_w);
+            }
+        }
     }
 
     // -- the bug this module was written to kill ---------------------------
@@ -1560,11 +1791,11 @@ mod tests {
         let client = Rect::new(0, 0, 1400, 800);
         let tabs = strs(&["Documents", "Downloads"]);
         let crumbs = strs(&["C:\\"]);
-        let splits = Layout::clamp_splits(client, m, false, false, 2, &[]);
+        let tree = Node::columns(2);
         let l = Layout::compute(
             client,
             m,
-            &splits,
+            &tree,
             false,
             &[],
             0,
@@ -1587,11 +1818,11 @@ mod tests {
         let client = Rect::new(0, 0, 1000, 800);
         let tabs: Vec<String> = (0..12).map(|i| format!("Folder{}", i)).collect();
         let crumbs = strs(&["C:\\"]);
-        let splits = Layout::clamp_splits(client, m, false, false, 2, &[]);
+        let tree = Node::columns(2);
         let l = Layout::compute(
             client,
             m,
-            &splits,
+            &tree,
             false,
             &[],
             0,
@@ -1658,7 +1889,7 @@ mod tests {
         Layout::compute(
             client,
             m,
-            &[],
+            &Node::columns(1),
             false,
             &[],
             0,
@@ -1717,12 +1948,12 @@ mod tests {
         let client = Rect::new(0, 0, 1400, 800);
         let tabs = strs(&["Foo"]);
         let crumbs = strs(&["C:\\"]);
-        let splits = Layout::clamp_splits(client, m, false, false, 2, &[]);
+        let tree = Node::columns(2);
         let mk = |offset: u32| {
             Layout::compute(
                 client,
                 m,
-                &splits,
+                &tree,
                 false,
                 &[],
                 0,
@@ -1758,11 +1989,11 @@ mod tests {
         let client = Rect::new(0, 0, 1400, 800);
         let tabs = strs(&["Foo"]);
         let crumbs = strs(&["C:\\"]);
-        let splits = Layout::clamp_splits(client, m, false, false, 2, &[]);
+        let tree = Node::columns(2);
         let l = Layout::compute(
             client,
             m,
-            &splits,
+            &tree,
             false,
             &[],
             0,
@@ -1778,7 +2009,7 @@ mod tests {
     fn divider_hit_wins_over_the_panes() {
         let l = build_n(3, 1800, 800, &strs(&["C:\\"]));
         for (i, d) in l.dividers.iter().enumerate() {
-            assert_eq!(l.hit_test(d.x + d.w / 2, 400), Hit::Divider(i));
+            assert_eq!(l.hit_test(d.rect.x + d.rect.w / 2, 400), Hit::Divider(i));
         }
     }
 
@@ -1844,11 +2075,11 @@ mod tests {
         let crumbs = strs(&["C:\\"]);
         let entries: Vec<SidebarEntry> =
             (0..40).map(|i| SidebarEntry::Place { index: i }).collect();
-        let splits = Layout::clamp_splits(client, m, true, false, 2, &[]);
+        let tree = Node::columns(2);
         let l = Layout::compute(
             client,
             m,
-            &splits,
+            &tree,
             true,
             &entries,
             0,
@@ -1887,7 +2118,7 @@ mod tests {
         let l = Layout::compute(
             client,
             m,
-            &[0.5],
+            &Node::columns(2),
             true,
             &sidebar_of(2),
             0,
@@ -2015,7 +2246,7 @@ mod tests {
             Layout::compute(
                 client,
                 m,
-                &[],
+                &Node::columns(1),
                 true,
                 &sidebar_of(2),
                 0,
@@ -2028,32 +2259,55 @@ mod tests {
 
         let without = mk(false);
         assert!(without.inspector.is_empty());
-        assert_eq!(without.panes[0].bounds.right(), client.right());
+        assert_eq!(without.pane(PaneId(0)).bounds.right(), client.right());
 
         let with = mk(true);
         assert_eq!(with.inspector.w, m.inspector_w);
         assert_eq!(with.inspector.right(), client.right());
         assert_eq!(with.inspector.h, client.h, "full height, like the sidebar");
         // The pane stops where the inspector starts: no overlap, no gap.
-        assert_eq!(with.panes[0].bounds.right(), with.inspector.x);
+        assert_eq!(with.pane(PaneId(0)).bounds.right(), with.inspector.x);
         assert_eq!(
-            with.panes[0].bounds.w,
-            without.panes[0].bounds.w - m.inspector_w
+            with.pane(PaneId(0)).bounds.w,
+            without.pane(PaneId(0)).bounds.w - m.inspector_w
         );
     }
 
     #[test]
-    fn splits_are_clamped_against_the_body_the_inspector_leaves() {
+    fn the_inspector_takes_its_width_out_of_the_panes_not_the_minimums() {
         let m = Metrics::for_dpi(96);
-        // Narrow enough that four panes plus an inspector cannot fit, but
-        // four panes alone can: the clamp has to notice the difference.
-        let client = Rect::new(0, 0, m.min_pane_w * 4 + m.divider_w * 3 + m.inspector_w + 20, 800);
-        let even = Layout::clamp_splits(client, m, false, false, 4, &[0.1, 0.2, 0.3]);
-        let squeezed = Layout::clamp_splits(client, m, false, true, 4, &[0.1, 0.2, 0.3]);
-        assert_ne!(
-            even, squeezed,
-            "the same splits cannot mean the same pixels in a narrower body"
-        );
+        // Wide enough for four panes, but not for four plus an inspector.
+        let needed = m.min_pane_w * 4 + m.divider_w * 3;
+        // Half an inspector of slack: enough for four panes on its own, and
+        // short of it once the inspector takes its width.
+        let client = Rect::new(0, 0, needed + m.inspector_w / 2, 800);
+        let tabs = strs(&["Foo"]);
+        let tree = Node::columns(4);
+        let inputs: Vec<PaneInput> = (0..4).map(|_| input(&tabs, &[], 10, 0)).collect();
+        let mk = |inspector: bool| {
+            Layout::compute(client, m, &tree, false, &[], 0, inspector, &[], &inputs, &FixedWidth)
+        };
+
+        let roomy = mk(false);
+        assert_eq!(tree.leaves().len(), 4);
+        for p in tree.leaves() {
+            assert!(!roomy.pane(p).bounds.is_empty(), "all four fit without it");
+        }
+
+        // With the inspector there is no longer room for four that each meet
+        // the minimum, so placement stops dividing rather than producing panes
+        // too narrow to use.
+        let squeezed = mk(true);
+        let shown = tree
+            .leaves()
+            .iter()
+            .filter(|p| !squeezed.pane(**p).bounds.is_empty())
+            .count();
+        assert!(shown < 4, "something had to give");
+        for p in tree.leaves() {
+            let b = squeezed.pane(p).bounds;
+            assert!(b.is_empty() || b.w >= m.min_pane_w, "{:?}", b);
+        }
     }
 
     fn grid_pane(w: i32) -> Layout {
@@ -2066,7 +2320,7 @@ mod tests {
         Layout::compute(
             Rect::new(0, 0, w, 800),
             Metrics::for_dpi(96),
-            &[],
+            &Node::columns(1),
             false,
             &[],
             0,
@@ -2205,7 +2459,7 @@ mod tests {
             Layout::compute(
                 client,
                 m,
-                &[],
+                &Node::columns(1),
                 true,
                 &sidebar_of(2),
                 0,
@@ -2263,6 +2517,99 @@ mod tests {
         assert!(drawn.len() < items.len(), "some had to go");
         for pair in drawn.windows(2) {
             assert!(pair[0].right() <= pair[1].x, "and none of them overlap");
+        }
+    }
+
+    #[test]
+    fn the_overflow_button_is_still_there_when_nothing_else_fits() {
+        // It is right-anchored precisely so that placement reserves it first.
+        // An overflow button that could itself overflow would hide the very
+        // buttons it exists to reach.
+        let m = Metrics::for_dpi(96);
+        let mut items: Vec<BarItemInput> = (0..12)
+            .map(|_| BarItemInput { label: "", menu: false, right: false })
+            .collect();
+        items.push(BarItemInput { label: "", menu: false, right: true });
+        let overflow = items.len() - 1;
+
+        let r = bar_rects(Rect::new(0, 0, 120, m.bar_h), m, &items, &FixedWidth);
+        assert!(!r[overflow].is_empty(), "the way out has to be drawn");
+        assert!(
+            r.iter().take(overflow).any(|r| r.is_empty()),
+            "and there is something behind it"
+        );
+        for left in r.iter().take(overflow).filter(|r| !r.is_empty()) {
+            assert!(left.right() <= r[overflow].x, "no overlap with it either");
+        }
+    }
+
+    #[test]
+    fn splitting_a_leaf_keeps_everything_else_where_it_was() {
+        let mut tree = Node::columns(2);
+        assert!(tree.split(PaneId(1), PaneId(2), false));
+        assert_eq!(tree.leaves(), vec![PaneId(0), PaneId(1), PaneId(2)]);
+
+        // The new pane is stacked under the one that was split, and the first
+        // column is untouched: that is the whole point of a tree.
+        let l = build_tree(&tree, 1800, 800, &[]);
+        let a = l.pane(PaneId(0)).bounds;
+        let b = l.pane(PaneId(1)).bounds;
+        let c = l.pane(PaneId(2)).bounds;
+        assert_eq!(a.h, 800, "the untouched column is still full height");
+        assert_eq!(b.x, c.x, "the split pair share a column");
+        assert_eq!(b.w, c.w);
+        assert!(b.bottom() < c.y, "and one sits above the other");
+        assert_eq!(l.dividers.len(), 2);
+        assert!(l.dividers[0].vertical);
+        assert!(!l.dividers[1].vertical, "the new one divides horizontally");
+    }
+
+    #[test]
+    fn closing_a_pane_collapses_the_split_that_held_it() {
+        let mut tree = Node::columns(3);
+        assert!(tree.close(PaneId(1)));
+        assert_eq!(tree.leaves(), vec![PaneId(0), PaneId(2)]);
+        // The survivor takes the whole of what the pair had, rather than
+        // leaving a gap where its sibling was.
+        let l = build_tree(&tree, 1800, 800, &[]);
+        assert_eq!(l.dividers.len(), 1);
+        assert_eq!(
+            l.pane(PaneId(2)).bounds.right(),
+            1800,
+            "no gap left behind"
+        );
+
+        // The last pane cannot be closed: a window with no panes is not a view.
+        let mut one = Node::columns(1);
+        assert!(!one.close(PaneId(0)));
+        assert_eq!(one.count(), 1);
+    }
+
+    #[test]
+    fn a_new_pane_takes_an_id_nobody_is_using() {
+        let mut tree = Node::columns(2);
+        assert_eq!(tree.unused(), vec![PaneId(2), PaneId(3)]);
+        tree.split(PaneId(0), PaneId(2), true);
+        assert_eq!(tree.unused(), vec![PaneId(3)]);
+        tree.split(PaneId(3), PaneId(1), true);
+        assert!(tree.unused().contains(&PaneId(3)), "no such leaf, no split");
+    }
+
+    #[test]
+    fn set_ratio_addresses_dividers_in_the_order_they_are_drawn() {
+        // The drag handler knows a divider by its index in `dividers`, so the
+        // same index has to reach the same split node.
+        let mut tree = Node::columns(2);
+        tree.split(PaneId(1), PaneId(2), false);
+        for (i, ratio) in [(0usize, 0.25f32), (1, 0.75)] {
+            let mut t = tree.clone();
+            t.set_ratio(i, ratio);
+            let l = build_tree(&t, 1800, 800, &[]);
+            let before = build_tree(&tree, 1800, 800, &[]);
+            let moved: Vec<bool> = (0..l.dividers.len())
+                .map(|d| l.dividers[d].rect != before.dividers[d].rect)
+                .collect();
+            assert!(moved[i], "divider {} should have moved", i);
         }
     }
 }

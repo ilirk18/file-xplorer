@@ -29,8 +29,10 @@ pub const MAX_RECENT: usize = 20;
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Config {
-    /// Panes on screen, 1..=MAX_PANES.
-    pub pane_count: usize,
+    /// The pane tree, as text. Empty means "one pane", and the older
+    /// `pane_count`/`splits` pair is still read so a settings file from before
+    /// trees opens the way it was left.
+    pub layout: String,
     pub theme_dark: bool,
     pub sidebar_visible: bool,
     pub inspector: bool,
@@ -61,6 +63,10 @@ pub struct Config {
 
     /// Folders pinned into the sidebar's Places, in the order they were added.
     pub pins: Vec<String>,
+    /// Shell context-menu verbs hoisted to the top of the menu, by the text
+    /// the menu showed. Matching on text is approximate once the machine
+    /// changes language, which is honest for a convenience feature.
+    pub pin_actions: Vec<String>,
     /// Shortcuts that differ from the defaults, as (chord text, command
     /// label). An empty chord means the command has had its shortcut removed.
     pub binds: Vec<(String, String)>,
@@ -81,7 +87,7 @@ pub const UNSET: i32 = i32::MIN;
 impl Default for Config {
     fn default() -> Self {
         Self {
-            pane_count: 1,
+            layout: String::new(),
             // No saved preference means "whatever Windows is set to". Once the
             // user toggles the theme the key is written and wins from then on.
             theme_dark: crate::theme::system_dark(),
@@ -101,6 +107,7 @@ impl Default for Config {
             tabs: vec![Vec::new(); MAX_PANES],
             active_tab: vec![0; MAX_PANES],
             pins: Vec::new(),
+            pin_actions: Vec::new(),
             recent: Vec::new(),
             binds: Vec::new(),
             sort: vec![(0, true); MAX_PANES],
@@ -174,7 +181,7 @@ impl Config {
     pub fn to_text(&self) -> String {
         format!(
             "# File Xplorer settings\n\
-             pane_count={}\n\
+             layout={}\n\
              theme_dark={}\n\
              sidebar_visible={}\n\
              inspector={}\n\
@@ -190,7 +197,7 @@ impl Config {
              sync_scroll={}\n\
              compare={}\n\
              col_widths={},{},{}\n{}",
-            self.pane_count,
+            self.layout,
             self.theme_dark,
             self.sidebar_visible,
             self.inspector,
@@ -220,6 +227,9 @@ impl Config {
         let mut out = String::new();
         for p in &self.pins {
             out.push_str(&format!("pin={}\n", p));
+        }
+        for a in &self.pin_actions {
+            out.push_str(&format!("pinaction={}\n", a));
         }
         for (chord, label) in &self.binds {
             out.push_str(&format!("bind={}={}
@@ -263,11 +273,21 @@ impl Config {
             // A bad value keeps the default; an unknown key is ignored, so an
             // older build can read a newer file.
             match key.trim() {
-                "pane_count" => c.pane_count = value.parse().unwrap_or(c.pane_count),
+                "layout" => c.layout = value.to_string(),
+                // Before there were trees. A count and a list of fractions
+                // describe a row of columns, which is one shape of tree.
+                "pane_count" => {
+                    // Only a number this file actually contains becomes a
+                    // layout: a garbled line leaves the default alone rather
+                    // than quietly writing one pane over it.
+                    if let (true, Ok(n)) = (c.layout.is_empty(), value.parse::<usize>()) {
+                        c.layout = tree_to_text(&crate::layout::Node::columns(n));
+                    }
+                }
                 // Files written before multi-pane only knew one flag.
                 "dual" => {
-                    if value.parse().unwrap_or(false) {
-                        c.pane_count = 2;
+                    if value.parse().unwrap_or(false) && c.layout.is_empty() {
+                        c.layout = tree_to_text(&crate::layout::Node::columns(2));
                     }
                 }
                 "theme_dark" => c.theme_dark = value.parse().unwrap_or(c.theme_dark),
@@ -297,6 +317,11 @@ impl Config {
                 "pin" => {
                     if !value.is_empty() {
                         c.pins.push(value.to_string());
+                    }
+                }
+                "pinaction" => {
+                    if !value.is_empty() {
+                        c.pin_actions.push(value.to_string());
                     }
                 }
                 "bind" => {
@@ -336,6 +361,94 @@ impl Config {
     }
 }
 
+/// Write a pane tree as text.
+///
+/// `V(0,0.5,1)` is two panes side by side; `H` stacks them. Readable and
+/// editable, which is what the settings file has always promised, and small
+/// enough that a saved layout is just another one of these.
+pub fn tree_to_text(node: &crate::layout::Node) -> String {
+    use crate::layout::Node;
+    match node {
+        Node::Leaf(id) => id.0.to_string(),
+        Node::Split {
+            vertical,
+            ratio,
+            a,
+            b,
+        } => format!(
+            "{}({},{:.3},{})",
+            if *vertical { "V" } else { "H" },
+            tree_to_text(a),
+            ratio,
+            tree_to_text(b)
+        ),
+    }
+}
+
+/// Read one back. Anything malformed is one pane, because a settings file
+/// nobody can parse should still start the app.
+pub fn tree_from_text(text: &str) -> Option<crate::layout::Node> {
+    let (node, rest) = parse_node(text.trim())?;
+    rest.trim().is_empty().then_some(node)
+}
+
+fn parse_node(text: &str) -> Option<(crate::layout::Node, &str)> {
+    use crate::layout::{Node, MAX_PANES};
+    let text = text.trim_start();
+    let vertical = match text.as_bytes().first()? {
+        b'V' => true,
+        b'H' => false,
+        _ => {
+            // A leaf: digits up to the next comma or bracket.
+            let end = text
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(text.len());
+            let id: usize = text[..end].parse().ok()?;
+            if id >= MAX_PANES {
+                return None;
+            }
+            return Some((Node::Leaf(crate::layout::PaneId(id)), &text[end..]));
+        }
+    };
+    let rest = text.get(1..)?.strip_prefix('(')?;
+    let (a, rest) = parse_node(rest)?;
+    let rest = rest.trim_start().strip_prefix(',')?;
+    let split = rest.find(',')?;
+    let ratio: f32 = rest[..split].trim().parse().ok()?;
+    let (b, rest) = parse_node(&rest[split + 1..])?;
+    let rest = rest.trim_start().strip_prefix(')')?;
+    Some((
+        Node::Split {
+            vertical,
+            ratio: ratio.clamp(0.0, 1.0),
+            a: Box::new(a),
+            b: Box::new(b),
+        },
+        rest,
+    ))
+}
+
+impl Config {
+    /// The saved tree, or one pane. A tree naming the same pane twice is
+    /// refused: two leaves sharing an id would be two views of one pane's
+    /// tabs, and every operation on it would fight itself.
+    pub fn tree(&self) -> crate::layout::Node {
+        let fallback = || crate::layout::Node::columns(1);
+        let Some(node) = tree_from_text(&self.layout) else {
+            return fallback();
+        };
+        let leaves = node.leaves();
+        let mut seen: Vec<crate::layout::PaneId> = Vec::new();
+        for id in &leaves {
+            if seen.contains(id) {
+                return fallback();
+            }
+            seen.push(*id);
+        }
+        node
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,9 +474,60 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_tree_round_trips_through_text() {
+        use crate::layout::Node;
+        for n in 1..=crate::layout::MAX_PANES {
+            let text = tree_to_text(&Node::columns(n));
+            let back = tree_from_text(&text).expect("parses");
+            // Through the text, not through the ratios: three decimals cannot
+            // hold a third exactly, and the file is the thing that has to be
+            // stable, not the float.
+            assert_eq!(tree_to_text(&back), text);
+            assert_eq!(back.count(), n);
+            assert_eq!(back.leaves(), Node::columns(n).leaves());
+        }
+        // Nesting and orientation survive too.
+        let nested = tree_from_text("V(0,0.5,H(1,0.25,2))").expect("parses");
+        assert_eq!(tree_to_text(&nested), "V(0,0.500,H(1,0.250,2))");
+        assert_eq!(nested.count(), 3);
+    }
+
+    #[test]
+    fn a_layout_nobody_can_parse_is_one_pane() {
+        for bad in ["", "V(", "V(0,0.5)", "X(0,1)", "V(0,0.5,9)", "0)", "V(0,x,1)"] {
+            assert!(tree_from_text(bad).is_none(), "{:?} should not parse", bad);
+        }
+        let cfg = Config {
+            layout: "nonsense".into(),
+            ..Config::default()
+        };
+        assert_eq!(cfg.tree().count(), 1);
+    }
+
+    #[test]
+    fn a_tree_naming_one_pane_twice_is_refused() {
+        // Two leaves with the same id would be two views of one pane's tabs,
+        // and every operation on it would fight itself.
+        let cfg = Config {
+            layout: "V(1,0.5,1)".into(),
+            ..Config::default()
+        };
+        assert_eq!(cfg.tree().count(), 1);
+    }
+
+    #[test]
+    fn an_old_settings_file_still_opens_the_way_it_was_left() {
+        let c = Config::from_text("pane_count=3\n");
+        assert_eq!(c.tree().count(), 3, "three columns, as it always was");
+        // An explicit layout wins over the old key whichever order they appear.
+        let c = Config::from_text("layout=V(0,0.5,1)\npane_count=4\n");
+        assert_eq!(c.tree().count(), 2);
+    }
+
+    #[test]
     fn round_trips() {
         let c = Config {
-            pane_count: 3,
+            layout: "V(0,0.5,V(1,0.5,2))".to_string(),
             theme_dark: false,
             sidebar_visible: false,
             inspector: true,
@@ -386,6 +550,8 @@ mod tests {
             ],
             active_tab: vec![1, 0, 0, 0],
             pins: vec!["C:\\pinned".into()],
+            // A label with a space and an ampersand: menu text has both.
+            pin_actions: vec!["Open with".into(), "Scan && clean".into()],
             recent: vec![r"C:\Users".into(), r"D:\work".into()],
             binds: vec![
                 ("Ctrl+Q".into(), "Refresh".into()),
@@ -421,7 +587,7 @@ mod tests {
     fn unknown_keys_are_ignored() {
         // An older build must survive a file written by a newer one.
         let c = Config::from_text("pane_count=2\nfuture_option=42\n");
-        assert_eq!(c.pane_count, 2);
+        assert_eq!(c.tree().count(), 2);
     }
 
     #[test]
@@ -433,8 +599,8 @@ mod tests {
 
     #[test]
     fn the_old_dual_flag_still_opens_two_panes() {
-        assert_eq!(Config::from_text("dual=true\n").pane_count, 2);
-        assert_eq!(Config::from_text("dual=false\n").pane_count, 1);
+        assert_eq!(Config::from_text("dual=true\n").tree().count(), 2);
+        assert_eq!(Config::from_text("dual=false\n").tree().count(), 1);
     }
 
     #[test]
@@ -468,7 +634,7 @@ mod tests {
     #[test]
     fn a_byte_order_mark_does_not_eat_the_first_setting() {
         let c = Config::from_text("\u{feff}pane_count=3\n");
-        assert_eq!(c.pane_count, 3);
+        assert_eq!(c.tree().count(), 3);
     }
 
     #[test]

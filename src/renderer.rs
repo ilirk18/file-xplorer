@@ -60,6 +60,7 @@ pub mod glyph {
     pub const VIEW: &str = "\u{E890}";
     pub const MORE: &str = "\u{E712}";
     pub const PANE: &str = "\u{E8A0}";
+    pub const SHARE: &str = "\u{E72D}";
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -1031,13 +1032,20 @@ impl Renderer {
     pub fn draw_dividers(&mut self, layout: &Layout, active: Option<(usize, bool)>) {
         let p = self.palette();
         for (i, d) in layout.dividers.clone().iter().enumerate() {
-            self.fill(*d, p.window_bg);
+            let r = d.rect;
+            self.fill(r, p.window_bg);
             let c = match active {
                 Some((n, true)) if n == i => p.accent,
                 Some((n, false)) if n == i => p.scrollbar_thumb_hover,
                 _ => p.divider,
             };
-            let mid = Rect::new(d.x + d.w / 2, d.y, 1.max(d.w / 6), d.h);
+            // A hairline down the middle of the grab strip, along whichever
+            // way the divider runs.
+            let mid = if d.vertical {
+                Rect::new(r.x + r.w / 2, r.y, 1.max(r.w / 6), r.h)
+            } else {
+                Rect::new(r.x, r.y + r.h / 2, r.w, 1.max(r.h / 6))
+            };
             self.fill(mid, c);
         }
     }
