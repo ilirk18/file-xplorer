@@ -29,14 +29,37 @@ const MAX_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
 pub struct Query {
     /// Name pattern, `*` allowed. Empty matches every name.
     pub name: String,
+    /// Extensions to keep, lowercased and without the dot. Empty keeps every
+    /// file. A non-empty list also drops folders, which have no extension.
+    pub exts: Vec<String>,
     /// Text that must appear inside the file. None searches names only.
     pub content: Option<String>,
 }
 
+/// Pull `ext:` tokens out of a query, so `ext:rs,toml render` reads as "render,
+/// in Rust and TOML files". Everything else stays in the name pattern.
+fn split_ext_filter(query: &str) -> (String, Vec<String>) {
+    let mut exts = Vec::new();
+    let mut rest = Vec::new();
+    for word in query.split_whitespace() {
+        match word.strip_prefix("ext:") {
+            Some(list) => exts.extend(
+                list.split(',')
+                    .map(|e| e.trim_start_matches('.').to_lowercase())
+                    .filter(|e| !e.is_empty()),
+            ),
+            None => rest.push(word),
+        }
+    }
+    (rest.join(" "), exts)
+}
+
 impl Query {
     pub fn by_name(pattern: &str) -> Query {
+        let (name, exts) = split_ext_filter(pattern);
         Query {
-            name: pattern.to_string(),
+            name,
+            exts,
             content: None,
         }
     }
@@ -44,16 +67,38 @@ impl Query {
     pub fn by_content(text: &str) -> Query {
         Query {
             name: String::new(),
+            exts: Vec::new(),
             content: Some(text.to_string()),
+        }
+    }
+
+    /// True when `entry` passes the extension filter.
+    pub fn ext_ok(&self, extension: Option<&str>) -> bool {
+        if self.exts.is_empty() {
+            return true;
+        }
+        match extension {
+            Some(ext) => {
+                let ext = ext.trim_start_matches('.');
+                self.exts.iter().any(|x| x == ext)
+            }
+            None => false,
         }
     }
 
     /// What the tab calls itself.
     pub fn label(&self) -> String {
-        match (&self.content, self.name.is_empty()) {
+        let name = if self.exts.is_empty() {
+            self.name.clone()
+        } else if self.name.is_empty() {
+            format!("*.{}", self.exts.join(", *."))
+        } else {
+            format!("{} (*.{})", self.name, self.exts.join(", *."))
+        };
+        match (&self.content, name.is_empty()) {
             (Some(text), true) => format!("Containing: {}", text),
-            (Some(text), false) => format!("{} containing: {}", self.name, text),
-            (None, _) => format!("Search: {}", self.name),
+            (Some(text), false) => format!("{} containing: {}", name, text),
+            (None, _) => format!("Search: {}", name),
         }
     }
 }
@@ -66,37 +111,61 @@ impl Query {
 /// because that is what a lot of Windows text actually is, and a UTF-8 reader
 /// sees every second byte as a NUL and calls the file binary.
 pub fn file_contains(path: &str, needle: &str) -> bool {
-    use std::io::Read;
-
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Some(text) = read_text(path, MAX_CONTENT_BYTES) else {
         return false;
-    };
-    if meta.len() > MAX_CONTENT_BYTES {
-        return false;
-    }
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    if f.read_to_end(&mut bytes).is_err() {
-        return false;
-    }
-
-    let text = match bytes.get(..2) {
-        Some([0xFF, 0xFE]) => decode_utf16(&bytes[2..], true),
-        Some([0xFE, 0xFF]) => decode_utf16(&bytes[2..], false),
-        _ => {
-            if bytes.iter().take(8192).any(|b| *b == 0) {
-                return false; // binary
-            }
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
     };
     // Lowercasing the whole file allocates a second copy of it, which at 8 MiB
     // is a transient the allocator will not notice. A streaming
     // case-insensitive search would be a lot of code for a search that is
     // already dominated by disk time.
     text.to_lowercase().contains(needle)
+}
+
+/// Read up to `limit` bytes of `path` as text, or None if it is not text.
+///
+/// The BOM cases are decoded properly because a lot of Windows text is UTF-16,
+/// and a UTF-8 reader sees every second byte as a NUL and calls the file
+/// binary. Everything else is UTF-8 unless an early NUL says otherwise, which
+/// is the same heuristic every grep uses and is right far more often than any
+/// amount of content sniffing would be.
+pub fn read_text(path: &str, limit: u64) -> Option<String> {
+    use std::io::Read;
+
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > limit {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    std::fs::File::open(path).ok()?.read_to_end(&mut bytes).ok()?;
+    decode_text(&bytes)
+}
+
+/// Read at most `limit` bytes from the *front* of `path` as text.
+///
+/// Unlike `read_text` a file larger than the limit is not refused, it is
+/// truncated: a preview of the first screenful of a 2 GB log is useful, and
+/// searching it for a word is not.
+pub fn read_text_head(path: &str, limit: u64) -> Option<String> {
+    use std::io::Read;
+
+    let f = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    f.take(limit).read_to_end(&mut bytes).ok()?;
+    // A truncated UTF-16 file can end mid-unit; the decoder drops the odd byte.
+    decode_text(&bytes)
+}
+
+fn decode_text(bytes: &[u8]) -> Option<String> {
+    Some(match bytes.get(..2) {
+        Some([0xFF, 0xFE]) => decode_utf16(&bytes[2..], true),
+        Some([0xFE, 0xFF]) => decode_utf16(&bytes[2..], false),
+        _ => {
+            if bytes.iter().take(8192).any(|b| *b == 0) {
+                return None; // binary
+            }
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    })
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
@@ -129,11 +198,18 @@ impl Drop for Search {
     }
 }
 
+/// Shorter than this, a subsequence match means nothing: "rs" is a subsequence
+/// of half the names on a disk. Substring matching still applies at any length.
+const MIN_FUZZY: usize = 3;
+
 /// True when `name` matches `query`.
 ///
 /// Case-insensitive substring, with `*` treated as a gap so `*.rs` and
 /// `test*.txt` do what people expect. No full glob: `?` and character classes
 /// are not worth the parser for a name filter.
+///
+/// Without a `*`, a substring miss falls back to the palette's subsequence
+/// matcher, so "gtd" finds "get_tree_depth.rs" the same way it finds a command.
 pub fn matches(name: &str, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -142,7 +218,9 @@ pub fn matches(name: &str, query: &str) -> bool {
     let query = query.to_lowercase();
 
     if !query.contains('*') {
-        return name.contains(&query);
+        return name.contains(&query)
+            || (query.chars().count() >= MIN_FUZZY
+                && crate::palette::score(&name, &query).is_some());
     }
 
     // Anchor the ends only when the pattern does not start/end with `*`.
@@ -219,8 +297,10 @@ pub fn run<F>(
             if e.is_dir && !e.is_reparse {
                 stack.push(rel_name.clone());
             }
-            // Name first: it is free, and it narrows what has to be read.
-            let hit = matches(&e.name, &query.name)
+            // Name and extension first: both are free, and they narrow what
+            // has to be read.
+            let hit = query.ext_ok(e.extension.as_deref())
+                && matches(&e.name, &query.name)
                 && match &needle {
                     // A folder has no contents to search, so a content search
                     // never lists one.
@@ -257,6 +337,38 @@ pub fn run<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ext_filter_splits_out_of_the_query() {
+        let q = Query::by_name("ext:rs,.TOML render");
+        assert_eq!(q.name, "render");
+        assert_eq!(q.exts, vec!["rs", "toml"]);
+        assert!(q.ext_ok(Some(".rs")));
+        assert!(q.ext_ok(Some("toml")));
+        assert!(!q.ext_ok(Some(".txt")));
+        assert!(!q.ext_ok(None), "a folder has no extension to match");
+    }
+
+    #[test]
+    fn no_ext_filter_keeps_everything() {
+        let q = Query::by_name("render");
+        assert!(q.exts.is_empty());
+        assert!(q.ext_ok(None));
+        assert!(q.ext_ok(Some(".exe")));
+    }
+
+    #[test]
+    fn fuzzy_needs_three_characters() {
+        assert!(matches("get_tree_depth.rs", "gtd"));
+        assert!(!matches("get_tree_depth.rs", "gx"), "two chars stay literal");
+        assert!(matches("get_tree_depth.rs", "tree"), "substring still wins");
+    }
+
+    #[test]
+    fn glob_is_not_fuzzy() {
+        assert!(matches("main.rs", "*.rs"));
+        assert!(!matches("main.rs", "*.txt"));
+    }
 
     #[test]
     fn substring_is_case_insensitive() {
@@ -433,6 +545,7 @@ mod tests {
             Query {
                 name: "*.rs".into(),
                 content: Some("needle".into()),
+                ..Default::default()
             },
             1,
             Arc::new(AtomicBool::new(false)),
@@ -449,7 +562,8 @@ mod tests {
         assert_eq!(
             Query {
                 name: "*.rs".into(),
-                content: Some("todo".into())
+                content: Some("todo".into()),
+                ..Default::default()
             }
             .label(),
             "*.rs containing: todo"

@@ -26,6 +26,7 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::Graphics::Gdi::{HBITMAP, HPALETTE};
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
 use crate::file_list::{FileList, SortKey, SortOrder};
@@ -89,10 +90,30 @@ pub struct PaneView<'a> {
     pub can_up: bool,
     /// True when keystrokes are going to the filter box rather than the list.
     pub filter_focused: bool,
+    /// The rubber-band rectangle being dragged in this pane, already clipped
+    /// to the rows area.
+    pub band: Option<Rect>,
+    /// The row whose name is being edited in place, if it is in this pane.
+    pub renaming: Option<u32>,
+    /// Shell images for the icon view, and this pane's folder, which together
+    /// give each entry its cache key. Empty in the details view.
+    pub thumbs: Option<(&'a crate::preview::ThumbCache, &'a str)>,
     pub counts: &'a str,
     /// In compare mode, the names present in the *other* pane. Rows missing
     /// from it get a marker, which is what makes two trees diffable at a glance.
     pub other_names: Option<&'a HashSet<String>>,
+}
+
+/// Everything the renderer needs to paint the inspector.
+pub struct InspectorView<'a> {
+    /// None when nothing is under the cursor.
+    pub name: Option<&'a str>,
+    pub kind: String,
+    pub size: String,
+    pub modified: String,
+    /// The preview and the key it was built for; the key is what the converted
+    /// bitmap is cached against.
+    pub preview: Option<(&'a str, &'a crate::preview::Preview)>,
 }
 
 /// Everything the renderer needs to paint the sidebar.
@@ -117,6 +138,11 @@ struct Formats {
     caption: IDWriteTextFormat,
     icon: IDWriteTextFormat,
     centered: IDWriteTextFormat,
+    /// Centred and wrapping to two lines, for a name under an icon.
+    cell_label: IDWriteTextFormat,
+    /// Wrapping, top-aligned, no ellipsis: for the inspector's text preview,
+    /// which is many lines rather than one that must fit.
+    preview: IDWriteTextFormat,
 }
 
 pub struct Renderer {
@@ -133,6 +159,13 @@ pub struct Renderer {
     /// Shell icons converted to D2D bitmaps. Cleared whenever the render target
     /// is recreated, because the bitmaps belong to that target.
     icon_bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
+    /// The inspector shows one preview at a time, so its converted bitmap is
+    /// one slot keyed by the preview it came from rather than a cache.
+    preview_bitmap: Option<(String, ID2D1Bitmap)>,
+    /// Converted grid-cell images. Keyed like the cache they come from; the
+    /// cache is what bounds this, since a key it has evicted is never asked
+    /// for again and `prune_cells` drops what it no longer holds.
+    cell_bitmaps: HashMap<String, ID2D1Bitmap>,
     /// Memo for text measurement: layout asks for the same tab and crumb
     /// widths every frame.
     measure_cache: RefCell<HashMap<(String, bool), f32>>,
@@ -157,6 +190,8 @@ impl Renderer {
             dpi,
             icons: IconCache::new(),
             icon_bitmaps: HashMap::new(),
+            preview_bitmap: None,
+            cell_bitmaps: HashMap::new(),
             measure_cache: RefCell::new(HashMap::new()),
         })
     }
@@ -220,6 +255,24 @@ impl Renderer {
             caption: mk(&ui, 10.5, SEMI, LEADING, true)?,
             icon: mk(&mdl2, 10.0, NORMAL, CENTER, false)?,
             centered: mk(&ui, 12.5, NORMAL, CENTER, false)?,
+            cell_label: {
+                let f = mk(&ui, 11.5, NORMAL, CENTER, true)?;
+                unsafe {
+                    f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+                    f.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+                }
+                f
+            },
+            preview: {
+                let f = mk(&ui, 11.5, NORMAL, LEADING, false)?;
+                unsafe {
+                    // Every other format is one line in a row: top-aligned and
+                    // wrapping are both wrong there and both right here.
+                    f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+                    f.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+                }
+                f
+            },
         })
     }
 
@@ -273,6 +326,8 @@ impl Renderer {
         self.brush = Some(brush);
         self.target = Some(target);
         self.icon_bitmaps.clear();
+        self.preview_bitmap = None;
+        self.cell_bitmaps.clear();
         Ok(())
     }
 
@@ -281,6 +336,8 @@ impl Renderer {
         self.target = None;
         self.brush = None;
         self.icon_bitmaps.clear();
+        self.preview_bitmap = None;
+        self.cell_bitmaps.clear();
     }
 
     pub fn has_target(&self) -> bool {
@@ -291,6 +348,19 @@ impl Renderer {
 
     fn rt(&self) -> Option<&ID2D1HwndRenderTarget> {
         self.target.as_ref()
+    }
+
+    /// A hollow rectangle, drawn as four fills. D2D can stroke one, but that
+    /// wants a stroke style and half-pixel alignment to come out crisp; four
+    /// rectangles are exact at any DPI.
+    fn outline(&self, r: Rect, c: Rgb, t: i32) {
+        if r.is_empty() || t <= 0 {
+            return;
+        }
+        self.fill(Rect::new(r.x, r.y, r.w, t), c);
+        self.fill(Rect::new(r.x, r.bottom() - t, r.w, t), c);
+        self.fill(Rect::new(r.x, r.y, t, r.h), c);
+        self.fill(Rect::new(r.right() - t, r.y, t, r.h), c);
     }
 
     fn fill(&self, r: Rect, c: Rgb) {
@@ -418,6 +488,201 @@ impl Renderer {
             let bitmap = rt.CreateBitmapFromWicBitmap(&converter, None)?;
             Ok(bitmap.cast()?)
         }
+    }
+
+    /// The preview image as a D2D bitmap, converted once and kept until the
+    /// selection moves on.
+    fn preview_bitmap(&mut self, key: &str, hbm: HBITMAP) -> Option<ID2D1Bitmap> {
+        if self.preview_bitmap.as_ref().is_some_and(|(k, _)| k == key) {
+            return self.preview_bitmap.as_ref().map(|(_, b)| b.clone());
+        }
+        let bmp = self.hbitmap_to_bitmap(hbm).ok()?;
+        self.preview_bitmap = Some((key.to_string(), bmp.clone()));
+        Some(bmp)
+    }
+
+    /// A shell thumbnail is an HBITMAP, not an HICON, so it takes the other WIC
+    /// entry point. The rest of the pipeline is the icons' one.
+    fn hbitmap_to_bitmap(&self, hbm: HBITMAP) -> Result<ID2D1Bitmap> {
+        let rt = self
+            .rt()
+            .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))?;
+        unsafe {
+            let src = self.wic.CreateBitmapFromHBITMAP(
+                hbm,
+                HPALETTE::default(),
+                // Shell thumbnails carry alpha for anything with transparency;
+                // ignoring it paints black behind a PNG.
+                WICBitmapUsePremultipliedAlpha,
+            )?;
+            let converter = self.wic.CreateFormatConverter()?;
+            converter.Initialize(
+                &src,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeMedianCut,
+            )?;
+            Ok(rt.CreateBitmapFromWicBitmap(&converter, None)?.cast()?)
+        }
+    }
+
+    /// The inspector panel: what one file is, and as much of it as can be shown
+    /// without opening it.
+    pub fn draw_inspector(&mut self, layout: &Layout, v: &InspectorView) {
+        let r = layout.inspector;
+        if r.is_empty() {
+            return;
+        }
+        let p = self.palette();
+        let m = layout.metrics;
+        self.fill(r, p.sidebar_bg);
+        self.fill(Rect::new(r.x, r.y, 1.max(m.scale as i32), r.h), p.divider);
+
+        let Some(name) = v.name else {
+            self.centered_message(r, "Nothing selected");
+            return;
+        };
+
+        self.push_clip(r);
+        let inner = Rect::new(r.x + m.pad * 2, r.y + m.pad, r.w - m.pad * 3, r.h - m.pad * 2);
+        let line = m.row_h;
+
+        // Name first, then the facts, then whatever the file itself can show.
+        let mut y = inner.y;
+        self.text(
+            name,
+            Rect::new(inner.x, y, inner.w, line),
+            p.text,
+            &self.formats.small_bold.clone(),
+        );
+        y += line;
+        for fact in [&v.kind, &v.size, &v.modified] {
+            if fact.is_empty() {
+                continue;
+            }
+            self.text(
+                fact,
+                Rect::new(inner.x, y, inner.w, line),
+                p.text_muted,
+                &self.formats.tiny.clone(),
+            );
+            y += line * 3 / 4;
+        }
+        y += m.pad;
+
+        let body = Rect::new(inner.x, y, inner.w, (inner.bottom() - y).max(0));
+        if body.h <= line {
+            self.pop_clip();
+            return;
+        }
+        let faint = |r: &mut Self, msg: &str| {
+            r.text(
+                msg,
+                Rect::new(body.x, body.y, body.w, line),
+                p.text_faint,
+                &r.formats.tiny.clone(),
+            )
+        };
+        match v.preview {
+            Some((key, crate::preview::Preview::Image(hbm))) => {
+                self.draw_preview_image(key, *hbm, body)
+            }
+            Some((_, crate::preview::Preview::Text(text))) => {
+                self.text(text, body, p.text_muted, &self.formats.preview.clone())
+            }
+            Some((_, crate::preview::Preview::None)) => {
+                faint(self, "No preview for this kind of file.")
+            }
+            // Nothing has come back from the worker yet.
+            None => faint(self, "Reading\u{2026}"),
+        }
+        self.pop_clip();
+    }
+
+    /// Fit the thumbnail inside `area` without stretching it, pinned to the
+    /// top: a portrait photo and a landscape one should start at the same
+    /// place, and neither should be distorted to fill the panel.
+    fn draw_preview_image(&mut self, key: &str, hbm: HBITMAP, area: Rect) {
+        let Some(bmp) = self.preview_bitmap(key, hbm) else {
+            return;
+        };
+        let size = unsafe { bmp.GetSize() };
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return;
+        }
+        let scale = (area.w as f32 / size.width)
+            .min(area.h as f32 / size.height)
+            // Never blow a 48px thumbnail up to panel width: a smeared image
+            // reads as a broken one.
+            .min(1.0);
+        let w = (size.width * scale).round() as i32;
+        let h = (size.height * scale).round() as i32;
+        let dest = Rect::new(area.x + (area.w - w) / 2, area.y, w, h);
+        if let Some(rt) = self.rt() {
+            unsafe {
+                rt.DrawBitmap(
+                    &bmp,
+                    Some(&d2d_rect(dest)),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Draw a grid cell's shell image, or say it is not there yet.
+    ///
+    /// Returns false when there is nothing to draw, which is the caller's cue
+    /// to fall back to the small file-type icon: something in every cell from
+    /// the first frame, replaced as the real images arrive.
+    fn draw_cell_image(&mut self, key: &str, cache: &crate::preview::ThumbCache, area: Rect) -> bool {
+        if !self.cell_bitmaps.contains_key(key) {
+            let Some(hbm) = cache.get(key) else {
+                return false;
+            };
+            let Ok(bmp) = self.hbitmap_to_bitmap(hbm) else {
+                return false;
+            };
+            self.cell_bitmaps.insert(key.to_string(), bmp);
+        }
+        let Some(bmp) = self.cell_bitmaps.get(key).cloned() else {
+            return false;
+        };
+        let size = unsafe { bmp.GetSize() };
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return false;
+        }
+        // Fit inside the cell's icon box, centred, never enlarged past it.
+        let scale = (area.w as f32 / size.width).min(area.h as f32 / size.height);
+        let w = (size.width * scale).round() as i32;
+        let h = (size.height * scale).round() as i32;
+        let dest = Rect::new(
+            area.x + (area.w - w) / 2,
+            area.y + (area.h - h) / 2,
+            w,
+            h,
+        );
+        if let Some(rt) = self.rt() {
+            unsafe {
+                rt.DrawBitmap(
+                    &bmp,
+                    Some(&d2d_rect(dest)),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+            }
+        }
+        true
+    }
+
+    /// Drop converted bitmaps whose cache entry has been evicted, so this map
+    /// cannot outgrow the cache that feeds it.
+    pub fn prune_cells(&mut self, cache: &crate::preview::ThumbCache) {
+        self.cell_bitmaps.retain(|k, _| cache.has(k));
     }
 
     fn draw_icon(&mut self, key: &str, r: Rect) {
@@ -707,6 +972,9 @@ impl Renderer {
         self.draw_toolbar(m, v);
         self.draw_header(m, v);
         self.draw_rows(m, v);
+        if let Some(band) = v.band {
+            self.outline(band, p.accent, 1.max(m.scale as i32));
+        }
         self.draw_scrollbar(v);
         self.draw_footer(m, v);
 
@@ -988,14 +1256,14 @@ impl Renderer {
 
         self.push_clip(list_rect);
 
-        let row_h = m.row_h;
+        let row_h = v.layout.line_h;
+        let grid = v.layout.columns_per_line > 1;
         let (start, end) = v.list.visible_range(list_rect.h as u32);
         let cursor = v.list.cursor();
 
         // Column geometry comes from the same layout the header used, so the
         // cells line up with their titles by construction.
         let cols = v.layout.columns.clone();
-        let name_col = cols.iter().find(|c| c.key == SortKey::Name).map(|c| c.rect);
         let type_col = cols.iter().find(|c| c.key == SortKey::Type).map(|c| c.rect);
         let size_col = cols.iter().find(|c| c.key == SortKey::Size).map(|c| c.rect);
         let date_col = cols.iter().find(|c| c.key == SortKey::Date).map(|c| c.rect);
@@ -1004,11 +1272,10 @@ impl Renderer {
             let Some(entry) = v.list.entries.get(row as usize) else {
                 break;
             };
-            let y = list_rect.y + ((row - v.list.scroll_offset) as i32) * row_h;
-            if y >= list_rect.bottom() {
-                break;
-            }
-            let r = Rect::new(list_rect.x, y, list_rect.w, row_h);
+            let Some(r) = v.layout.cell(row, v.list.scroll_px()) else {
+                continue;
+            };
+            let y = r.y;
 
             let selected = v.list.is_selected(row);
             let hovered = v.hover == Some(Hit::Row(v.pid, row));
@@ -1052,23 +1319,44 @@ impl Renderer {
                 self.fill_rounded(bar, 1.5, if differs { p.capacity_full } else { p.accent });
             }
 
-            if let Some(nc) = name_col {
-                let icon = Rect::new(
-                    nc.x + m.pad,
-                    y + (row_h - m.icon_size) / 2,
-                    m.icon_size,
-                    m.icon_size,
-                );
-                let key = icon_key(entry.extension.as_deref(), entry.is_dir);
-                self.draw_icon(&key, icon);
+            if let Some((icon, name)) = v.layout.cell_parts(row, v.list.scroll_px(), m) {
+                // The shell's image if a worker has produced one, and the
+                // file-type icon until then, so no cell is ever empty.
+                let drawn = match v.thumbs {
+                    Some((cache, dir)) => {
+                        let key = crate::app::AppState::image_key(dir, entry);
+                        self.draw_cell_image(&key, cache, icon)
+                    }
+                    None => false,
+                };
+                if !drawn {
+                    let key = icon_key(entry.extension.as_deref(), entry.is_dir);
+                    let small = if grid {
+                        // A 16px icon blown up to 72 is a smear. Draw it at its
+                        // own size in the middle of the cell instead.
+                        Rect::new(
+                            icon.x + (icon.w - m.icon_size) / 2,
+                            icon.y + (icon.h - m.icon_size) / 2,
+                            m.icon_size,
+                            m.icon_size,
+                        )
+                    } else {
+                        icon
+                    };
+                    self.draw_icon(&key, small);
+                }
 
-                let name = Rect::new(
-                    icon.right() + m.pad,
-                    y,
-                    (nc.right() - icon.right() - m.pad * 2).max(0),
-                    row_h,
-                );
-                self.text(&entry.name, name, fg, &self.formats.body.clone());
+                // The row being renamed shows the edit box instead of its name.
+                if v.renaming != Some(row) {
+                    let fmt = if grid {
+                        // Two centred lines under the icon; a longer name is
+                        // trimmed rather than pushed into the next cell.
+                        self.formats.cell_label.clone()
+                    } else {
+                        self.formats.body.clone()
+                    };
+                    self.text(&entry.name, name, fg, &fmt);
+                }
 
                 // Junctions and symlinks are marked, so a recursive copy is
                 // never a surprise.
@@ -1076,6 +1364,12 @@ impl Renderer {
                     let badge = Rect::new(icon.x, icon.bottom() - 5, 5, 5);
                     self.fill_rounded(badge, 2.5, p.accent);
                 }
+            }
+
+            // The columns are the details view. The icon view has none, and
+            // its cell layout already gave the name the whole width.
+            if grid {
+                continue;
             }
 
             if let Some(tc) = type_col {

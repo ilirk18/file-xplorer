@@ -9,6 +9,33 @@
 //    hover < active) instead of collapsing into one flat black, which is what
 //    makes panels legible without needing borders everywhere.
 
+/// What Windows itself is set to, from the same registry value the shell reads.
+///
+/// Absent or unreadable means dark, which is this app's own default: a machine
+/// that has never been themed should not get a surprise white window.
+///
+/// ponytail: read once at startup. Following a live theme change would mean
+/// handling WM_SETTINGCHANGE / "ImmersiveColorSet"; add it if anyone notices.
+pub fn system_dark() -> bool {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            PCWSTR(w!("AppsUseLightTheme").as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    status.is_err() || value == 0
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum Theme {
     #[default]

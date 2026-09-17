@@ -50,6 +50,29 @@ impl Rect {
     pub fn is_empty(&self) -> bool {
         self.w <= 0 || self.h <= 0
     }
+    /// The rectangle between two corners, in any order. For a drag band, where
+    /// the second corner is wherever the mouse got to.
+    pub fn between(a: (i32, i32), b: (i32, i32)) -> Rect {
+        Rect::new(
+            a.0.min(b.0),
+            a.1.min(b.1),
+            (a.0 - b.0).abs(),
+            (a.1 - b.1).abs(),
+        )
+    }
+
+    /// This rectangle clipped to `other`. Empty when they do not overlap.
+    pub fn clamp_to(&self, other: Rect) -> Rect {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        Rect::new(
+            x,
+            y,
+            (self.right().min(other.right()) - x).max(0),
+            (self.bottom().min(other.bottom()) - y).max(0),
+        )
+    }
+
     pub fn inset(&self, dx: i32, dy: i32) -> Rect {
         Rect::new(self.x + dx, self.y + dy, self.w - dx * 2, self.h - dy * 2)
     }
@@ -115,6 +138,9 @@ pub struct Metrics {
     pub row_h: i32,
 
     pub sidebar_w: i32,
+    /// The inspector panel on the right. Wide enough for a readable preview
+    /// without taking a listing's worth of window.
+    pub inspector_w: i32,
     pub sidebar_section_h: i32,
     pub sidebar_row_h: i32,
     /// A drive row is taller than a place row: it carries a capacity bar.
@@ -126,6 +152,11 @@ pub struct Metrics {
     pub scrollbar_min_thumb: i32,
     pub min_pane_w: i32,
     pub icon_size: i32,
+    /// One cell of the icon view, and the icon drawn inside it. Wide enough
+    /// for a readable two-line name under a thumbnail.
+    pub cell_w: i32,
+    pub cell_h: i32,
+    pub cell_icon: i32,
     pub pad: i32,
     pub radius: f32,
 
@@ -158,6 +189,7 @@ impl Metrics {
             row_h: s(22.0),
 
             sidebar_w: s(196.0),
+            inspector_w: s(300.0),
             sidebar_section_h: s(26.0),
             sidebar_row_h: s(24.0),
             sidebar_drive_h: s(46.0),
@@ -168,6 +200,9 @@ impl Metrics {
             scrollbar_min_thumb: s(28.0),
             min_pane_w: s(240.0),
             icon_size: s(16.0),
+            cell_w: s(118.0),
+            cell_h: s(124.0),
+            cell_icon: s(72.0),
             pad: s(8.0),
             radius: 4.0 * scale,
 
@@ -276,7 +311,14 @@ pub struct PaneLayout {
     pub scrollbar: Rect,
     pub thumb: Rect,
     /// Rows fully visible in `list`.
+    /// Whole lines that fit in the list area.
     pub visible_rows: u32,
+    /// Entries per line: 1 in the details view, as many as fit in the icon
+    /// view. The one number that makes a grid out of a list — every index is
+    /// still flat, only the mapping from index to rectangle changes.
+    pub columns_per_line: u32,
+    /// Height of one line: a row in the details view, a cell in the icon view.
+    pub line_h: i32,
 
     pub footer: Rect,
     pub filter: Rect,
@@ -285,13 +327,142 @@ pub struct PaneLayout {
 
 impl PaneLayout {
     /// Absolute row index under a point, if the point is over a real row.
-    pub fn row_at(&self, py: i32, scroll_offset: u32, row_h: i32, total_rows: u32) -> Option<u32> {
-        if row_h <= 0 || py < self.list.y || py >= self.list.bottom() {
+    /// The rectangle one entry occupies, whichever view is showing.
+    ///
+    /// Indices stay flat — `columns_per_line` and `line_h` are the only things
+    /// that differ between a details row and an icon cell — so everything that
+    /// works in indices (selection, sorting, the cursor) needs no view branch.
+    /// `None` only when the entry is entirely outside the rows area.
+    pub fn cell(&self, index: u32, scroll_px: i32) -> Option<Rect> {
+        let cols = self.columns_per_line.max(1);
+        if self.line_h <= 0 || self.list.w <= 0 {
             return None;
         }
-        let row = scroll_offset as i64 + ((py - self.list.y) / row_h) as i64;
-        if row >= 0 && (row as u64) < total_rows as u64 {
-            Some(row as u32)
+        let line = (index / cols) as i32;
+        let col = (index % cols) as i32;
+        let y = self.list.y + line * self.line_h - scroll_px;
+        if y + self.line_h <= self.list.y || y >= self.list.bottom() {
+            return None;
+        }
+        let w = if cols == 1 {
+            self.list.w
+        } else {
+            self.list.w / cols as i32
+        };
+        Some(Rect::new(self.list.x + col * w, y, w, self.line_h))
+    }
+
+    /// The icon and name-text rectangles inside one entry's cell.
+    ///
+    /// One formula, used by the painter and by the inline rename editor, so the
+    /// box you type in sits exactly where the name was drawn. A row half off
+    /// the bottom edge still has to be painted and the clip takes care of the
+    /// rest; a caller that needs the cell *whole* — the rename editor does, a
+    /// box hanging out of its panel is not usable — checks what it gets back.
+    pub fn cell_parts(&self, index: u32, scroll_px: i32, m: Metrics) -> Option<(Rect, Rect)> {
+        let cell = self.cell(index, scroll_px)?;
+        if self.columns_per_line > 1 {
+            // Icon view: a big icon over a two-line name, both centred.
+            let icon = Rect::new(
+                cell.x + (cell.w - m.cell_icon) / 2,
+                cell.y + m.pad,
+                m.cell_icon,
+                m.cell_icon,
+            );
+            let label = Rect::new(
+                cell.x + m.pad / 2,
+                icon.bottom() + m.pad / 2,
+                (cell.w - m.pad).max(0),
+                (cell.bottom() - icon.bottom() - m.pad).max(0),
+            );
+            return Some((icon, label));
+        }
+        // Details: a small icon in the Name column, the name after it.
+        let nc = self
+            .columns
+            .iter()
+            .find(|c| c.key == SortKey::Name)
+            .map(|c| c.rect)?;
+        let icon = Rect::new(
+            nc.x + m.pad,
+            cell.y + (self.line_h - m.icon_size) / 2,
+            m.icon_size,
+            m.icon_size,
+        );
+        let name = Rect::new(
+            icon.right() + m.pad,
+            cell.y,
+            (nc.right() - icon.right() - m.pad * 2).max(0),
+            self.line_h,
+        );
+        Some((icon, name))
+    }
+
+    /// Entries a selection band covers.
+    ///
+    /// Each candidate cell is tested against the band rather than a row range
+    /// being derived from it, because in the icon view a band is a rectangle
+    /// over a grid and only some of a line is inside it. In the details view
+    /// cells span the width, so this comes out as the row range it used to be.
+    pub fn band_indices(&self, band: Rect, scroll_px: i32, total: u32) -> Vec<u32> {
+        let cols = self.columns_per_line.max(1);
+        if self.line_h <= 0 || total == 0 {
+            return Vec::new();
+        }
+        // A drag straight down or straight across has no width or no height,
+        // and a zero-area rectangle intersects nothing. One pixel is what the
+        // gesture means.
+        let band = Rect::new(band.x, band.y, band.w.max(1), band.h.max(1));
+        // Only lines on screen can be covered: the band is clamped to the list.
+        let band = band.clamp_to(self.list);
+        if band.is_empty() {
+            return Vec::new();
+        }
+        let first_line = ((band.y - self.list.y + scroll_px) / self.line_h).max(0);
+        let last_line = (band.bottom() - 1 - self.list.y + scroll_px) / self.line_h;
+        let mut out = Vec::new();
+        for line in first_line..=last_line.max(first_line) {
+            for col in 0..cols {
+                let index = line as u32 * cols + col;
+                if index >= total {
+                    return out;
+                }
+                if self
+                    .cell(index, scroll_px)
+                    .is_some_and(|r| !r.clamp_to(band).is_empty())
+                {
+                    out.push(index);
+                }
+            }
+        }
+        out
+    }
+
+    /// The entry under a point, or None if there is none there.
+    pub fn cell_at(&self, px: i32, py: i32, scroll_px: i32, total: u32) -> Option<u32> {
+        let cols = self.columns_per_line.max(1);
+        if self.line_h <= 0 || !self.list.contains(px, py) {
+            return None;
+        }
+        let line = ((py - self.list.y + scroll_px) / self.line_h) as i64;
+        let w = if cols == 1 {
+            self.list.w
+        } else {
+            self.list.w / cols as i32
+        };
+        if w <= 0 {
+            return None;
+        }
+        // A window wider than cols*cell_w leaves a strip on the right that
+        // belongs to no cell; clamping there would select the last column from
+        // empty space.
+        let col = ((px - self.list.x) / w) as i64;
+        if col < 0 || col >= cols as i64 {
+            return None;
+        }
+        let index = line * cols as i64 + col;
+        if index >= 0 && (index as u64) < total as u64 {
+            Some(index as u32)
         } else {
             None
         }
@@ -304,6 +475,10 @@ pub struct Layout {
     pub client: Rect,
     pub sidebar: Rect,
     pub sidebar_rows: Vec<SidebarRow>,
+    /// The inspector panel, or empty when it is hidden. Mirrors the sidebar:
+    /// taken off the body before the panes are laid out, so nothing else has
+    /// to know it exists.
+    pub inspector: Rect,
     pub panes: Vec<PaneLayout>,
     /// One fewer than `panes`. Empty when a single pane fills the window.
     pub dividers: Vec<Rect>,
@@ -344,8 +519,12 @@ pub enum Hit {
 pub struct PaneInput<'a> {
     pub tab_labels: &'a [String],
     pub crumbs: &'a [String],
-    pub total_rows: u32,
+    /// Lines of cells, not entries: in the icon view one line holds several.
+    /// It is what the scrollbar measures against.
+    pub total_lines: u32,
     pub scroll_offset: u32,
+    /// Icon view rather than the details list.
+    pub grid: bool,
 }
 
 impl Layout {
@@ -362,6 +541,7 @@ impl Layout {
         sidebar_entries: &[SidebarEntry],
         // How far the sidebar is scrolled, in pixels.
         sidebar_scroll: i32,
+        inspector_visible: bool,
         panes: &[PaneInput],
         measurer: &dyn TextMeasurer,
     ) -> Layout {
@@ -373,6 +553,11 @@ impl Layout {
         } else {
             (Rect::default(), body)
         };
+        let (body, inspector) = if inspector_visible {
+            body.split_right(m.inspector_w)
+        } else {
+            (body, Rect::default())
+        };
 
         let sidebar_rows = sidebar_rows(sidebar, m, sidebar_entries, sidebar_scroll);
         let (bounds, dividers) = split_body(body, m, splits, panes.len());
@@ -382,6 +567,7 @@ impl Layout {
             client,
             sidebar,
             sidebar_rows,
+            inspector,
             panes: bounds
                 .iter()
                 .zip(panes)
@@ -399,6 +585,7 @@ impl Layout {
         client: Rect,
         m: Metrics,
         sidebar_visible: bool,
+        inspector_visible: bool,
         count: usize,
         splits: &[f32],
     ) -> Vec<f32> {
@@ -407,7 +594,8 @@ impl Layout {
         }
         let even = || (1..count).map(|i| i as f32 / count as f32).collect::<Vec<f32>>();
         let body_x = client.x + if sidebar_visible { m.sidebar_w } else { 0 };
-        let body_w = client.right() - body_x;
+        let body_w =
+            client.right() - body_x - if inspector_visible { m.inspector_w } else { 0 };
         let needed = m.min_pane_w * count as i32 + m.divider_w * (count as i32 - 1);
         if splits.len() != count - 1 || body_w < needed {
             return even();
@@ -690,7 +878,8 @@ fn pane_layout(
 
     let (tab_bar, rest) = bounds.split_top(m.tab_bar_h);
     let (toolbar, rest) = rest.split_top(m.toolbar_h);
-    let (header, rest) = rest.split_top(m.header_h);
+    // The icon view has no columns, so it has no column header to click.
+    let (header, rest) = rest.split_top(if input.grid { 0 } else { m.header_h });
     let (list_area, footer) = rest.split_bottom(m.footer_h);
     let (list, scrollbar) = list_area.split_right(m.scrollbar_w);
 
@@ -713,15 +902,22 @@ fn pane_layout(
 
     let columns = column_rects(header, m);
 
-    let visible_rows = if m.row_h > 0 {
-        (list.h / m.row_h).max(0) as u32
+    // Details is the grid with one column: everything below works off these
+    // two numbers, so neither the painter nor hit-testing needs a view branch.
+    let (columns_per_line, line_h) = if input.grid {
+        ((list.w / m.cell_w).max(1) as u32, m.cell_h)
+    } else {
+        (1, m.row_h)
+    };
+    let visible_rows = if line_h > 0 {
+        (list.h / line_h).max(0) as u32
     } else {
         0
     };
     let thumb = thumb_rect(
         scrollbar,
         m,
-        input.total_rows,
+        input.total_lines,
         visible_rows,
         input.scroll_offset,
     );
@@ -747,6 +943,8 @@ fn pane_layout(
         scrollbar,
         thumb,
         visible_rows,
+        columns_per_line,
+        line_h,
         footer,
         filter: filter.inset(m.pad / 2, m.pad / 4),
         counts,
@@ -958,7 +1156,8 @@ mod tests {
         PaneInput {
             tab_labels: tabs,
             crumbs,
-            total_rows: rows,
+            total_lines: rows,
+            grid: false,
             scroll_offset: scroll,
         }
     }
@@ -991,11 +1190,11 @@ mod tests {
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, w, h);
         let tabs = strs(&["Foo"]);
-        let splits = Layout::clamp_splits(client, m, true, n, &[]);
+        let splits = Layout::clamp_splits(client, m, true, false, n, &[]);
         let inputs: Vec<PaneInput> = (0..n)
             .map(|_| input(&tabs, crumbs, 100, 0))
             .collect();
-        Layout::compute(client, m, &splits, true, &sidebar_of(2), 0, &inputs, &FixedWidth)
+        Layout::compute(client, m, &splits, true, &sidebar_of(2), 0, false, &inputs, &FixedWidth)
     }
 
     fn build(w: i32, h: i32, crumbs: &[String]) -> Layout {
@@ -1037,9 +1236,9 @@ mod tests {
         let client = Rect::new(0, 0, 1800, 800);
         // Three dividers crowded into the left edge: the clamp has to push them
         // apart, not let two panes collapse to nothing.
-        let splits = Layout::clamp_splits(client, m, true, 4, &[0.01, 0.02, 0.03]);
+        let splits = Layout::clamp_splits(client, m, true, false, 4, &[0.01, 0.02, 0.03]);
         let inputs: Vec<PaneInput> = (0..4).map(|_| input(&[], &[], 0, 0)).collect();
-        let l = Layout::compute(client, m, &splits, true, &[], 0, &inputs, &FixedWidth);
+        let l = Layout::compute(client, m, &splits, true, &[], 0, false, &inputs, &FixedWidth);
         for p in &l.panes {
             assert!(p.bounds.w >= m.min_pane_w, "pane too narrow: {:?}", p.bounds);
         }
@@ -1049,7 +1248,7 @@ mod tests {
     fn a_window_too_narrow_for_the_minimums_shares_evenly() {
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, 400, 600);
-        let splits = Layout::clamp_splits(client, m, false, 4, &[0.9, 0.92, 0.95]);
+        let splits = Layout::clamp_splits(client, m, false, false, 4, &[0.9, 0.92, 0.95]);
         assert_eq!(splits, vec![0.25, 0.5, 0.75]);
     }
 
@@ -1058,7 +1257,7 @@ mod tests {
         // Ctrl+1 after Ctrl+4: the count changes, the stale fractions do not.
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, 1800, 800);
-        assert!(Layout::clamp_splits(client, m, true, 1, &[0.25, 0.5, 0.75]).is_empty());
+        assert!(Layout::clamp_splits(client, m, true, false, 1, &[0.25, 0.5, 0.75]).is_empty());
     }
 
     #[test]
@@ -1074,6 +1273,7 @@ mod tests {
             true,
             &sidebar_of(2),
             0,
+            false,
             &[input(&tabs, &crumbs, 10, 0)],
             &FixedWidth,
         );
@@ -1104,8 +1304,8 @@ mod tests {
     fn clamp_split_keeps_both_panes_usable() {
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, 1000, 600);
-        let low = Layout::clamp_splits(client, m, false, 2, &[-5.0]);
-        let high = Layout::clamp_splits(client, m, false, 2, &[5.0]);
+        let low = Layout::clamp_splits(client, m, false, false, 2, &[-5.0]);
+        let high = Layout::clamp_splits(client, m, false, false, 2, &[5.0]);
         assert_eq!((low[0] * 1000.0).round() as i32, m.min_pane_w);
         assert_eq!(
             (high[0] * 1000.0).round() as i32,
@@ -1117,7 +1317,7 @@ mod tests {
     fn clamp_split_centres_when_the_window_is_too_narrow() {
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, 200, 600);
-        assert_eq!(Layout::clamp_splits(client, m, false, 2, &[0.05]), vec![0.5]);
+        assert_eq!(Layout::clamp_splits(client, m, false, false, 2, &[0.05]), vec![0.5]);
     }
 
     // -- the bug this module was written to kill ---------------------------
@@ -1218,7 +1418,7 @@ mod tests {
         let client = Rect::new(0, 0, 1400, 800);
         let tabs = strs(&["Documents", "Downloads"]);
         let crumbs = strs(&["C:\\"]);
-        let splits = Layout::clamp_splits(client, m, false, 2, &[]);
+        let splits = Layout::clamp_splits(client, m, false, false, 2, &[]);
         let l = Layout::compute(
             client,
             m,
@@ -1226,6 +1426,7 @@ mod tests {
             false,
             &[],
             0,
+            false,
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1243,7 +1444,7 @@ mod tests {
         let client = Rect::new(0, 0, 1000, 800);
         let tabs: Vec<String> = (0..12).map(|i| format!("Folder{}", i)).collect();
         let crumbs = strs(&["C:\\"]);
-        let splits = Layout::clamp_splits(client, m, false, 2, &[]);
+        let splits = Layout::clamp_splits(client, m, false, false, 2, &[]);
         let l = Layout::compute(
             client,
             m,
@@ -1251,6 +1452,7 @@ mod tests {
             false,
             &[],
             0,
+            false,
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1316,6 +1518,7 @@ mod tests {
             false,
             &[],
             0,
+            false,
             &[input(&tabs, &crumbs, 10, 0)],
             &FixedWidth,
         )
@@ -1349,10 +1552,18 @@ mod tests {
         let m = l.metrics;
         let p = &l.panes[0];
         let y = p.list.y + m.row_h * 2 + 1;
-        assert_eq!(p.row_at(y, 10, m.row_h, 100), Some(12));
-        assert_eq!(p.row_at(y, 10, m.row_h, 5), None);
+        // Scroll is in pixels, so ten rows down is ten row heights.
+        assert_eq!(p.cell_at(p.list.x + 1, y, 10 * m.row_h, 100), Some(12));
+        assert_eq!(p.cell_at(p.list.x + 1, y, 10 * m.row_h, 5), None);
+        // Half a row scrolled: the same pixel is one row further down.
+        assert_eq!(p.cell_at(p.list.x + 1, y, 10 * m.row_h + m.row_h / 2 + 1, 100), Some(12));
+        assert_eq!(
+            p.cell_at(p.list.x + 1, p.list.y + m.row_h - 1, m.row_h / 2 + 1, 100),
+            Some(1),
+            "a part-scrolled top row hands the rest of its band to the next"
+        );
         // Below the list is not a row, even with plenty of data.
-        assert_eq!(p.row_at(p.list.bottom() + 1, 0, m.row_h, 10_000), None);
+        assert_eq!(p.cell_at(p.list.x + 1, p.list.bottom() + 1, 0, 10_000), None);
     }
 
     #[test]
@@ -1361,7 +1572,7 @@ mod tests {
         let client = Rect::new(0, 0, 1400, 800);
         let tabs = strs(&["Foo"]);
         let crumbs = strs(&["C:\\"]);
-        let splits = Layout::clamp_splits(client, m, false, 2, &[]);
+        let splits = Layout::clamp_splits(client, m, false, false, 2, &[]);
         let mk = |offset: u32| {
             Layout::compute(
                 client,
@@ -1370,6 +1581,7 @@ mod tests {
                 false,
                 &[],
                 0,
+                false,
                 &[
                     input(&tabs, &crumbs, 1000, offset),
                     input(&tabs, &crumbs, 1000, offset),
@@ -1400,7 +1612,7 @@ mod tests {
         let client = Rect::new(0, 0, 1400, 800);
         let tabs = strs(&["Foo"]);
         let crumbs = strs(&["C:\\"]);
-        let splits = Layout::clamp_splits(client, m, false, 2, &[]);
+        let splits = Layout::clamp_splits(client, m, false, false, 2, &[]);
         let l = Layout::compute(
             client,
             m,
@@ -1408,6 +1620,7 @@ mod tests {
             false,
             &[],
             0,
+            false,
             &[input(&tabs, &crumbs, 3, 0), input(&tabs, &crumbs, 3, 0)],
             &FixedWidth,
         );
@@ -1484,7 +1697,7 @@ mod tests {
         let crumbs = strs(&["C:\\"]);
         let entries: Vec<SidebarEntry> =
             (0..40).map(|i| SidebarEntry::Place { index: i }).collect();
-        let splits = Layout::clamp_splits(client, m, true, 2, &[]);
+        let splits = Layout::clamp_splits(client, m, true, false, 2, &[]);
         let l = Layout::compute(
             client,
             m,
@@ -1492,6 +1705,7 @@ mod tests {
             true,
             &entries,
             0,
+            false,
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1529,9 +1743,260 @@ mod tests {
             true,
             &sidebar_of(2),
             0,
+            false,
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
         assert_eq!(l.hit_test(0, 0), Hit::Nothing);
+    }
+
+    #[test]
+    fn band_selects_the_rows_it_covers() {
+        let m = Metrics::for_dpi(96);
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let p = &l.panes[0];
+        let x = p.list.x + 1;
+        let top = p.list.y;
+        let band = |y0: i32, y1: i32, scroll: i32| {
+            p.band_indices(Rect::between((x, y0), (x, y1)), scroll, 100)
+        };
+
+        // A band over the first three rows, scrolled to the top.
+        assert_eq!(band(top + 1, top + 2 * m.row_h + 1, 0), vec![0, 1, 2]);
+        // Dragged upwards: same rows.
+        assert_eq!(band(top + 2 * m.row_h + 1, top + 1, 0), vec![0, 1, 2]);
+        // Scrolled: the same pixels mean later rows.
+        assert_eq!(band(top + 1, top + 1, 10 * m.row_h), vec![10]);
+    }
+
+    #[test]
+    fn band_clamps_rather_than_refusing() {
+        let m = Metrics::for_dpi(96);
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let p = &l.panes[0];
+        let x = p.list.x + 1;
+
+        // Dragged far past the last row: stops at it.
+        let covered = p.band_indices(
+            Rect::between((x, p.list.y + 1), (x, p.list.bottom() + 5000)),
+            0,
+            3,
+        );
+        assert_eq!(covered, vec![0, 1, 2]);
+
+        // Entirely above the rows, or over an empty listing: nothing.
+        assert!(p
+            .band_indices(Rect::between((x, 0), (x, p.list.y - 1)), 0, 3)
+            .is_empty());
+        assert!(p
+            .band_indices(Rect::between((x, p.list.y), (x, p.list.bottom())), 0, 0)
+            .is_empty());
+    }
+
+    #[test]
+    fn between_and_clamp_to_normalise() {
+        assert_eq!(Rect::between((10, 10), (4, 7)), Rect::new(4, 7, 6, 3));
+        let clipped = Rect::new(0, 0, 100, 100).clamp_to(Rect::new(50, 50, 200, 200));
+        assert_eq!(clipped, Rect::new(50, 50, 50, 50));
+        assert!(Rect::new(0, 0, 10, 10).clamp_to(Rect::new(50, 50, 10, 10)).is_empty());
+    }
+
+    #[test]
+    fn a_rows_name_cell_hit_tests_back_to_that_row() {
+        let m = Metrics::for_dpi(96);
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let p = &l.panes[0];
+        for row in [0u32, 1, 5] {
+            let (icon, name) = p
+                .cell_parts(row, 0, m)
+                .expect("a row near the top is on screen");
+            assert!(icon.right() < name.x, "the name starts after the icon");
+            assert!(name.w > 0);
+            // hit_test resolves the rows area; the row itself comes from
+            // row_at, the way the input handlers do it.
+            assert_eq!(
+                l.hit_test(name.x + 1, name.y + name.h / 2),
+                Hit::ListBackground(PaneId(0))
+            );
+            assert_eq!(
+                p.cell_at(p.list.x + 1, name.y + name.h / 2, 0, 100),
+                Some(row),
+                "the cell drawn for a row belongs to that row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_half_visible_row_still_has_cells_to_paint() {
+        // The bottom row is usually clipped. It must still be drawn, or its
+        // name and icon go missing while its other columns render.
+        let m = Metrics::for_dpi(96);
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let p = &l.panes[0];
+        let partial = (p.list.h / m.row_h) as u32;
+        assert!(
+            p.list.h % m.row_h != 0,
+            "this test needs a list height that does not divide evenly"
+        );
+        let (_, name) = p
+            .cell_parts(partial, 0, m)
+            .expect("a row hanging off the bottom edge is still painted");
+        assert!(name.y < p.list.bottom() && name.bottom() > p.list.bottom());
+    }
+
+    #[test]
+    fn a_scrolled_out_row_has_no_cell_to_edit() {
+        let m = Metrics::for_dpi(96);
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let p = &l.panes[0];
+        assert!(
+            p.cell_parts(3, 10 * m.row_h, m).is_none(),
+            "scrolled off the top"
+        );
+        let past = (p.list.h / m.row_h) as u32 + 5;
+        assert!(p.cell_parts(past, 0, m).is_none(), "below the viewport");
+    }
+
+    #[test]
+    fn the_inspector_takes_its_width_off_the_panes() {
+        let m = Metrics::for_dpi(96);
+        let tabs = strs(&["C:\\"]);
+        let crumbs = strs(&["C:"]);
+        let client = Rect::new(0, 0, 1400, 800);
+        let mk = |inspector: bool| {
+            Layout::compute(
+                client,
+                m,
+                &[],
+                true,
+                &sidebar_of(2),
+                0,
+                inspector,
+                &[input(&tabs, &crumbs, 10, 0)],
+                &FixedWidth,
+            )
+        };
+
+        let without = mk(false);
+        assert!(without.inspector.is_empty());
+        assert_eq!(without.panes[0].bounds.right(), client.right());
+
+        let with = mk(true);
+        assert_eq!(with.inspector.w, m.inspector_w);
+        assert_eq!(with.inspector.right(), client.right());
+        assert_eq!(with.inspector.h, client.h, "full height, like the sidebar");
+        // The pane stops where the inspector starts: no overlap, no gap.
+        assert_eq!(with.panes[0].bounds.right(), with.inspector.x);
+        assert_eq!(
+            with.panes[0].bounds.w,
+            without.panes[0].bounds.w - m.inspector_w
+        );
+    }
+
+    #[test]
+    fn splits_are_clamped_against_the_body_the_inspector_leaves() {
+        let m = Metrics::for_dpi(96);
+        // Narrow enough that four panes plus an inspector cannot fit, but
+        // four panes alone can: the clamp has to notice the difference.
+        let client = Rect::new(0, 0, m.min_pane_w * 4 + m.divider_w * 3 + m.inspector_w + 20, 800);
+        let even = Layout::clamp_splits(client, m, false, false, 4, &[0.1, 0.2, 0.3]);
+        let squeezed = Layout::clamp_splits(client, m, false, true, 4, &[0.1, 0.2, 0.3]);
+        assert_ne!(
+            even, squeezed,
+            "the same splits cannot mean the same pixels in a narrower body"
+        );
+    }
+
+    fn grid_pane(w: i32) -> Layout {
+        let tabs = strs(&["C:\\"]);
+        let crumbs = strs(&["C:"]);
+        Layout::compute(
+            Rect::new(0, 0, w, 800),
+            Metrics::for_dpi(96),
+            &[],
+            false,
+            &[],
+            0,
+            false,
+            &[PaneInput {
+                tab_labels: &tabs,
+                crumbs: &crumbs,
+                total_lines: 50,
+                scroll_offset: 0,
+                grid: true,
+            }],
+            &FixedWidth,
+        )
+    }
+
+    #[test]
+    fn the_icon_view_tiles_cells_and_drops_the_header() {
+        let m = Metrics::for_dpi(96);
+        let l = grid_pane(1000);
+        let p = &l.panes[0];
+        assert!(p.header.is_empty(), "no columns, so no column header");
+        assert_eq!(p.columns_per_line, (p.list.w / m.cell_w).max(1) as u32);
+        assert_eq!(p.line_h, m.cell_h);
+        assert!(p.columns_per_line > 1, "1000px should fit several cells");
+
+        // The first line's cells sit side by side, all at the same height.
+        let cols = p.columns_per_line;
+        let first = p.cell(0, 0).unwrap();
+        let second = p.cell(1, 0).unwrap();
+        assert_eq!(first.y, second.y);
+        assert_eq!(first.right(), second.x);
+        // The next line starts one cell height down.
+        assert_eq!(p.cell(cols, 0).unwrap().y, first.y + m.cell_h);
+        assert_eq!(p.cell(cols, 0).unwrap().x, first.x);
+    }
+
+    #[test]
+    fn a_cell_hit_tests_back_to_its_own_index() {
+        let l = grid_pane(1000);
+        let p = &l.panes[0];
+        for index in [0u32, 1, 5, 12] {
+            let c = p.cell(index, 0).expect("near the top, so on screen");
+            assert_eq!(
+                p.cell_at(c.x + c.w / 2, c.y + c.h / 2, 0, 100),
+                Some(index),
+                "whatever is drawn at a cell must hit-test back to it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_strip_past_the_last_column_belongs_to_no_cell() {
+        let l = grid_pane(1000);
+        let p = &l.panes[0];
+        // cell_at divides the list width by the column count, so every pixel
+        // of the list falls inside a column; what must not happen is a click
+        // past the last *entry* on a line selecting something.
+        let cols = p.columns_per_line;
+        let last_on_line = p.cell(cols - 1, 0).unwrap();
+        assert_eq!(
+            p.cell_at(last_on_line.x + 1, last_on_line.y + 1, 0, cols - 1),
+            None,
+            "a line that is not full has empty cells at the end"
+        );
+        assert!(p.cell_at(p.list.x + 1, p.list.y - 5, 0, 100).is_none());
+    }
+
+    #[test]
+    fn a_band_over_a_grid_takes_only_the_cells_it_touches() {
+        let l = grid_pane(1000);
+        let p = &l.panes[0];
+        let cols = p.columns_per_line;
+        let first = p.cell(0, 0).unwrap();
+        let second = p.cell(1, 0).unwrap();
+
+        // A band over the first two cells of line one takes exactly those two,
+        // not the whole line — which is the difference between a grid band and
+        // the row range the details view gets.
+        let band = Rect::between(
+            (first.x + 2, first.y + 2),
+            (second.x + 2, second.bottom() - 2),
+        );
+        assert_eq!(p.band_indices(band, 0, 100), vec![0, 1]);
+        assert!(cols > 2, "this test needs a line wider than the band");
     }
 }

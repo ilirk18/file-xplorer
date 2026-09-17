@@ -7,6 +7,8 @@
 //   {n}   original name without extension
 //   {e}   extension without the dot
 //   {#}   1, 2, 3 ...   {##} 01, 02 ...   {###} 001, 002 ...
+//   {d}   date modified, YYYY-MM-DD
+//   {id}  8 hex characters derived from the original name
 //
 // Everything else is literal. A pattern with no {e} loses the extension, which
 // is occasionally what you want and always what you asked for.
@@ -28,6 +30,32 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// One file the rename applies to.
+///
+/// `date` arrives preformatted because only the caller holds the FILETIME, and
+/// pulling `fs`'s formatter in here would make this module need a clock to test.
+#[derive(Clone, Debug)]
+pub struct Item {
+    pub name: String,
+    /// Modified date as `YYYY-MM-DD`. Empty when it could not be read, which
+    /// `{d}` then expands to nothing rather than to a wrong date.
+    pub date: String,
+}
+
+/// 8 hex characters from the original name: stable, so running the same rename
+/// twice produces the same ids, and distinct for distinct names.
+///
+/// ponytail: FNV-1a, not a cryptographic hash. A collision renames two files to
+/// the same name, which `is_valid` catches before anything runs.
+fn short_id(name: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{:08x}", (h >> 32) as u32)
+}
+
 /// Split a file name into (stem, extension-without-dot).
 /// A leading dot is part of the stem: `.gitignore` has no extension.
 pub fn split_name(name: &str) -> (&str, &str) {
@@ -38,7 +66,8 @@ pub fn split_name(name: &str) -> (&str, &str) {
 }
 
 /// Expand `pattern` for one file. `index` is 1-based.
-pub fn expand(pattern: &str, name: &str, index: usize) -> String {
+pub fn expand(pattern: &str, item: &Item, index: usize) -> String {
+    let name = item.name.as_str();
     let (stem, ext) = split_name(name);
     let mut out = String::with_capacity(pattern.len() + stem.len());
     let chars: Vec<char> = pattern.chars().collect();
@@ -59,6 +88,8 @@ pub fn expand(pattern: &str, name: &str, index: usize) -> String {
         match token.as_str() {
             "n" => out.push_str(stem),
             "e" => out.push_str(ext),
+            "d" => out.push_str(&item.date),
+            "id" => out.push_str(&short_id(name)),
             t if !t.is_empty() && t.chars().all(|c| c == '#') => {
                 out.push_str(&format!("{:0width$}", index, width = t.len()));
             }
@@ -73,21 +104,21 @@ pub fn expand(pattern: &str, name: &str, index: usize) -> String {
 /// Build the (old, new) list for a selection. Entries whose name would not
 /// change are dropped: renaming a file to itself is a no-op the shell would
 /// otherwise report as a conflict.
-pub fn plan(names: &[String], pattern: &str) -> Vec<(String, String)> {
-    names
+pub fn plan(items: &[Item], pattern: &str) -> Vec<(String, String)> {
+    items
         .iter()
         .enumerate()
-        .map(|(i, n)| (n.clone(), expand(pattern, n, i + 1)))
+        .map(|(i, it)| (it.name.clone(), expand(pattern, it, i + 1)))
         .filter(|(old, new)| old != new && !new.is_empty())
         .collect()
 }
 
 /// Human-readable preview, one line per rename.
-pub fn preview_text(names: &[String], pattern: &str) -> String {
+pub fn preview_text(items: &[Item], pattern: &str) -> String {
     if pattern.is_empty() {
         return "Type a pattern above.\r\n\r\n{n} name   {e} extension   {#} counter".into();
     }
-    let plan = plan(names, pattern);
+    let plan = plan(items, pattern);
     if plan.is_empty() {
         return "Nothing would change.".into();
     }
@@ -110,8 +141,8 @@ pub fn preview_text(names: &[String], pattern: &str) -> String {
 }
 
 /// True when every proposed name is valid and unique.
-pub fn is_valid(names: &[String], pattern: &str) -> bool {
-    let plan = plan(names, pattern);
+pub fn is_valid(items: &[Item], pattern: &str) -> bool {
+    let plan = plan(items, pattern);
     if plan.is_empty() {
         return false;
     }
@@ -126,18 +157,18 @@ pub fn is_valid(names: &[String], pattern: &str) -> bool {
 }
 
 struct State {
-    names: Vec<String>,
+    items: Vec<Item>,
     pattern: String,
     accepted: bool,
     dpi: u32,
 }
 
 /// Show the dialog. Returns the pattern the user accepted.
-pub fn prompt(parent: HWND, dpi: u32, names: Vec<String>) -> Option<String> {
-    unsafe { prompt_impl(parent, dpi, names) }
+pub fn prompt(parent: HWND, dpi: u32, items: Vec<Item>) -> Option<String> {
+    unsafe { prompt_impl(parent, dpi, items) }
 }
 
-unsafe fn prompt_impl(parent: HWND, dpi: u32, names: Vec<String>) -> Option<String> {
+unsafe fn prompt_impl(parent: HWND, dpi: u32, items: Vec<Item>) -> Option<String> {
     let instance = GetModuleHandleW(None).ok()?;
     let class = wide(CLASS);
 
@@ -163,7 +194,7 @@ unsafe fn prompt_impl(parent: HWND, dpi: u32, names: Vec<String>) -> Option<Stri
     let y = pr.top + ((pr.bottom - pr.top) - h) / 4;
 
     let st = Box::into_raw(Box::new(State {
-        names,
+        items,
         pattern: "{n}".to_string(),
         accepted: false,
         dpi,
@@ -247,11 +278,11 @@ unsafe fn refresh_preview(hwnd: HWND) {
     (*ptr).pattern = pattern.clone();
 
     if let Ok(preview) = GetDlgItem(Some(hwnd), IDC_PREVIEW) {
-        let text = wide(&preview_text(&(*ptr).names, &pattern));
+        let text = wide(&preview_text(&(*ptr).items, &pattern));
         let _ = SetWindowTextW(preview, PCWSTR::from_raw(text.as_ptr()));
     }
     if let Ok(ok) = GetDlgItem(Some(hwnd), IDC_OK) {
-        let _ = EnableWindow(ok, is_valid(&(*ptr).names, &pattern));
+        let _ = EnableWindow(ok, is_valid(&(*ptr).items, &pattern));
     }
 }
 
@@ -367,7 +398,7 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                     refresh_preview(hwnd);
                 } else if id == IDC_OK {
                     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
-                    if !ptr.is_null() && is_valid(&(*ptr).names, &(*ptr).pattern) {
+                    if !ptr.is_null() && is_valid(&(*ptr).items, &(*ptr).pattern) {
                         (*ptr).accepted = true;
                     }
                     let _ = DestroyWindow(hwnd);
@@ -396,8 +427,20 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
 mod tests {
     use super::*;
 
-    fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    fn one(name: &str) -> Item {
+        Item {
+            name: name.to_string(),
+            date: "2026-09-14".into(),
+        }
+    }
+
+    fn names(v: &[&str]) -> Vec<Item> {
+        v.iter()
+            .map(|s| Item {
+                name: s.to_string(),
+                date: "2026-09-14".into(),
+            })
+            .collect()
     }
 
     #[test]
@@ -411,32 +454,32 @@ mod tests {
 
     #[test]
     fn expands_name_and_extension() {
-        assert_eq!(expand("{n}.{e}", "photo.jpg", 1), "photo.jpg");
-        assert_eq!(expand("holiday-{n}.{e}", "photo.jpg", 1), "holiday-photo.jpg");
+        assert_eq!(expand("{n}.{e}", &one("photo.jpg"), 1), "photo.jpg");
+        assert_eq!(expand("holiday-{n}.{e}", &one("photo.jpg"), 1), "holiday-photo.jpg");
     }
 
     #[test]
     fn counter_pads_to_the_hash_count() {
-        assert_eq!(expand("{#}.{e}", "a.txt", 7), "7.txt");
-        assert_eq!(expand("{##}.{e}", "a.txt", 7), "07.txt");
-        assert_eq!(expand("{###}.{e}", "a.txt", 7), "007.txt");
-        assert_eq!(expand("{##}.{e}", "a.txt", 123), "123.txt", "never truncates");
+        assert_eq!(expand("{#}.{e}", &one("a.txt"), 7), "7.txt");
+        assert_eq!(expand("{##}.{e}", &one("a.txt"), 7), "07.txt");
+        assert_eq!(expand("{###}.{e}", &one("a.txt"), 7), "007.txt");
+        assert_eq!(expand("{##}.{e}", &one("a.txt"), 123), "123.txt", "never truncates");
     }
 
     #[test]
     fn literal_text_passes_through() {
-        assert_eq!(expand("IMG_{###}", "x.jpg", 4), "IMG_004");
+        assert_eq!(expand("IMG_{###}", &one("x.jpg"), 4), "IMG_004");
     }
 
     #[test]
     fn unknown_tokens_are_left_alone() {
         // Better to show the user their typo than to silently swallow it.
-        assert_eq!(expand("{bogus}-{n}", "a.txt", 1), "{bogus}-a");
+        assert_eq!(expand("{bogus}-{n}", &one("a.txt"), 1), "{bogus}-a");
     }
 
     #[test]
     fn unclosed_brace_is_literal() {
-        assert_eq!(expand("{n", "a.txt", 1), "{n");
+        assert_eq!(expand("{n", &one("a.txt"), 1), "{n");
     }
 
     #[test]
@@ -474,6 +517,24 @@ mod tests {
     #[test]
     fn a_valid_plan_passes() {
         assert!(is_valid(&names(&["a.txt", "b.txt"]), "photo-{##}.{e}"));
+    }
+
+    #[test]
+    fn date_and_id_expand() {
+        assert_eq!(expand("{d}-{n}.{e}", &one("a.txt"), 1), "2026-09-14-a.txt");
+        let id = expand("{id}.{e}", &one("a.txt"), 1);
+        assert_eq!(id.len(), "00000000.txt".len());
+        assert_eq!(id, expand("{id}.{e}", &one("a.txt"), 9), "stable per name");
+        assert_ne!(id, expand("{id}.{e}", &one("b.txt"), 1), "distinct per name");
+    }
+
+    #[test]
+    fn a_missing_date_expands_to_nothing() {
+        let undated = Item {
+            name: "a.txt".into(),
+            date: String::new(),
+        };
+        assert_eq!(expand("{d}{n}.{e}", &undated, 1), "a.txt");
     }
 
     #[test]

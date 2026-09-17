@@ -51,6 +51,14 @@ pub const WM_APP_TASK_DONE: u32 = WM_APP + 7;
 /// A content comparison finished. lParam is a boxed `DiffDone`.
 pub const WM_APP_DIFF_DONE: u32 = WM_APP + 8;
 
+/// A worker finished building an inspector preview. `lparam` owns a boxed
+/// `(key, Preview)`; the handler takes it or leaks the bitmap inside it.
+pub const WM_APP_PREVIEW_READY: u32 = WM_APP + 9;
+
+/// A worker finished one grid cell's image. `lparam` owns a boxed
+/// `(key, Option<HBITMAP>)`; the handler takes it or leaks the bitmap.
+pub const WM_APP_THUMB_READY: u32 = WM_APP + 10;
+
 /// Periodic settings save. Writing only on exit means a crash — or being
 /// killed from a terminal — loses the session, which is exactly when you
 /// most want it back.
@@ -203,6 +211,16 @@ pub enum Drag {
     /// Resizing a column by its left edge.
     Column { key: crate::file_list::SortKey, start_x: i32, start_w: i32 },
     Scrollbar { pid: PaneId, grab_offset: i32 },
+    /// Rubber-band selection, in client pixels.
+    ///
+    /// ponytail: replaces the selection; no Ctrl+band to add to it. That would
+    /// mean carrying the starting selection through the drag, and `Drag` is
+    /// `Copy` precisely because nothing in it owns anything.
+    Band {
+        pid: PaneId,
+        origin: (i32, i32),
+        cursor: (i32, i32),
+    },
 }
 
 pub struct AppState {
@@ -248,6 +266,33 @@ pub struct AppState {
     pub tree_rows: Vec<crate::tree::TreeRow>,
     /// Which pane's footer filter box is taking keystrokes, if any.
     pub filter_focus: Option<PaneId>,
+    /// Which chord runs which command. Seeded from the command table's own
+    /// default shortcuts, then overridden by whatever the settings file says.
+    pub bindings: crate::keys::Bindings,
+    /// Shell images for the icon view's cells, and the keys being fetched.
+    pub thumbs: crate::preview::ThumbCache,
+    thumbs_pending: std::collections::HashSet<String>,
+    /// Icon view rather than the details list, in every pane. Per-pane would
+    /// mean a per-pane array in the config like `sort`; nothing has asked.
+    pub grid: bool,
+    /// Is the inspector panel on the right showing?
+    pub inspector: bool,
+    /// What the inspector is showing, keyed by path and modified time so an
+    /// edited file re-previews rather than showing a stale thumbnail.
+    pub preview: Option<(String, crate::preview::Preview)>,
+    /// The key a worker is currently fetching, so one selection does not
+    /// spawn a thread per repaint.
+    pub preview_pending: Option<String>,
+    /// The inline rename editor, while a name is being typed over.
+    pub rename: Option<crate::rename::InlineRename>,
+    /// Folders visited, most recent first, offered by "Recent folders".
+    pub recent: Vec<String>,
+    /// The sort each folder was last given, for this session only. Keyed by
+    /// lowercased path, because Windows paths are case-insensitive.
+    ///
+    /// ponytail: not persisted. Add `foldersort=` lines to the config if
+    /// wanting it across restarts; the session map is where the value is.
+    pub folder_sort: std::collections::HashMap<String, (SortKey, SortOrder)>,
 
     pub hover: Option<Hit>,
     pub drag: Drag,
@@ -323,6 +368,33 @@ impl AppState {
             tree: crate::tree::Tree::default(),
             tree_rows: Vec::new(),
             filter_focus: None,
+            bindings: {
+                let mut b = crate::keys::Bindings::from_defaults(
+                    &crate::commands::default_bindings(),
+                );
+                for (chord, label) in &cfg.binds {
+                    // A label the table no longer has is a binding for a
+                    // command that no longer exists: drop it quietly rather
+                    // than refuse to start.
+                    if let Some(id) = crate::commands::id_for_label(label) {
+                        match crate::keys::Chord::parse(chord) {
+                            Some(c) => b.set(c, id),
+                            // An empty chord is how "no shortcut" is recorded.
+                            None => b.clear(id),
+                        }
+                    }
+                }
+                b
+            },
+            thumbs: Default::default(),
+            thumbs_pending: Default::default(),
+            grid: cfg.grid,
+            inspector: cfg.inspector,
+            preview: None,
+            preview_pending: None,
+            rename: None,
+            recent: cfg.recent.clone(),
+            folder_sort: std::collections::HashMap::new(),
             hover: None,
             drag: Drag::None,
             mouse_tracking: false,
@@ -491,8 +563,9 @@ impl AppState {
             .map(|p| PaneInput {
                 tab_labels: &tabs[p.0],
                 crumbs: &crumbs[p.0],
-                total_rows: self.pane(p).list().total_rows(),
+                total_lines: self.pane(p).list().total_lines(),
                 scroll_offset: self.pane(p).list().scroll_offset,
+                grid: self.grid,
             })
             .collect();
         let (entries, _) = self.sidebar_model();
@@ -503,9 +576,112 @@ impl AppState {
             self.sidebar_visible,
             &entries,
             self.sidebar_scroll,
+            self.inspector,
             &inputs,
             &self.renderer,
         )
+    }
+
+    /// Key a cache entry by path and modified time, so an edited file re-renders
+    /// rather than showing what it used to look like.
+    pub fn image_key(dir: &str, entry: &crate::fs::FileEntry) -> String {
+        format!("{}|{}", fs::path_join(dir, &entry.name), entry.modified)
+    }
+
+    /// Ask for the images of every cell on screen that has none yet.
+    ///
+    /// Called from the paint path, like `ensure_preview`: it is the one place
+    /// that knows what is actually visible, after every way of changing it.
+    /// Bounded per frame so a fast scroll queues a screenful, not a drive.
+    pub fn ensure_thumbs(&mut self, hwnd: HWND) {
+        if !self.grid {
+            return;
+        }
+        /// Threads started per repaint. A scroll that outruns them simply asks
+        /// again next frame for whatever is still missing.
+        const PER_FRAME: usize = 16;
+
+        let edge = self.metrics.cell_icon;
+        let mut wanted: Vec<(String, Option<String>)> = Vec::new();
+        for pid in self.visible().collect::<Vec<_>>() {
+            let h = self.list_height(pid);
+            let pane = self.pane(pid);
+            let dir = pane.current_path().to_string();
+            if dir.is_empty() {
+                continue;
+            }
+            let list = pane.list();
+            let (start, end) = list.visible_range(h);
+            for i in start..end {
+                let Some(entry) = list.entries.get(i as usize) else {
+                    break;
+                };
+                let key = Self::image_key(&dir, entry);
+                if !self.thumbs.has(&key) && !self.thumbs_pending.contains(&key) {
+                    wanted.push((key, entry.extension.clone()));
+                }
+                if wanted.len() >= PER_FRAME {
+                    break;
+                }
+            }
+            if wanted.len() >= PER_FRAME {
+                break;
+            }
+        }
+
+        for (key, extension) in wanted {
+            self.thumbs_pending.insert(key.clone());
+            let path = key.rsplit_once('|').map(|(p, _)| p.to_string()).unwrap_or_default();
+            let owner = ops::OwnerWindow(hwnd);
+            // ponytail: a thread per image, at most one per missing visible
+            // cell. They are short and the shell serialises behind its own
+            // cache anyway; a pool is worth it if a listing of thousands of
+            // videos ever makes this visible.
+            std::thread::spawn(move || {
+                let bmp = crate::preview::cell_image(&path, extension.as_deref(), edge);
+                let raw = Box::into_raw(Box::new((key, bmp)));
+                let posted = unsafe {
+                    PostMessageW(
+                        Some(owner.hwnd()),
+                        WM_APP_THUMB_READY,
+                        WPARAM(0),
+                        LPARAM(raw as isize),
+                    )
+                };
+                if posted.is_err() {
+                    // The window is gone, so nothing will ever draw this.
+                    let (_, bmp) = *unsafe { Box::from_raw(raw) };
+                    if let Some(b) = bmp {
+                        unsafe {
+                            let _ = windows::Win32::Graphics::Gdi::DeleteObject(
+                                windows::Win32::Graphics::Gdi::HGDIOBJ(b.0),
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// Take a finished cell image.
+    pub fn finish_thumb(&mut self, key: String, bmp: Option<windows::Win32::Graphics::Gdi::HBITMAP>) {
+        self.thumbs_pending.remove(&key);
+        self.thumbs.insert(key, bmp);
+    }
+
+    /// Push the layout's cells-per-line into every pane's list.
+    ///
+    /// Only the layout knows it — it depends on the pane's width — and the
+    /// list needs it for scrolling and for moving the cursor a line at a time.
+    /// Called from the paint path, which is where the final geometry exists,
+    /// so a resize, a pane-count change or a hidden sidebar updates it without
+    /// each of them having to remember.
+    pub fn sync_columns(&mut self) {
+        let layout = self.layout();
+        for pid in self.visible().collect::<Vec<_>>() {
+            let cols = layout.pane(pid).columns_per_line;
+            self.pane_mut(pid).set_columns(cols);
+        }
     }
 
     pub fn list_height(&self, pid: PaneId) -> u32 {
@@ -517,6 +693,7 @@ impl AppState {
             self.client,
             self.metrics,
             self.sidebar_visible,
+            self.inspector,
             self.pane_count,
             &self.splits,
         );
@@ -542,6 +719,85 @@ impl AppState {
         self.clamp_split();
     }
 
+    /// What the inspector should be showing: the focused pane's cursor entry,
+    /// keyed by path and modified time.
+    ///
+    /// None when the inspector is hidden or nothing is under the cursor, which
+    /// is also how the preview gets dropped when the selection is cleared.
+    pub fn preview_key(&self) -> Option<(String, bool, Option<String>)> {
+        if !self.inspector {
+            return None;
+        }
+        let pane = self.focused_pane();
+        let entry = pane.list().cursor_entry()?;
+        let path = fs::path_join(pane.current_path(), &entry.name);
+        Some((
+            format!("{}|{}", path, entry.modified),
+            entry.is_dir,
+            entry.extension.clone(),
+        ))
+    }
+
+    /// Start a preview fetch if what the inspector wants is not what it has.
+    ///
+    /// Called from the paint path because that is the one place that sees the
+    /// selection after every way of changing it — arrows, clicks, a drag band,
+    /// type-ahead, a reload — rather than hooking each of them. It spawns a
+    /// thread at most; the disk work is the worker's.
+    pub fn ensure_preview(&mut self, hwnd: HWND) {
+        let Some((key, is_dir, extension)) = self.preview_key() else {
+            self.preview = None;
+            self.preview_pending = None;
+            return;
+        };
+        if self.preview.as_ref().is_some_and(|(k, _)| *k == key)
+            || self.preview_pending.as_deref() == Some(key.as_str())
+        {
+            return;
+        }
+        self.preview_pending = Some(key.clone());
+
+        // The key carries the modified time after a '|', which a path cannot
+        // contain, so the path is everything before the last one.
+        let path = key.rsplit_once('|').map(|(p, _)| p.to_string()).unwrap_or_default();
+        let edge = self.metrics.inspector_w.max(64);
+        let owner = ops::OwnerWindow(hwnd);
+        std::thread::spawn(move || {
+            let preview = crate::preview::build(&path, is_dir, extension.as_deref(), edge);
+            let raw = Box::into_raw(Box::new((key, preview)));
+            let posted = unsafe {
+                PostMessageW(
+                    Some(owner.hwnd()),
+                    WM_APP_PREVIEW_READY,
+                    WPARAM(0),
+                    LPARAM(raw as isize),
+                )
+            };
+            if posted.is_err() {
+                unsafe { drop(Box::from_raw(raw)) };
+            }
+        });
+    }
+
+    /// Record a folder as visited. Most recent first, no duplicates, bounded.
+    pub fn remember_visit(&mut self, path: &str) {
+        crate::config::push_recent(&mut self.recent, path);
+    }
+
+    /// Remember how a folder was sorted, and what a folder was last sorted by.
+    ///
+    /// Unbounded for the session: one small entry per folder actually sorted by
+    /// hand, which is a number of folders a person can produce, not a machine.
+    pub fn remember_sort(&mut self, path: &str, key: SortKey, order: SortOrder) {
+        if !path.is_empty() {
+            self.folder_sort.insert(path.to_lowercase(), (key, order));
+        }
+    }
+
+    pub fn sort_for(&self, path: &str) -> Option<(SortKey, SortOrder)> {
+        self.folder_sort.get(&path.to_lowercase()).copied()
+    }
+
     pub fn config(&self, hwnd: HWND) -> Config {
         let mut c = Config {
             pane_count: self.pane_count,
@@ -554,6 +810,20 @@ impl AppState {
             tabs: self.panes.iter().map(|p| p.tab_paths()).collect(),
             active_tab: self.panes.iter().map(|p| p.active_tab_index).collect(),
             pins: self.pins.clone(),
+            recent: self.recent.clone(),
+            inspector: self.inspector,
+            grid: self.grid,
+            // Only what differs from the defaults, so a default that changes
+            // in a later version still reaches someone who never rebound it.
+            binds: self
+                .bindings
+                .changed_from(&crate::keys::Bindings::from_defaults(
+                    &crate::commands::default_bindings(),
+                ))
+                .into_iter()
+                .map(|(chord, id)| (chord, crate::commands::label_for(id).to_string()))
+                .filter(|(_, label)| !label.is_empty())
+                .collect(),
             sort: self
                 .panes
                 .iter()
@@ -598,12 +868,19 @@ impl AppState {
             return;
         }
         let offset = self.pane(from).list().scroll_offset;
+        let frac = self.pane(from).list().scroll_frac;
         for to in self.visible().collect::<Vec<_>>() {
             if to == from {
                 continue;
             }
             let h = self.list_height(to);
-            self.pane_mut(to).list_mut().scroll_to(offset, h);
+            let list = self.pane_mut(to).list_mut();
+            list.scroll_to(offset, h);
+            // Carry the sub-row remainder too, or a synchronised pane would
+            // judder against the one being scrolled.
+            if list.scroll_offset == offset {
+                list.scroll_frac = frac;
+            }
         }
     }
 

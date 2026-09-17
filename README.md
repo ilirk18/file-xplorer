@@ -54,11 +54,48 @@ An operation that fails raises a message box with the actual reason.
 **Live filter.** Each pane's footer filters its listing as you type, with a
 `12 of 340` count.
 
+**Icon view.** `Ctrl+Shift+I` lays the listing out as cells instead of rows,
+each showing the shell's own thumbnail — the same one Explorer draws, so
+whatever handler is installed does the work — with the file-type icon in its
+place until one arrives and for everything that has none. Images are fetched
+only for what is on screen, on worker threads, and cached with a ceiling.
+
+**Inspector.** `Alt+P` opens a panel on the right showing what the cursor is
+on: the shell's own thumbnail for an image, video, PDF or Office file — the
+same call Explorer makes, so whatever handler is installed does the work — or
+the first 64 KB of anything that reads as text, UTF-16 included. Built on a
+worker thread, never on the UI thread, and a result whose file is no longer
+selected is dropped rather than shown against the wrong name.
+
+**Rename in place.** `F2` types over the name where it sits, with the stem
+selected and the extension left alone. Enter commits, Escape abandons, clicking
+away commits — and anything that moves the row out from under the box abandons
+rather than renaming the wrong file. A row that is not on screen falls back to
+the dialog.
+
+**Sort is remembered per folder** for the session: sort Downloads by date and
+it is still by date when you come back to it.
+
+**Every shortcut can be changed.** "Change a shortcut" in the palette picks a
+command and takes the keys to give it — `Ctrl+Shift+R`, `Alt+Left`, `F5`, or
+empty to remove it. Taking a chord from another command says which one it came
+from, rather than letting a shortcut quietly stop working. The defaults are the
+command table's own text, so what the palette and the context menu advertise is
+always what actually fires. Changes live in the settings file as
+`bind=Ctrl+Q=Refresh` lines, and only the ones you changed are written.
+
+Movement is not rebindable: arrows, Page Up and Down, Home, End, Tab and
+type-ahead mean different things with Shift and Ctrl held, and that is not
+something a settings file should try to describe.
+
 **Command palette.** `Ctrl+Shift+P` finds any command by initials, so nothing
 is hidden behind a chord you have to remember.
 
 **Recursive search.** `Ctrl+Shift+F` walks the tree on a worker thread and
-streams matches in as it finds them. `*` is allowed (`*.rs`, `test*`).
+streams matches in as it finds them. `*` is allowed (`*.rs`, `test*`), `ext:rs`
+or `ext:rs,toml` filters by extension, and a query of three characters or more
+that matches nothing literally falls back to subsequence matching, so `gtd`
+finds `get_tree_depth.rs`.
 `Ctrl+Shift+G` searches inside files instead of names, decoding UTF-8 and
 UTF-16 and skipping anything binary.
 
@@ -78,8 +115,9 @@ than half-applied.
 Expanding reads that one folder; collapsing forgets it, which doubles as the
 refresh gesture.
 
-**Batch rename.** `{n}` name, `{e}` extension, `{#}` counter, with a live
-preview that flags collisions and illegal names before anything happens.
+**Batch rename.** `{n}` name, `{e}` extension, `{#}` counter, `{d}` date
+modified, `{id}` a stable 8-character id, with a live preview that flags
+collisions and illegal names before anything happens.
 
 **A context menu in the app's own colours.** Our entries are owner-drawn from
 the same palette as everything else, because a Win32 menu otherwise follows the
@@ -102,16 +140,23 @@ without a refresh.
 **Sidebar** with drives (label, free/total, and a capacity bar that turns amber
 past 90%) and your standard folders, each with its real shell icon.
 
-**Themes.** Dark and light, including the title bar. Both palettes are tested to
-clear WCAG AA contrast for body and secondary text.
+**Themes.** Dark and light, including the title bar. On first run the app takes
+whichever Windows itself is set to; after that `Ctrl+Shift+D` decides and is
+remembered. Both palettes are tested to clear WCAG AA contrast for body and
+secondary text.
 
 **Settings stick.** Pane count, theme, sidebar visibility, hidden files, the
-divider positions, the window box, pinned folders, per-pane sort, column widths
+divider positions, the window box, pinned folders, recent folders, per-pane sort, column widths
 and every open tab live in `%APPDATA%\FileXplorer\settings.txt`. They are
 written a few seconds after anything changes, not only on exit, so a crash does
 not cost you the session.
 It is plain `key=value` text you can edit or delete; anything unreadable falls
 back to defaults rather than refusing to start.
+
+**Scrolling by the pixel.** The wheel moves the list in pixels rather than whole
+rows, so a precision touchpad reporting less than a notch moves it by less than
+a row. Keyboard moves still land on a row boundary, because a row half out of
+view is not something anyone asks for on purpose.
 
 **Correct at any DPI.** The process is per-monitor-v2 aware and every size is
 computed in physical pixels for the current monitor, so nothing is ever
@@ -122,18 +167,19 @@ bitmap-stretched. Dragging between a 100% and a 150% monitor rescales cleanly.
 ## Keyboard and mouse
 
 Bindings follow Windows conventions, with the dual-pane extras on Ctrl+Shift.
+These are the defaults; "Change a shortcut" in the palette rebinds any of them.
 
 | Action | Keys |
 |---|---|
-| Move / extend selection | `Up` `Down` `PageUp` `PageDown` `Home` `End`, `+Shift` to extend, `+Ctrl` to move the cursor only |
+| Move / extend selection | `Up` `Down` (a line at a time), `Left` `Right` in the icon view, `PageUp` `PageDown` `Home` `End`, `+Shift` to extend, `+Ctrl` to move the cursor only |
 | Select all / clear | `Ctrl+A` / `Esc` |
-| Multi-select with the mouse | `Ctrl+click` to toggle, `Shift+click` for a range |
+| Multi-select with the mouse | `Ctrl+click` to toggle, `Shift+click` for a range, or drag a band from the empty space below the rows |
 | Open | `Enter` or double-click (folders navigate, files open in their default app) |
 | Up / back / forward | `Backspace` or `Alt+Up` / `Alt+Left` / `Alt+Right`, or mouse buttons 4 and 5 |
 | Command palette | `Ctrl+Shift+P` |
 | Search in this folder and below | `Ctrl+Shift+F` |
 | Search inside files | `Ctrl+Shift+G` |
-| Go to a typed path | `Ctrl+L` |
+| Go to a typed path | `Ctrl+L`, or "Recent folders" in the palette |
 | Copy the selection's paths | `Ctrl+Shift+C` |
 | Undo the last operation | `Ctrl+Z` |
 | Batch rename | `Ctrl+Shift+R` |
@@ -143,16 +189,17 @@ Bindings follow Windows conventions, with the dual-pane extras on Ctrl+Shift.
 | Refresh | `F5` or `Ctrl+R` |
 | Cut / copy / paste | `Ctrl+X` / `Ctrl+C` / `Ctrl+V` (interoperates with Explorer via `CF_HDROP`) |
 | Copy / move to the next pane | `F6` / `Ctrl+Shift+M` |
-| Move a tab to another pane | drag it there |
+| Move or reorder a tab | drag it to another pane, or past its neighbours |
 | Resize a column | drag its left edge in the header |
 | Delete | `Del` to the Recycle Bin, `Shift+Del` permanently |
-| Rename / new folder | `F2` / `Ctrl+Shift+N` |
+| Rename / new folder | `F2` (in place; `Enter` commits, `Esc` abandons) / `Ctrl+Shift+N` |
 | Filter this pane | `Ctrl+F`, `Esc` to clear |
 | Type-to-select | just start typing a name |
 | Show hidden files | `Ctrl+H` |
-| Toggle sidebar | `Ctrl+B` |
+| Toggle sidebar / inspector | `Ctrl+B` / `Alt+P` |
 | Toggle dark / light | `Ctrl+Shift+D` |
 | Context menu | right-click or `Shift+F10` |
+| Icon view / details | `Ctrl+Shift+I` |
 | Sort | click a column header (Name, Type, Size, Date); click again to reverse |
 | Resize panes | drag the divider, double-click it to even them up |
 
@@ -205,7 +252,7 @@ is unit-tested without a window.
 cargo test
 ```
 
-204 tests, no warnings. They cover path handling and name validation, the
+239 tests, no warnings. They cover path handling and name validation, the
 virtual list and selection model, sorting and filtering, tab and history
 behaviour, session restore, stale-load rejection, layout geometry and
 hit-testing at every pane count, undo inverses, search matching and content
