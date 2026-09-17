@@ -71,9 +71,29 @@ impl Tree {
             if !self.is_expanded(&so_far) {
                 self.toggle(&so_far);
             }
-            so_far = fs::path_join(&so_far, part);
+            let next = fs::path_join(&so_far, part);
+            // Listing skips hidden and reparse children on purpose — otherwise a
+            // junction loops the tree. Reveal still has to walk through them
+            // (AppData is hidden; Temp often sits behind it), so inject the
+            // next hop when the listing left it out.
+            self.ensure_child(&so_far, part, &next);
+            so_far = next;
         }
         so_far
+    }
+
+    /// Make sure `child_path` appears under `parent` in the cached children.
+    fn ensure_child(&mut self, parent: &str, label: &str, child_path: &str) {
+        let key = parent.to_lowercase();
+        let kids = self.children.entry(key).or_default();
+        if kids
+            .iter()
+            .any(|(_, p)| p.eq_ignore_ascii_case(child_path))
+        {
+            return;
+        }
+        kids.push((label.to_string(), child_path.to_string()));
+        kids.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     }
 
     /// Every row on screen, depth-first. `roots` are the top-level paths,

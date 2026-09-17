@@ -35,6 +35,14 @@ pub struct FileEntry {
     /// whose path is `C:\`, and no amount of joining gets there from the
     /// name. Use `child_path` rather than joining by hand.
     pub target: Option<String>,
+    /// This entry's absolute id list, when the shell gave us one.
+    ///
+    /// Filesystem listings leave it None: a path is a complete answer there.
+    /// Namespace items need it because their parsing name is not — a Recycle
+    /// Bin item's parsing name is the path it came from, so binding a context
+    /// menu to that string gets the original file's verbs rather than the
+    /// bin's. The id list is the item itself, and nothing else is.
+    pub pidl: Option<crate::pidl::Pidl>,
 }
 
 /// Where an entry in `dir` leads.
@@ -42,6 +50,19 @@ pub struct FileEntry {
 /// The one place that answers "what is this row's path", so a listing whose
 /// names do not join — the shell namespace — works everywhere at once rather
 /// than at each call site that remembered.
+/// The shell item an entry stands for, for anything that has to talk to the
+/// shell about it: its context menu, its verbs, its properties.
+///
+/// Prefers the id list the listing carried, and falls back to resolving the
+/// path — which is right for every filesystem entry and is all there ever was
+/// before namespace browsing.
+pub fn entry_pidl(dir: &str, entry: &FileEntry) -> Option<crate::pidl::Pidl> {
+    entry
+        .pidl
+        .clone()
+        .or_else(|| crate::pidl::Pidl::from_path(&child_path(dir, entry)))
+}
+
 pub fn child_path(dir: &str, entry: &FileEntry) -> String {
     match &entry.target {
         Some(t) => t.clone(),
@@ -245,6 +266,7 @@ pub fn list_dir(path: &str) -> Result<Vec<FileEntry>, std::io::Error> {
                 dir_size_known: false,
                 extension,
                 target: None,
+                pidl: None,
             });
         }
         if unsafe { FindNextFileW(handle, &mut data) }.is_err() {

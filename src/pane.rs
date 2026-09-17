@@ -381,6 +381,17 @@ impl Pane {
     }
 
     /// The paths of every open tab, for saving the session.
+    /// The selection as shell id lists, for anything that has to ask the shell
+    /// about these items rather than about their paths.
+    pub fn selected_pidls(&self) -> Vec<crate::pidl::Pidl> {
+        let dir = self.current_path();
+        self.list()
+            .selected_entries()
+            .iter()
+            .filter_map(|e| fs::entry_pidl(dir, e))
+            .collect()
+    }
+
     pub fn tab_paths(&self) -> Vec<String> {
         self.tabs
             .iter()
@@ -593,6 +604,7 @@ mod tests {
             dir_size_known: false,
             extension: None,
             target: None,
+            pidl: None,
         }
     }
 

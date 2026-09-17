@@ -1,0 +1,2 @@
+// App icon. ID 1 is what LoadIconW / WM_SETICON look up.
+1 ICON "assets/app.ico"

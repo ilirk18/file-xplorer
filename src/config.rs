@@ -34,7 +34,9 @@ pub struct Config {
     pub theme_dark: bool,
     pub sidebar_visible: bool,
     pub inspector: bool,
-    pub grid: bool,
+    pub command_bar: bool,
+    /// Icon edge in DIPs, or 0 for the details list.
+    pub icons: i32,
     pub show_hidden: bool,
     /// One fraction of the body width per divider. Fractions rather than
     /// pixels so a window resize keeps the panes in proportion; an empty or
@@ -85,7 +87,8 @@ impl Default for Config {
             theme_dark: crate::theme::system_dark(),
             sidebar_visible: true,
             inspector: false,
-            grid: false,
+            command_bar: true,
+            icons: 0,
             show_hidden: false,
             splits: Vec::new(),
             win_x: UNSET,
@@ -175,7 +178,8 @@ impl Config {
              theme_dark={}\n\
              sidebar_visible={}\n\
              inspector={}\n\
-             grid={}\n\
+             command_bar={}\n\
+             icons={}\n\
              show_hidden={}\n\
              splits={}\n\
              win_x={}\n\
@@ -190,7 +194,8 @@ impl Config {
             self.theme_dark,
             self.sidebar_visible,
             self.inspector,
-            self.grid,
+            self.command_bar,
+            self.icons,
             self.show_hidden,
             join_splits(&self.splits),
             self.win_x,
@@ -270,7 +275,16 @@ impl Config {
                     c.sidebar_visible = value.parse().unwrap_or(c.sidebar_visible)
                 }
                 "inspector" => c.inspector = value.parse().unwrap_or(c.inspector),
-                "grid" => c.grid = value.parse().unwrap_or(c.grid),
+                "command_bar" => c.command_bar = value.parse().unwrap_or(c.command_bar),
+                "icons" => c.icons = value.parse().unwrap_or(c.icons),
+                // What the icon view used to be called, when it was on or off
+                // rather than a size. Read so an older settings file still
+                // opens in the view it was left in.
+                "grid" => {
+                    if value.parse().unwrap_or(false) {
+                        c.icons = crate::layout::DEFAULT_ICONS;
+                    }
+                }
                 "show_hidden" => c.show_hidden = value.parse().unwrap_or(c.show_hidden),
                 "splits" => c.splits = parse_splits(value),
                 "win_x" => c.win_x = value.parse().unwrap_or(c.win_x),
@@ -353,7 +367,8 @@ mod tests {
             theme_dark: false,
             sidebar_visible: false,
             inspector: true,
-            grid: true,
+            command_bar: false,
+            icons: 96,
             show_hidden: true,
             splits: vec![0.25, 0.75],
             win_x: -1400,

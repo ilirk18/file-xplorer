@@ -16,6 +16,7 @@ the current state so context is never lost.
 | 5 | [phase-5.md](phase-5.md) | Done | Layout module, sidebar, filter, theming, visual overhaul |
 | 6 | [phase-6.md](phase-6.md) | Done | Palette, search, drag & drop, shell menu, watching, batch rename, settings |
 | 8 | [phase-8.md](phase-8.md) | Done | Themed context menu and tab strip, Ctrl+L, terminal, pins, autosave, tab moving, tree reveal, column resize, content compare, archiving |
+| 9+ | [phase-9-plan.md](phase-9-plan.md) | Planned | Nested layouts, view modes, default manager, and the rest of the File Pilot gap |
 | 7 | [phase-7.md](phase-7.md) | Done | Split `main.rs`, four panes, undo, content search, session restore, Type column, folder tree, archives |
 
 ---
@@ -83,7 +84,7 @@ the current state so context is never lost.
   failures. See [.cursor/rules/phase-tests.mdc](../.cursor/rules/phase-tests.mdc).
 - **Docs**: after each phase add or update `docs/phase-N.md` and this index.
 
-Current: **249 tests, zero warnings** (`cargo test`).
+Current: **260 tests, zero warnings** (`cargo test`).
 
 ---
 

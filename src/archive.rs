@@ -297,6 +297,7 @@ pub fn list(archive: &str, inner: &str) -> Result<Vec<FileEntry>, String> {
                         is_hidden: false,
                         dir_size_known: false,
                         target: None,
+                        pidl: None,
                     });
                 }
             }
@@ -315,6 +316,7 @@ pub fn list(archive: &str, inner: &str) -> Result<Vec<FileEntry>, String> {
             dir_size_known: false,
             extension: None,
             target: None,
+            pidl: None,
         })
         .collect();
     out.append(&mut files);

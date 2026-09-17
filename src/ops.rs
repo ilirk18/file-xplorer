@@ -443,6 +443,16 @@ pub fn paths_from_hdrop(hdrop: HDROP) -> Vec<String> {
 }
 
 /// Read a CF_HDROP file list off the clipboard, with the cut/copy hint.
+/// Whether the clipboard holds files right now.
+///
+/// Asked once per repaint, to decide whether the command bar's Paste is live.
+/// Deliberately not `clipboard_read`: that opens the clipboard, which is a
+/// lock every other app on the machine contends for, and doing it sixty times
+/// a second to grey out a button would be a good way to break somebody's copy.
+pub fn clipboard_has_files() -> bool {
+    unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() }
+}
+
 pub fn clipboard_read(owner: HWND) -> Option<(Vec<String>, DropEffect)> {
     unsafe {
         if !IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() {
