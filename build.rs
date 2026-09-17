@@ -15,7 +15,12 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let manifest = manifest_dir.join("app.manifest");
+    let manifest = match stamp_version(&manifest_dir) {
+        Ok(p) => p,
+        // Shipping a manifest that says the wrong version is worse than not
+        // building: the number is what a bug report will quote back at you.
+        Err(e) => panic!("stamping the manifest version failed: {e}"),
+    };
     // MSVC linker: /MANIFEST:EMBED consumes the input manifest.
     println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
     println!(
@@ -28,6 +33,59 @@ fn main() {
         // the build so the gap is obvious.
         panic!("embedding the app icon failed: {e}");
     }
+}
+
+/// Copy `app.manifest` into OUT_DIR with its version taken from Cargo.toml.
+///
+/// The assembly identity wants four parts where a crate version has three, so
+/// the fourth is always zero. Doing it here means the version lives in exactly
+/// one file — a manifest still saying 0.2.0 inside a 0.3.0 build is the kind of
+/// drift nobody notices until somebody quotes it back in a bug report.
+fn stamp_version(manifest_dir: &Path) -> Result<PathBuf, String> {
+    let src = manifest_dir.join("app.manifest");
+    let text = std::fs::read_to_string(&src).map_err(|e| format!("reading app.manifest: {e}"))?;
+    let version = format!(
+        "{}.0",
+        std::env::var("CARGO_PKG_VERSION").map_err(|e| e.to_string())?
+    );
+
+    // The first win32 identity and no other. A manifest names the assembly
+    // itself before it names anything it depends on, so the first one is ours;
+    // the Common Controls dependency below it is an `assemblyIdentity
+    // type="win32"` too, and today it is only spared because its version sits
+    // on the following line.
+    let mut found = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let identity = (!found)
+            .then(|| line.find(r#"<assemblyIdentity type="win32""#))
+            .flatten();
+        match identity.and(attr_span(line)) {
+            Some((start, end)) => {
+                found = true;
+                out.push_str(&line[..start]);
+                out.push_str(&version);
+                out.push_str(&line[end..]);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    if !found {
+        return Err("no win32 assemblyIdentity with a version= attribute".into());
+    }
+
+    let dest = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?)
+        .join("app.manifest");
+    std::fs::write(&dest, out).map_err(|e| format!("writing {}: {e}", dest.display()))?;
+    Ok(dest)
+}
+
+/// The bounds of the value inside the first `version="..."` on a line.
+fn attr_span(line: &str) -> Option<(usize, usize)> {
+    let start = line.find(r#"version=""#)? + r#"version=""#.len();
+    let end = start + line[start..].find('"')?;
+    Some((start, end))
 }
 
 fn embed_icon(manifest_dir: &Path) -> Result<(), String> {
