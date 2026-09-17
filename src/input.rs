@@ -55,11 +55,6 @@ pub fn on_dropped(state: &mut AppState, hwnd: HWND, dropped: dnd::Dropped) {
     }
 
     state.focused = pid;
-    state.status_override = Some(if dropped.move_it {
-        "Moving\u{2026}".into()
-    } else {
-        "Copying\u{2026}".to_string()
-    });
     let op = if dropped.move_it {
         ops::Op::Move {
             sources: dropped.paths,
@@ -71,7 +66,7 @@ pub fn on_dropped(state: &mut AppState, hwnd: HWND, dropped: dnd::Dropped) {
             dest_dir: dest,
         }
     };
-    spawn_op(hwnd, op);
+    spawn_transfer(state, hwnd, op);
 }
 
 pub fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
@@ -140,6 +135,13 @@ pub fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             return;
         }
         Drag::None => {}
+    }
+
+    // A tab being dragged wants the cursor every time it moves: the drop
+    // target is drawn from it.
+    if let Some(drag) = &mut state.tab_drag {
+        drag.cursor = (x, y);
+        invalidate(hwnd);
     }
 
     // Past the threshold with the button down on a selected row: start a drag.
@@ -242,14 +244,19 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             start_load(hwnd, pid, req);
             // Switching happens now; moving the tab, if the mouse travels far
             // enough before it comes up, happens on the button up.
-            state.tab_drag = Some((pid, i, x, y));
+            state.tab_drag = Some(crate::app::TabDrag {
+                from: pid,
+                index: i,
+                origin: (x, y),
+                cursor: (x, y),
+            });
+            // Captured so the button-up arrives even if it happens outside the
+            // window: without it a drag released over another app leaves the
+            // drop highlight on screen with nothing to end it.
+            unsafe { SetCapture(hwnd) };
         }
 
-        Hit::TabClose(pid, i) => {
-            state.focused = pid;
-            let req = state.pane_mut(pid).close_tab(i, FALLBACK_PATH);
-            start_load(hwnd, pid, req);
-        }
+        Hit::TabClose(pid, i) => close_tab(state, hwnd, pid, i),
 
         Hit::NewTab(pid) => {
             state.focused = pid;
@@ -458,7 +465,93 @@ pub fn activate_selection(state: &mut AppState, hwnd: HWND, pid: PaneId) {
 // Keyboard
 // ---------------------------------------------------------------------------
 
+/// Keys while several names are being typed over at once.
+///
+/// It owns every editing key, because a caret in twenty rows is still a caret
+/// and Backspace has to mean Backspace. Everything it does not claim falls
+/// through, so F5 still refreshes.
+fn multi_rename_key(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
+    use crate::multi_rename::Move;
+    if state.multi_rename.is_none() {
+        return false;
+    }
+    let shift = shift_down();
+    let ctrl = ctrl_down();
+    let claimed = {
+        let Some(m) = state.multi_rename.as_mut() else {
+            return false;
+        };
+        match vk {
+            VK_BACK => {
+                m.backspace();
+                true
+            }
+            VK_DELETE => {
+                m.delete();
+                true
+            }
+            VK_LEFT => {
+                m.move_caret(Move::Left, shift);
+                true
+            }
+            VK_RIGHT => {
+                m.move_caret(Move::Right, shift);
+                true
+            }
+            VK_HOME => {
+                m.move_caret(Move::Home, shift);
+                true
+            }
+            VK_END => {
+                m.move_caret(Move::End, shift);
+                true
+            }
+            // Ctrl+A is select-all inside the editor, not in the listing.
+            VK_A if ctrl => {
+                m.select_all();
+                true
+            }
+            VK_C if ctrl => {
+                let text = m.selected_text();
+                if !text.is_empty() {
+                    let _ = crate::ops::clipboard_write_text(hwnd, &text);
+                }
+                true
+            }
+            _ => false,
+        }
+    };
+    if claimed {
+        invalidate(hwnd);
+        return true;
+    }
+    // Paste reads the clipboard, which needs the window, so it cannot happen
+    // while the editor is borrowed.
+    if vk == VK_V && ctrl {
+        let text = crate::ops::clipboard_read_text(hwnd);
+        if let (Some(text), Some(m)) = (text, state.multi_rename.as_mut()) {
+            m.insert(text.lines().next().unwrap_or_default());
+            invalidate(hwnd);
+        }
+        return true;
+    }
+    match vk {
+        VK_RETURN => {
+            crate::commands::finish_multi_rename(state, hwnd, true);
+            true
+        }
+        VK_ESCAPE => {
+            crate::commands::finish_multi_rename(state, hwnd, false);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
+    if multi_rename_key(state, hwnd, vk) {
+        return true;
+    }
     // While the footer filter has focus it owns editing keys; everything else
     // still falls through to the normal bindings.
     if let Some(fside) = state.filter_focus {
@@ -610,8 +703,8 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
                     spawn_dir_load(hwnd, pid, req);
                 }
                 (true, false, 'W') => {
-                    let req = state.pane_mut(pid).close_active_tab(FALLBACK_PATH);
-                    start_load(hwnd, pid, req);
+                    let i = state.pane(pid).active_tab_index;
+                    close_tab(state, hwnd, pid, i);
                 }
                 (true, false, 'Z') => do_undo(state, hwnd),
                 (true, false, 'L') => do_goto(state, hwnd),
@@ -697,6 +790,29 @@ pub fn toggle_hidden(state: &mut AppState, hwnd: HWND) {
         p.set_show_hidden(show);
     }
     invalidate(hwnd);
+}
+
+/// Close one tab — or the pane, when it was that pane's last tab.
+///
+/// A pane showing a single tab has nothing to close *to*, and resetting it to
+/// the fallback path reads, from the X on the tab, as the button doing nothing
+/// at all. The window's last pane keeps its tab: a window with no panes is not
+/// a view.
+pub fn close_tab(state: &mut AppState, hwnd: HWND, pid: PaneId, index: usize) {
+    state.focused = pid;
+    if state.pane(pid).tabs.len() == 1 {
+        // The pane goes; the last pane of all takes the window with it, the
+        // way a browser closing its last tab does. Posted rather than called
+        // so this handler finishes first.
+        if !state.close_pane(pid) {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+        return;
+    }
+    let req = state.pane_mut(pid).close_tab(index);
+    start_load(hwnd, pid, req);
 }
 
 /// Show `n` panes side by side.

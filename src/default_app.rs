@@ -28,9 +28,7 @@ const CLASSES: &[&str] = &["Directory", "Drive", "Folder"];
 /// loses the ability to restore and nothing else.
 const BACKUP_KEY: &str = r"Software\FileXplorer\PreviousOpenCommand";
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::fs::wide;
 
 fn class_key(class: &str) -> String {
     format!(r"Software\Classes\{}\shell\open\command", class)
@@ -80,16 +78,22 @@ pub fn restore_action(saved: Option<String>) -> Restore {
 // The registry itself
 // ---------------------------------------------------------------------------
 
-/// Read a key's default value, or None when the key is not there.
-fn read_default(subkey: &str) -> Option<String> {
+/// Read a value under a key, or None when neither is there. `None` for the
+/// name means the key's default value, the same split `write_value` uses.
+fn read_value(subkey: &str, name: Option<&str>) -> Option<String> {
     let key = wide(subkey);
+    let name_w = name.map(wide);
+    let name_p = match &name_w {
+        Some(n) => PCWSTR::from_raw(n.as_ptr()),
+        None => PCWSTR::null(),
+    };
     let mut size: u32 = 0;
     unsafe {
         // Asked twice: once for the size, once for the text.
         RegGetValueW(
             HKEY_CURRENT_USER,
             PCWSTR::from_raw(key.as_ptr()),
-            PCWSTR::null(),
+            name_p,
             RRF_RT_REG_SZ,
             None,
             None,
@@ -101,7 +105,7 @@ fn read_default(subkey: &str) -> Option<String> {
         RegGetValueW(
             HKEY_CURRENT_USER,
             PCWSTR::from_raw(key.as_ptr()),
-            PCWSTR::null(),
+            name_p,
             RRF_RT_REG_SZ,
             None,
             Some(buf.as_mut_ptr() as *mut _),
@@ -138,39 +142,6 @@ fn write_value(subkey: &str, name: Option<&str>, value: &str) -> Result<(), Stri
         )
     };
     status.ok().map_err(|e| format!("{}: {}", subkey, e.message()))
-}
-
-fn read_value(subkey: &str, name: &str) -> Option<String> {
-    let key = wide(subkey);
-    let name_w = wide(name);
-    let mut size: u32 = 0;
-    unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(key.as_ptr()),
-            PCWSTR::from_raw(name_w.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            None,
-            Some(&mut size),
-        )
-        .ok()
-        .ok()?;
-        let mut buf = vec![0u16; (size as usize).div_ceil(2) + 1];
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(key.as_ptr()),
-            PCWSTR::from_raw(name_w.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            Some(buf.as_mut_ptr() as *mut _),
-            Some(&mut size),
-        )
-        .ok()
-        .ok()?;
-        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        Some(String::from_utf16_lossy(&buf[..end]))
-    }
 }
 
 /// Remove a key and everything under it. Only ever aimed at our own key.
@@ -259,7 +230,7 @@ pub fn exe_path() -> Result<String, String> {
 /// Whether folders currently open in this app.
 pub fn is_default() -> bool {
     match exe_path() {
-        Ok(exe) => read_default(&class_key("Directory"))
+        Ok(exe) => read_value(&class_key("Directory"), None)
             .map(|c| points_at(&c, &exe))
             .unwrap_or(false),
         Err(_) => false,
@@ -277,10 +248,10 @@ pub fn make_default() -> Result<(), String> {
 
     for class in CLASSES {
         let key = class_key(class);
-        let before = read_default(&key).unwrap_or_default();
+        let before = read_value(&key, None).unwrap_or_default();
         // "" means there was nothing here, which restore reads as "take ours
         // away". Never record our own command as the thing to go back to.
-        if read_value(BACKUP_KEY, class).is_none() {
+        if read_value(BACKUP_KEY, Some(class)).is_none() {
             let record = if points_at(&before, &exe) {
                 String::new()
             } else {
@@ -298,7 +269,7 @@ pub fn make_default() -> Result<(), String> {
 pub fn restore() -> Result<(), String> {
     let mut failed: Vec<String> = Vec::new();
     for class in CLASSES {
-        match restore_action(read_value(BACKUP_KEY, class)) {
+        match restore_action(read_value(BACKUP_KEY, Some(class))) {
             Restore::Put(cmd) => {
                 if let Err(e) = write_default(&class_key(class), &cmd) {
                     failed.push(e);
@@ -344,17 +315,17 @@ mod tests {
         // failure in either direction is somebody's default file manager
         // stuck.
         const SCRATCH: &str = r"Software\FileXplorer\SelfTest";
-        assert_eq!(read_default(SCRATCH), None, "left over from a failed run");
+        assert_eq!(read_value(SCRATCH, None), None, "left over from a failed run");
 
         write_default(SCRATCH, "a command").expect("creates the key");
-        assert_eq!(read_default(SCRATCH).as_deref(), Some("a command"));
+        assert_eq!(read_value(SCRATCH, None).as_deref(), Some("a command"));
 
         write_value(SCRATCH, Some("Directory"), "").expect("an empty value too");
-        assert_eq!(read_value(SCRATCH, "Directory").as_deref(), Some(""));
-        assert_eq!(read_value(SCRATCH, "never written"), None);
+        assert_eq!(read_value(SCRATCH, Some("Directory")).as_deref(), Some(""));
+        assert_eq!(read_value(SCRATCH, Some("never written")), None);
         // Which is the distinction restore turns on.
         assert_eq!(
-            restore_action(read_value(SCRATCH, "Directory")),
+            restore_action(read_value(SCRATCH, Some("Directory"))),
             Restore::Remove
         );
 
@@ -363,13 +334,13 @@ mod tests {
         delete_default_value(SCRATCH);
         delete_if_empty(SCRATCH);
         assert_eq!(
-            read_value(SCRATCH, "Directory").as_deref(),
+            read_value(SCRATCH, Some("Directory")).as_deref(),
             Some(""),
             "not empty, so not deleted"
         );
 
         delete_tree(SCRATCH);
-        assert_eq!(read_default(SCRATCH), None, "and it is gone");
+        assert_eq!(read_value(SCRATCH, None), None, "and it is gone");
 
         // The parent goes only if it is empty; a real backup living there
         // makes this fail, which is what should happen.

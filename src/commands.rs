@@ -80,6 +80,8 @@ pub const CMD_MAP_DRIVE: usize = 159;
 pub const CMD_DISCONNECT_DRIVE: usize = 160;
 pub const CMD_FOLDER_SIZES: usize = 161;
 pub const CMD_SETTINGS: usize = 162;
+pub const CMD_SAVE_LAYOUT: usize = 163;
+pub const CMD_LAYOUTS: usize = 164;
 
 /// Everything the palette can reach. The context menu builds from the same
 /// list, so a command is described in exactly one place.
@@ -158,6 +160,8 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_DISCONNECT_DRIVE, label: "Disconnect a network drive\u{2026}", keys: "" },
     CommandDef { id: CMD_FOLDER_SIZES, label: "Toggle automatic folder sizes", keys: "" },
     CommandDef { id: CMD_SETTINGS, label: "Settings", keys: "Ctrl+Comma" },
+    CommandDef { id: CMD_SAVE_LAYOUT, label: "Save this layout\u{2026}", keys: "" },
+    CommandDef { id: CMD_LAYOUTS, label: "Switch to a saved layout\u{2026}", keys: "" },
 ];
 
 /// Rename the selection from a pattern, previewed before anything happens.
@@ -336,6 +340,9 @@ const SORT_FIRST: usize = 9000;
 const ORDER_ASC: usize = 9100;
 const ORDER_DESC: usize = 9101;
 const ICON_FIRST: usize = 9200;
+/// The two views that are a size *and* a side, so they are not in that run.
+const ICON_LIST: usize = 9290;
+const ICON_TILES: usize = 9291;
 /// `BAR_FIRST + index` reopens a bar button from the settings menu, which is
 /// how a hidden *Sort* still drops its own menu rather than doing nothing.
 const BAR_FIRST: usize = 9300;
@@ -345,6 +352,9 @@ const BAR_FIRST: usize = 9300;
 const THEME_FIRST: usize = 9400;
 const TEXT_FIRST: usize = 9500;
 const DENSITY_FIRST: usize = 9600;
+/// The menu inside a multi-row rename. Its own block, claimed before any
+/// other because it is the highest.
+const RENAME_FIRST: usize = 9700;
 
 /// Drop a menu under a bar button, using the same themed menu as the context
 /// menu so it looks like part of the app rather than part of Windows.
@@ -415,6 +425,20 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
                     ICON_FIRST,
                     &format!("{}Details", tick(icons == ICONS_OFF)),
                     &binds.text_for(CMD_GRID),
+                );
+                // List and Tiles are the same grid with the name beside the
+                // icon, so they tick for any size on that side of zero.
+                themed.add(
+                    menu,
+                    ICON_LIST,
+                    &format!("{}List", tick(crate::layout::beside(icons) && icons > -48)),
+                    "",
+                );
+                themed.add(
+                    menu,
+                    ICON_TILES,
+                    &format!("{}Tiles", tick(crate::layout::beside(icons) && icons <= -48)),
+                    "",
                 );
                 themed.separator(menu);
                 for (i, size) in ICON_STEPS.iter().enumerate() {
@@ -588,6 +612,14 @@ fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layou
             // A button that did not fit, run from the overflow menu. Menus
             // reopen under the overflow button, which is where the click was.
             do_bar(state, hwnd, id - BAR_FIRST, rect);
+        } else if id == ICON_LIST || id == ICON_TILES {
+            state.icons = if id == ICON_LIST {
+                crate::layout::LIST
+            } else {
+                crate::layout::TILES
+            };
+            state.remember_current_view();
+            state.sync_columns();
         } else if id >= ICON_FIRST {
             let step = id - ICON_FIRST;
             state.icons = if step == 0 {
@@ -743,11 +775,13 @@ pub fn do_font(state: &mut AppState, hwnd: HWND) {
             } else {
                 String::new()
             },
+            icon: None,
+            bitmap: None,
         })
         .collect();
 
     state.modal = true;
-    let chosen = palette::pick(hwnd, state.dpi, "Font", items);
+    let chosen = palette::pick(hwnd, state.dpi, state.theme, "Font", items);
     state.modal = false;
 
     if let Some(i) = chosen {
@@ -771,11 +805,13 @@ pub fn do_font_size(state: &mut AppState, hwnd: HWND) {
                 (_, true) => "default".into(),
                 _ => String::new(),
             },
+            icon: None,
+            bitmap: None,
         })
         .collect();
 
     state.modal = true;
-    let chosen = palette::pick(hwnd, state.dpi, "Text size", items);
+    let chosen = palette::pick(hwnd, state.dpi, state.theme, "Text size", items);
     state.modal = false;
 
     if let Some(i) = chosen {
@@ -799,11 +835,13 @@ pub fn do_density(state: &mut AppState, hwnd: HWND) {
             } else {
                 format!("{}%", pct)
             },
+            icon: None,
+            bitmap: None,
         })
         .collect();
 
     state.modal = true;
-    let chosen = palette::pick(hwnd, state.dpi, "Row density", items);
+    let chosen = palette::pick(hwnd, state.dpi, state.theme, "Row density", items);
     state.modal = false;
 
     if let Some(i) = chosen {
@@ -830,16 +868,173 @@ pub fn do_theme(state: &mut AppState, hwnd: HWND) {
                 (_, true) => "dark".into(),
                 (_, false) => "light".into(),
             },
+            icon: None,
+            bitmap: None,
         })
         .collect();
 
     state.modal = true;
-    let chosen = palette::pick(hwnd, state.dpi, "Theme", items);
+    let chosen = palette::pick(hwnd, state.dpi, state.theme, "Theme", items);
     state.modal = false;
 
     if let Some(i) = chosen {
         crate::input::set_theme(state, hwnd, Theme::at(i));
     }
+}
+
+/// Remember the pane tree under a name. Saving over a name replaces it: two
+/// layouts called the same thing is the shape of a bug, not a feature.
+pub fn do_save_layout(state: &mut AppState, hwnd: HWND) {
+    let suggested = format!("Layout {}", state.saved_layouts.len() + 1);
+    let Some(name) = crate::prompt::prompt_text(hwnd, state, "Save layout", "Name:", &suggested)
+    else {
+        return;
+    };
+    // "=" is the settings file's own separator and the name is written before
+    // the tree, so a name carrying one would read back as a shorter name and
+    // a tree nobody can parse.
+    let name = name.trim().replace('=', "-");
+    if name.is_empty() {
+        return;
+    }
+    let tree = crate::config::tree_to_text(&state.layout_tree);
+    match state
+        .saved_layouts
+        .iter_mut()
+        .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+    {
+        Some(slot) => slot.1 = tree,
+        None => state.saved_layouts.push((name.clone(), tree)),
+    }
+    state.status_override = Some(format!("Layout saved as {}", name));
+}
+
+/// Pick one of them and show it.
+pub fn do_layouts(state: &mut AppState, hwnd: HWND) {
+    if state.modal {
+        return;
+    }
+    if state.saved_layouts.is_empty() {
+        state.status_override = Some("No layouts saved yet".into());
+        return;
+    }
+    let here = crate::config::tree_to_text(&state.layout_tree);
+    let items: Vec<palette::Item> = state
+        .saved_layouts
+        .iter()
+        .map(|(name, tree)| palette::Item {
+            label: name.clone(),
+            detail: if *tree == here {
+                "current".into()
+            } else {
+                let panes = crate::config::tree_checked(tree).map(|n| n.count()).unwrap_or(0);
+                format!("{} panes", panes)
+            },
+            icon: None,
+            bitmap: None,
+        })
+        .collect();
+
+    state.modal = true;
+    let chosen = palette::pick(hwnd, state.dpi, state.theme, "Layouts", items);
+    state.modal = false;
+
+    let Some(tree) = chosen
+        .and_then(|i| state.saved_layouts.get(i))
+        .and_then(|(_, tree)| crate::config::tree_checked(tree))
+    else {
+        return;
+    };
+    state.set_layout(tree);
+}
+
+/// The menu inside a multi-row rename.
+///
+/// Editing commands, then the three things that differ per row \u2014 a number,
+/// a date, the file's own date. They go in expanded rather than as a token, so
+/// each row shows what it will be called.
+pub fn multi_rename_menu(state: &mut AppState, hwnd: HWND, at: POINT) {
+    const COPY: usize = RENAME_FIRST;
+    const PASTE: usize = RENAME_FIRST + 1;
+    const ALL: usize = RENAME_FIRST + 2;
+    const STEM: usize = RENAME_FIRST + 3;
+    const NUMBER: usize = RENAME_FIRST + 4;
+    const TODAY: usize = RENAME_FIRST + 5;
+    const FILE_DATE: usize = RENAME_FIRST + 6;
+
+    if state.multi_rename.is_none() {
+        return;
+    }
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let mut themed = crate::menu::ThemedMenu::new(state.theme, state.dpi);
+        themed.add(menu, COPY, "Copy", "Ctrl+C");
+        themed.add(menu, PASTE, "Paste", "Ctrl+V");
+        themed.add(menu, ALL, "Select all", "Ctrl+A");
+        themed.add(menu, STEM, "Select name without extension", "");
+        themed.separator(menu);
+        themed.add(menu, NUMBER, "Insert number", "");
+        themed.add(menu, TODAY, "Insert today's date", "");
+        themed.add(menu, FILE_DATE, "Insert file date", "");
+        themed.apply(menu);
+
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+            at.x,
+            at.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+
+        let pasted = (cmd.0 as usize == PASTE)
+            .then(|| ops::clipboard_read_text(hwnd))
+            .flatten();
+        let Some(m) = state.multi_rename.as_mut() else {
+            return;
+        };
+        match cmd.0 as usize {
+            COPY => {
+                let text = m.selected_text();
+                if !text.is_empty() {
+                    let _ = ops::clipboard_write_text(hwnd, &text);
+                }
+            }
+            PASTE => {
+                if let Some(text) = pasted {
+                    // One line only: a name cannot contain a newline, and a
+                    // multi-line paste is almost always an accident.
+                    let line = text.lines().next().unwrap_or_default().to_string();
+                    m.insert(&line);
+                }
+            }
+            ALL => m.select_all(),
+            STEM => m.select_stem(),
+            NUMBER => m.insert_token("{##}"),
+            TODAY => {
+                let today = today_text();
+                m.insert(&today);
+            }
+            FILE_DATE => m.insert_token("{d}"),
+            _ => {}
+        }
+        invalidate(hwnd);
+    }
+}
+
+/// Today, as `YYYY-MM-DD`, from the same formatter the listing's dates use.
+fn today_text() -> String {
+    let ft = unsafe { windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime() };
+    // The listing keeps its times as one number, which is what the formatter
+    // takes; a FILETIME is that number in two halves.
+    let ticks = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+    fs::format_filetime(ticks)
+        .split(' ')
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Take over opening folders, or hand it back.
@@ -957,9 +1152,10 @@ pub fn do_actions(state: &mut AppState, hwnd: HWND, pin: bool) {
         // command range, so the object that allocated it has to invoke it.
         let shell = shellmenu::append(menu, hwnd, &selected);
         let actions = shellmenu::list(menu);
-        let _ = DestroyMenu(menu);
-
+        // The menu stays until the picker is gone: the little bitmaps beside
+        // the rows belong to it, and destroying it takes them away.
         if actions.is_empty() {
+            let _ = DestroyMenu(menu);
             state.status_override = Some("The shell offered nothing here".into());
             return;
         }
@@ -976,13 +1172,24 @@ pub fn do_actions(state: &mut AppState, hwnd: HWND, pin: bool) {
                 } else {
                     String::new()
                 },
-            })
+                icon: None,
+                bitmap: a.bitmap,
+                })
             .collect();
 
-        let title = if pin { "Pin an action" } else { "Actions" };
         state.modal = true;
-        let chosen = palette::pick(hwnd, state.dpi, title, items);
+        // Running one opens where the pointer is, the way the menu it came
+        // from did. Pinning is a different question about the same list, and
+        // a question needs the title only the centred box has room for.
+        let chosen = if pin {
+            palette::pick(hwnd, state.dpi, state.theme, "Pin an action", items)
+        } else {
+            let mut at = POINT::default();
+            let _ = GetCursorPos(&mut at);
+            palette::pick_at(hwnd, state.dpi, state.theme, items, (at.x, at.y))
+        };
         state.modal = false;
+        let _ = DestroyMenu(menu);
 
         let Some(i) = chosen else { return };
         let action = &actions[i];
@@ -1021,7 +1228,9 @@ pub fn show_palette(state: &mut AppState, hwnd: HWND) {
                 palette::Item {
                     label: c.label.to_string(),
                     detail: state.bindings.text_for(c.id),
-                },
+                    icon: None,
+                    bitmap: None,
+                        },
             )
         })
         .collect();
@@ -1029,7 +1238,7 @@ pub fn show_palette(state: &mut AppState, hwnd: HWND) {
     let items: Vec<palette::Item> = items.into_iter().map(|(_, it)| it).collect();
 
     state.modal = true;
-    let chosen = palette::pick(hwnd, state.dpi, "Commands", items);
+    let chosen = palette::pick(hwnd, state.dpi, state.theme, "Commands", items);
     state.modal = false;
 
     if let Some(i) = chosen {
@@ -1266,6 +1475,38 @@ pub fn do_goto(state: &mut AppState, hwnd: HWND) {
     spawn_dir_load(hwnd, pid, req);
 }
 
+/// Finish a multi-row rename. `commit` applies every changed name as one
+/// operation, so one undo puts all of them back.
+///
+/// A name that cannot exist stops the whole batch and leaves the editor open:
+/// half a rename applied is worse than none of it, and the row that is wrong
+/// is still on screen to be fixed.
+pub fn finish_multi_rename(state: &mut AppState, hwnd: HWND, commit: bool) {
+    let Some(editor) = state.multi_rename.take() else {
+        return;
+    };
+    invalidate(hwnd);
+    if !commit {
+        return;
+    }
+    let dir = state.pane(editor.pid).current_path().to_string();
+    match editor.plan() {
+        Ok(plan) if plan.is_empty() => {}
+        Ok(plan) => {
+            let items = plan
+                .into_iter()
+                .map(|(old, new)| (fs::path_join(&dir, &old), new))
+                .collect();
+            state.status_override = Some("Renaming\u{2026}".into());
+            spawn_op(hwnd, ops::Op::RenameMany { items });
+        }
+        Err(why) => {
+            report_error(hwnd, "Rename", &why);
+            state.multi_rename = Some(editor);
+        }
+    }
+}
+
 /// Finish an inline rename: `commit` applies what was typed, otherwise the
 /// name is left alone. Either way the editor goes.
 ///
@@ -1314,11 +1555,13 @@ pub fn do_bind(state: &mut AppState, hwnd: HWND) {
         .map(|c| palette::Item {
             label: c.label.to_string(),
             detail: state.bindings.text_for(c.id),
+            icon: None,
+            bitmap: None,
         })
         .collect();
 
     state.modal = true;
-    let chosen = palette::pick(hwnd, state.dpi, "Change a shortcut", items);
+    let chosen = palette::pick(hwnd, state.dpi, state.theme, "Change a shortcut", items);
     state.modal = false;
     let Some(i) = chosen else { return };
     let id = COMMANDS[i].id;
@@ -1437,11 +1680,13 @@ pub fn do_places(state: &mut AppState, hwnd: HWND) {
         .map(|(label, path)| palette::Item {
             label,
             detail: path,
+            icon: None,
+            bitmap: None,
         })
         .collect();
 
     state.modal = true;
-    let chosen = palette::pick(hwnd, state.dpi, "Go to", items);
+    let chosen = palette::pick(hwnd, state.dpi, state.theme, "Go to", items);
     state.modal = false;
 
     if let Some(i) = chosen {
@@ -1652,8 +1897,7 @@ pub fn do_paste(state: &mut AppState, hwnd: HWND) {
             dest_dir: dest,
         },
     };
-    state.status_override = Some("Pasting\u{2026}".into());
-    spawn_op(hwnd, op);
+    spawn_transfer(state, hwnd, op);
 }
 
 pub fn copy_or_move_to_other(state: &mut AppState, hwnd: HWND, move_it: bool) {
@@ -1680,8 +1924,7 @@ pub fn copy_or_move_to_other(state: &mut AppState, hwnd: HWND, move_it: bool) {
             dest_dir: dest,
         }
     };
-    state.status_override = Some(if move_it { "Moving\u{2026}".into() } else { "Copying\u{2026}".to_string() });
-    spawn_op(hwnd, op);
+    spawn_transfer(state, hwnd, op);
 }
 
 pub fn do_delete(state: &mut AppState, hwnd: HWND, permanent: bool) {
@@ -1698,6 +1941,23 @@ pub fn do_delete(state: &mut AppState, hwnd: HWND, permanent: bool) {
 
 pub fn do_rename(state: &mut AppState, hwnd: HWND) {
     let pid = state.focused;
+    // More than one selected: type over all of them at once, in place.
+    if !state.modal && state.pane(pid).list().selection_count() > 1 {
+        let mut rows: Vec<u32> = state
+            .pane(pid)
+            .list()
+            .selected_set()
+            .iter()
+            .copied()
+            .collect();
+        rows.sort_unstable();
+        let entries = state.pane(pid).list().entries.clone();
+        state.multi_rename = crate::multi_rename::MultiRename::begin(rows, pid, &entries);
+        if state.multi_rename.is_some() {
+            invalidate(hwnd);
+            return;
+        }
+    }
     let pane = state.pane(pid);
     let Some(entry) = pane.list().cursor_entry() else {
         return;
@@ -1761,6 +2021,17 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
         x: screen_x,
         y: screen_y,
     };
+    // A rename in progress owns the right-click: the file commands would act
+    // on names that are being typed and do not exist yet.
+    if state.multi_rename.is_some() {
+        if screen_x == -1 && screen_y == -1 {
+            unsafe {
+                let _ = GetCursorPos(&mut pt);
+            }
+        }
+        multi_rename_menu(state, hwnd, pt);
+        return;
+    }
     // Shift+F10 sends (-1, -1). Anchor to the cursor row — which is what the
     // keyboard is pointing at — rather than to wherever the mouse happens to
     // be sitting, which may be over another pane, the sidebar, or nothing.
@@ -1835,17 +2106,18 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
     let writable = !in_archive && !crate::shellns::is_shell_path(&here);
     let pinned = state.is_pinned(state.pane(pid).current_path());
 
+    // Our own commands, then everything installed software registered, with
+    // the shell's own submenus left as submenus. A verb buried three menus
+    // deep is still hard to point at, which is what *Search actions...* is
+    // for: the flat, typeable list of the same menu.
+    let binds = state.bindings.clone();
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let mut themed = crate::menu::ThemedMenu::new(state.theme, state.dpi);
         // A macro rather than a closure: a closure would hold `themed`
-        // borrowed for the whole block, and the separators need it too.
-        // Cloned so the menu can be built while `state` is borrowed elsewhere;
-        // a few dozen entries per right-click is nothing.
-        let binds = state.bindings.clone();
-        // The shortcut shown is whatever is bound now. Written out beside each
-        // entry it would be a second copy of the binding, free to drift from
-        // the one that actually fires.
+        // borrowed for the whole block, and the separators need it too. The
+        // shortcut shown is whatever is bound now, rather than a second copy
+        // of the binding free to drift from the one that fires.
         macro_rules! add {
             ($cond:expr, $id:expr, $text:expr) => {
                 if $cond {
@@ -1864,27 +2136,35 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
             add!(true, CMD_COPY, "Copy");
             add!(true, CMD_COPY_PATH, "Copy path");
             add!(state.pane_count() > 1, CMD_COPY_TO_OTHER, "Copy to next pane");
-            add!(state.pane_count() > 1 && writable, CMD_MOVE_TO_OTHER, "Move to next pane");
+            add!(
+                state.pane_count() > 1 && writable,
+                CMD_MOVE_TO_OTHER,
+                "Move to next pane"
+            );
             add!(in_archive, CMD_EXTRACT, "Extract here");
             add!(writable && !in_archive, CMD_ARCHIVE, "Add to archive\u{2026}");
             themed.separator(menu);
             add!(writable && count == 1, CMD_RENAME, "Rename");
-            add!(writable && count > 1, CMD_BATCH_RENAME, "Rename all");
+            add!(writable && count > 1, CMD_BATCH_RENAME, "Rename with a pattern");
             add!(writable, CMD_DELETE, "Delete");
             themed.separator(menu);
+            add!(count > 0, CMD_SHARE, "Share");
             add!(true, CMD_ACTIONS, "Search actions\u{2026}");
             add!(count == 1, CMD_PROPERTIES, "Properties");
         } else {
             // What this folder can do. Everything else lives in the palette,
             // which is one line further down and searchable.
             add!(writable, CMD_NEW_FOLDER, "New folder");
-            let can_paste = writable && ops::clipboard_read(hwnd).is_some();
-            add!(can_paste, CMD_PASTE, "Paste");
+            add!(writable && ops::clipboard_has_files(), CMD_PASTE, "Paste");
             add!(in_archive, CMD_EXTRACT, "Extract all");
             themed.separator(menu);
             add!(true, CMD_GOTO, "Go to path\u{2026}");
             add!(true, CMD_TERMINAL, "Open terminal here");
-            add!(true, CMD_PIN, if pinned { "Unpin this folder" } else { "Pin this folder" });
+            add!(
+                true,
+                CMD_PIN,
+                if pinned { "Unpin this folder" } else { "Pin this folder" }
+            );
             add!(true, CMD_REVEAL, "Show in tree");
             themed.separator(menu);
             add!(true, CMD_SEARCH, "Search here");
@@ -1903,10 +2183,13 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
             Vec::new()
         };
         let shell = shellmenu::append(menu, hwnd, &selected);
+        // The shell's half arrives in the system's colours. Take it over, so
+        // the menu is one menu rather than two halves of different ones.
+        crate::menu::adopt(menu);
 
         // Pinned verbs go above our own items: reading down to find them is
         // the problem pinning exists to solve. They keep the shell's id, so
-        // the dispatch below cannot tell the two copies apart — which is the
+        // the dispatch below cannot tell the two copies apart, which is the
         // point.
         if shell.is_some() && !state.pin_actions.is_empty() {
             let offered = shellmenu::list(menu);
@@ -1934,6 +2217,9 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
         let _ = DestroyMenu(menu);
 
         let id = cmd.0 as u32;
+        if id == 0 {
+            return; // dismissed
+        }
         if id >= shellmenu::SHELL_ID_FIRST {
             if let Some(shell) = &shell {
                 shell.invoke(hwnd, id);
@@ -1942,7 +2228,7 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
             let req = state.pane_mut(pid).refresh();
             start_load(hwnd, pid, req);
         } else {
-            run_command(state, hwnd, cmd.0 as usize);
+            run_command(state, hwnd, id as usize);
         }
     }
 }
@@ -2037,6 +2323,8 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_BATCH_RENAME => do_batch_rename(state, hwnd),
         CMD_TOGGLE_THEME => toggle_theme(state, hwnd),
         CMD_THEME => do_theme(state, hwnd),
+        CMD_SAVE_LAYOUT => do_save_layout(state, hwnd),
+        CMD_LAYOUTS => do_layouts(state, hwnd),
         CMD_FONT => do_font(state, hwnd),
         CMD_FONT_SIZE => do_font_size(state, hwnd),
         CMD_DENSITY => do_density(state, hwnd),
@@ -2105,8 +2393,8 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
             spawn_dir_load(hwnd, pid, req);
         }
         CMD_CLOSE_TAB => {
-            let req = state.pane_mut(pid).close_active_tab(FALLBACK_PATH);
-            start_load(hwnd, pid, req);
+            let i = state.pane(pid).active_tab_index;
+            crate::input::close_tab(state, hwnd, pid, i);
         }
         CMD_SELECT_ALL => state.pane_mut(pid).list_mut().select_all(),
         CMD_FILTER => state.filter_focus = Some(pid),
@@ -2212,10 +2500,12 @@ mod tests {
         assert!(COMMANDS.iter().all(|c| c.id < SORT_FIRST), "commands sit below");
         assert!(SORT_FIRST + 4 <= ORDER_ASC);
         assert!(ORDER_ASC < ORDER_DESC && ORDER_DESC < ICON_FIRST);
-        assert!(ICON_FIRST + 1 + crate::layout::ICON_STEPS.len() <= BAR_FIRST);
+        assert!(ICON_FIRST + 1 + crate::layout::ICON_STEPS.len() <= ICON_LIST);
+        assert!(ICON_LIST < ICON_TILES && ICON_TILES < BAR_FIRST);
         assert!(BAR_FIRST + BAR.len() <= THEME_FIRST);
         assert!(THEME_FIRST + crate::theme::THEMES.len() <= TEXT_FIRST);
         assert!(TEXT_FIRST + crate::layout::FONT_STEPS.len() <= DENSITY_FIRST);
+        assert!(DENSITY_FIRST + crate::layout::DENSITY_STEPS.len() <= RENAME_FIRST);
         assert!(!crate::layout::DENSITY_STEPS.is_empty());
     }
 

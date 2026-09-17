@@ -11,9 +11,7 @@ use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBU
 use windows::Win32::UI::Shell::{PathIsNetworkPathW, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::fs::wide;
 
 /// Cache key for a listing entry. Directories all share one icon; files are
 /// keyed by lowercased extension, so a folder of 10,000 .jpg files costs one
@@ -45,10 +43,6 @@ pub struct IconCache {
 }
 
 impl IconCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Small (16px) shell icon for a cache key from `icon_key`.
     ///
     /// Looks the icon up from a synthetic path plus explicit attributes
@@ -191,7 +185,7 @@ mod tests {
 
     #[test]
     fn repeated_lookups_hit_the_cache() {
-        let mut c = IconCache::new();
+        let mut c = IconCache::default();
         c.get("<dir>");
         c.get("<dir>");
         c.get(".txt");

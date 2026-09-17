@@ -26,9 +26,7 @@ const IDC_PREVIEW: i32 = 3002;
 const IDC_OK: i32 = 3003;
 const IDC_CANCEL: i32 = 3004;
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::fs::wide;
 
 /// One file the rename applies to.
 ///

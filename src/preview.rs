@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::SIZE;
-use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
+use windows::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP, HBITMAP, HGDIOBJ};
 use windows::Win32::System::Com::{
     CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
 };
@@ -84,12 +84,36 @@ pub fn has_thumbnail(extension: Option<&str>) -> bool {
 pub struct ThumbCache {
     /// None means "asked, and there is nothing" — kept so it is not asked again.
     by_key: HashMap<String, Option<HBITMAP>>,
-    order: VecDeque<String>,
+    /// Each key with what its bitmap costs, oldest first.
+    order: VecDeque<(String, usize)>,
+    bytes: usize,
 }
 
-/// Enough for several screens of a grid at once. Each entry is a bitmap of a
-/// few hundred KB, so this is the memory ceiling in disguise.
+/// Enough for several screens of a grid at once.
 const MAX_THUMBS: usize = 400;
+
+/// And a ceiling in bytes, because an entry is not a fixed size: a 256px
+/// thumbnail is sixteen times a 72px one, so counting entries alone put the
+/// real ceiling anywhere between 8 and 100 MB depending on the view.
+const MAX_THUMB_BYTES: usize = 64 << 20;
+
+/// What a bitmap costs, asked of the bitmap: the cache is handed handles and
+/// never told what size was requested.
+fn bitmap_bytes(b: HBITMAP) -> usize {
+    let mut info = BITMAP::default();
+    let n = unsafe {
+        GetObjectW(
+            HGDIOBJ(b.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut info as *mut _ as *mut _),
+        )
+    };
+    if n == 0 {
+        return 0;
+    }
+    info.bmWidth.max(0) as usize * info.bmHeight.max(0) as usize
+        * (info.bmBitsPixel.max(8) as usize / 8)
+}
 
 impl ThumbCache {
     pub fn get(&self, key: &str) -> Option<HBITMAP> {
@@ -101,15 +125,19 @@ impl ThumbCache {
     }
 
     pub fn insert(&mut self, key: String, bmp: Option<HBITMAP>) {
+        let size = bmp.map(bitmap_bytes).unwrap_or(0);
         if self.by_key.insert(key.clone(), bmp).is_none() {
-            self.order.push_back(key);
+            self.order.push_back((key, size));
+            self.bytes += size;
         }
-        while self.order.len() > MAX_THUMBS {
-            if let Some(old) = self.order.pop_front() {
-                if let Some(Some(b)) = self.by_key.remove(&old) {
-                    unsafe {
-                        let _ = DeleteObject(HGDIOBJ(b.0));
-                    }
+        while self.order.len() > MAX_THUMBS || self.bytes > MAX_THUMB_BYTES {
+            let Some((old, size)) = self.order.pop_front() else {
+                break;
+            };
+            self.bytes -= size;
+            if let Some(Some(b)) = self.by_key.remove(&old) {
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(b.0));
                 }
             }
         }
@@ -246,6 +274,18 @@ mod tests {
         assert!(has_thumbnail(Some("mp4")));
         assert!(!has_thumbnail(Some(".rs")));
         assert!(!has_thumbnail(None), "a folder has no extension");
+    }
+
+    #[test]
+    fn a_bitmap_costs_what_its_pixels_cost() {
+        // The byte budget is only as good as this number, and nothing else
+        // in the cache knows how big a thumbnail was asked for.
+        use windows::Win32::Graphics::Gdi::CreateBitmap;
+        let b = unsafe { CreateBitmap(256, 256, 1, 32, None) };
+        assert_eq!(bitmap_bytes(b), 256 * 256 * 4);
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(b.0));
+        }
     }
 
     #[test]

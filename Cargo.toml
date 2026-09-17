@@ -3,6 +3,9 @@ name = "file-xplorer"
 version = "0.2.0"
 edition = "2021"
 description = "Minimal native dual-pane file manager for Windows"
+license = "GPL-3.0-only"
+repository = "https://github.com/ilirk18/file-xplorer"
+readme = "README.md"
 build = "build.rs"
 
 [dependencies]
@@ -10,7 +13,6 @@ windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_WNet",
-    "Win32_Globalization",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",

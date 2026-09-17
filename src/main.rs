@@ -1,3 +1,16 @@
+// File Xplorer, a file manager for Windows.
+// Copyright (C) 2026 ilirk18
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details. You should have received a copy of it along with this program;
+// if not, see <https://www.gnu.org/licenses/>.
+
 // Win32 window, message dispatch, and the glue between input and state.
 //
 // Design notes worth knowing before editing:
@@ -30,6 +43,7 @@ mod input;
 mod keys;
 mod layout;
 mod menu;
+mod multi_rename;
 mod ops;
 mod palette;
 mod pane;
@@ -343,9 +357,6 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static AppState> {
     (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AppState).as_ref()
 }
 
-/// Match the title bar to the app's theme. Without this a dark app sits under a
-
-
 // ---------------------------------------------------------------------------
 // Window procedure
 // ---------------------------------------------------------------------------
@@ -392,7 +403,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         if let Some(result) = menu::handle_menu_msg(msg, wparam, lparam) {
             return result;
         }
-        if let Some(result) = shellmenu::handle_menu_msg(msg, wparam, lparam) {
+        let handled = shellmenu::handle_menu_msg(msg, wparam, lparam);
+        // A popup about to open has just been filled by whoever owns it, so
+        // this is the only moment its entries exist and are still unpainted.
+        if msg == WM_INITMENUPOPUP {
+            menu::adopt(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                wparam.0 as *mut _,
+            ));
+        }
+        if let Some(result) = handled {
             return result;
         }
 
@@ -581,19 +600,36 @@ fn handle(
         }
 
         WM_LBUTTONUP => {
-            // A tab dropped on another pane moves there, keeping its history.
-            if let Some((from, index, ox, oy)) = state.tab_drag.take() {
-                let (x, y) = mouse_pos(lparam);
-                let far = (x - ox).abs() >= DRAG_THRESHOLD || (y - oy).abs() >= DRAG_THRESHOLD;
-                if let (true, Some(to)) = (far, state.layout().pane_at(x, y)) {
-                    if to != from {
-                        move_tab(state, hwnd, from, index, to);
-                    } else if let Some(target) = tab_drop_index(state, to, x, y) {
-                        if state.pane_mut(to).reorder_tab(index, target) {
-                            invalidate(hwnd);
+            // A tab dropped on a pane moves there; dropped near one of its
+            // edges it takes a new pane of its own on that side.
+            if let Some(mut drag) = state.tab_drag.take() {
+                drag.cursor = mouse_pos(lparam);
+                state.tab_drag = Some(drag);
+                let target = state.tab_drop_target();
+                state.tab_drag = None;
+                let (x, y) = drag.cursor;
+                match target {
+                    Some((to, zone, _)) => match zone.split() {
+                        Some((vertical, before)) => {
+                            split_off_tab(state, hwnd, drag, to, vertical, before)
                         }
-                    }
+                        None if to != drag.from => {
+                            move_tab(state, hwnd, drag.from, drag.index, to)
+                        }
+                        None => {
+                            if let Some(at) = tab_drop_index(state, to, x, y) {
+                                if state.pane_mut(to).reorder_tab(drag.index, at) {
+                                    invalidate(hwnd);
+                                }
+                            }
+                        }
+                    },
+                    None => {}
                 }
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                invalidate(hwnd);
             }
             // A click that never became a drag still needs to reduce a
             // multi-selection to the row that was pressed.
@@ -627,9 +663,7 @@ fn handle(
         WM_MBUTTONDOWN => {
             let (x, y) = mouse_pos(lparam);
             if let Hit::Tab(pid, i) | Hit::TabClose(pid, i) = state.layout().hit_test(x, y) {
-                state.focused = pid;
-                let req = state.pane_mut(pid).close_tab(i, FALLBACK_PATH);
-                start_load(hwnd, pid, req);
+                crate::input::close_tab(state, hwnd, pid, i);
                 invalidate(hwnd);
             }
             Some(LRESULT(0))
@@ -723,6 +757,15 @@ fn handle(
 
         WM_CHAR => {
             let c = char::from_u32(wparam.0 as u32).unwrap_or('\0');
+            // Typing into the multi-row rename, which has no control of its own
+            // to receive it.
+            if let Some(m) = state.multi_rename.as_mut() {
+                if !c.is_control() && !ctrl_down() && !alt_down() {
+                    m.insert(&c.to_string());
+                    invalidate(hwnd);
+                }
+                return Some(LRESULT(0));
+            }
             if !c.is_control() && !ctrl_down() && !alt_down() {
                 on_type_ahead(state, hwnd, c);
                 return Some(LRESULT(0));
@@ -985,14 +1028,67 @@ fn tab_drop_index(state: &AppState, pid: PaneId, x: i32, y: i32) -> Option<usize
     }
 }
 
-fn move_tab(state: &mut AppState, hwnd: HWND, from: PaneId, index: usize, to: PaneId) {
-    let Some(tab) = state.pane_mut(from).take_tab(index) else {
+/// Drop a tab into a new pane beside the one it was dropped on.
+///
+/// A pane's last tab cannot leave it \u2014 `take_tab` refuses, because a pane
+/// with no tabs is not a pane \u2014 so the split is undone rather than left
+/// standing empty. Dragging a lone tab out of its own pane is the case that
+/// hits this, and saying so is better than a split that quietly does nothing.
+fn split_off_tab(
+    state: &mut AppState,
+    hwnd: HWND,
+    drag: app::TabDrag,
+    to: PaneId,
+    vertical: bool,
+    before: bool,
+) {
+    let Some(fresh) = state.split_pane(to, vertical, before) else {
         return;
     };
+    let Some(tab) = state.pane_mut(drag.from).take_tab(drag.index) else {
+        state.layout_tree.close(fresh);
+        state.status_override = Some("A pane keeps its last tab".into());
+        return;
+    };
+    let req = state.pane_mut(fresh).adopt_tab(tab);
+    start_load(hwnd, fresh, req);
+    state.focused = fresh;
+    state.rewatch(drag.from, hwnd);
+    state.rewatch(fresh, hwnd);
+    invalidate(hwnd);
+}
+
+/// Move a tab into another pane.
+///
+/// A pane's last tab can leave, but only if the pane goes with it: two panes
+/// become one again, which is the inverse of the drag that split them and the
+/// thing that was missing \u2014 a pane made by dragging a tab out could not be
+/// undone by dragging it back.
+fn move_tab(state: &mut AppState, hwnd: HWND, from: PaneId, index: usize, to: PaneId) {
+    if from == to {
+        return;
+    }
+    let solo = state.pane(from).tabs.len() == 1;
+    if solo && state.pane_count() < 2 {
+        return; // the only tab of the only pane has nowhere to be
+    }
+    let taken = if solo {
+        state.pane_mut(from).take_only_tab(app::FALLBACK_PATH)
+    } else {
+        state.pane_mut(from).take_tab(index)
+    };
+    let Some(tab) = taken else {
+        return;
+    };
+    if solo {
+        state.close_pane(from);
+    }
     let req = state.pane_mut(to).adopt_tab(tab);
     start_load(hwnd, to, req);
     state.focused = to;
-    state.rewatch(from, hwnd);
+    if !solo {
+        state.rewatch(from, hwnd);
+    }
     state.rewatch(to, hwnd);
     invalidate(hwnd);
 }
@@ -1036,6 +1132,8 @@ fn paint(state: &mut AppState, hwnd: HWND) {
         _ => None,
     };
     let hover = state.hover;
+    // Computed before the destructure, like the rest of what reads `state`.
+    let drop_target = state.tab_drop_target().map(|(_, _, r)| r);
     let focused_side = state.focused;
     let filter_focus = state.filter_focus;
     let drives = state.drives.clone();
@@ -1093,6 +1191,7 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     let AppState {
         renderer,
         panes,
+        multi_rename,
         preview,
         thumbs,
         icons,
@@ -1125,7 +1224,10 @@ fn paint(state: &mut AppState, hwnd: HWND) {
         },
     );
 
-    for &pid in &visible {
+    // `visible` is leaf order; anything built from it is indexed by position
+    // in that order. `panes` is the array of every pane, so that one alone is
+    // indexed by id.
+    for (i, &pid) in visible.iter().enumerate() {
         let pane: &Pane = &panes[pid.0];
         let tabs: Vec<String> = pane.tabs.iter().map(|t| t.label()).collect();
         let crumbs = fs::path_segments(pane.current_path());
@@ -1145,13 +1247,18 @@ fn paint(state: &mut AppState, hwnd: HWND) {
             can_up: fs::path_parent(pane.current_path()).is_some(),
             filter_focused: filter_focus == Some(pid),
             renaming: renaming.filter(|(p, _)| *p == pid).map(|(_, row)| row),
+            multi: multi_rename.as_ref().filter(|m| m.pid == pid),
             thumbs: (icons != crate::layout::ICONS_OFF)
                 .then_some((thumbs, pane.current_path())),
             band: band.filter(|(p, _)| *p == pid).map(|(_, r)| r),
-            counts: &counts[pid.0],
-            other_names: comparing.then(|| &names[(pid.0 + 1) % names.len()]),
+            counts: &counts[i],
+            other_names: comparing.then(|| &names[(i + 1) % names.len()]),
         };
         renderer.draw_pane(layout.metrics, &view);
+    }
+
+    if let Some(r) = drop_target {
+        renderer.draw_drop_target(r, layout.metrics);
     }
 
     let active_divider = match (state_drag, hover) {

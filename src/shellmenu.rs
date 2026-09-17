@@ -112,6 +112,9 @@ pub struct Action {
     pub label: String,
     /// The id `TrackPopupMenu` would have returned, which `invoke` takes.
     pub id: u32,
+    /// The handler's own little bitmap, if it set one. Owned by the menu, so
+    /// it is only good for as long as the menu is.
+    pub bitmap: Option<windows::Win32::Graphics::Gdi::HBITMAP>,
 }
 
 /// Flatten a shell menu into the actions it offers, submenus included.
@@ -169,9 +172,29 @@ unsafe fn walk(hmenu: HMENU, prefix: &str, out: &mut Vec<Action>, depth: u32) {
         }
         let id = GetMenuItemID(hmenu, i as i32);
         if (SHELL_ID_FIRST..=SHELL_ID_LAST).contains(&id) {
-            out.push(Action { label: full, id });
+            out.push(Action {
+                label: full,
+                id,
+                bitmap: item_bitmap(hmenu, i as u32),
+            });
         }
     }
+}
+
+/// The bitmap a handler set for its item, if it is a real one.
+///
+/// `hbmpItem` doubles as a set of small magic values \u2014 HBMMENU_POPUP_CLOSE
+/// and friends \u2014 that ask the system to draw a standard glyph. Those are
+/// not bitmaps and must not be drawn as one.
+unsafe fn item_bitmap(hmenu: HMENU, at: u32) -> Option<windows::Win32::Graphics::Gdi::HBITMAP> {
+    let mut info = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_BITMAP,
+        ..Default::default()
+    };
+    GetMenuItemInfoW(hmenu, at, true, &mut info).ok()?;
+    let handle = info.hbmpItem;
+    (handle.0 as isize > 16).then_some(handle)
 }
 
 /// Menu text as a person would read it: no `&` mnemonics, no accelerator

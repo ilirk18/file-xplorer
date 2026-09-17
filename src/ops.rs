@@ -21,9 +21,7 @@ use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::Win32::UI::Shell::*;
 
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::fs::wide;
 
 /// A window handle handed to a worker thread purely so the shell can parent its
 /// progress and conflict dialogs. HWNDs are not `Send` because most Win32 calls
@@ -199,6 +197,13 @@ impl Op {
         })
     }
 
+    /// Does this move bytes about? Two of these at once on one disk take
+    /// longer together than one after the other; a rename or a delete is over
+    /// before the head has moved and must not wait behind a ten-minute copy.
+    pub fn is_transfer(&self) -> bool {
+        matches!(self, Op::Copy { .. } | Op::Move { .. })
+    }
+
     /// What the footer says while this is running.
     pub fn progress_text(&self) -> &'static str {
         match self {
@@ -221,7 +226,7 @@ pub struct OpResult {
 }
 
 fn shell_item(path: &str) -> windows::core::Result<IShellItem> {
-    let wide = to_wide(path);
+    let wide = wide(path);
     unsafe { SHCreateItemFromParsingName(PCWSTR::from_raw(wide.as_ptr()), None) }
 }
 
@@ -273,19 +278,19 @@ fn perform(op: &Op, owner: HWND) -> windows::core::Result<bool> {
         }
         Op::Rename { source, new_name } => {
             let item = shell_item(source)?;
-            let name = to_wide(new_name);
+            let name = wide(new_name);
             unsafe { file_op.RenameItem(&item, PCWSTR::from_raw(name.as_ptr()), None)? };
         }
         Op::RenameMany { items } => {
             for (source, new_name) in items {
                 let item = shell_item(source)?;
-                let name = to_wide(new_name);
+                let name = wide(new_name);
                 unsafe { file_op.RenameItem(&item, PCWSTR::from_raw(name.as_ptr()), None)? };
             }
         }
         Op::NewFolder { parent, name } => {
             let dest = shell_item(parent)?;
-            let name = to_wide(name);
+            let name = wide(name);
             unsafe {
                 file_op.NewItem(
                     &dest,
@@ -306,11 +311,33 @@ fn perform(op: &Op, owner: HWND) -> windows::core::Result<bool> {
 
 /// Run `op` on a worker thread, then hand the boxed result to `deliver` (which
 /// is expected to PostMessage it to the UI thread and return immediately).
+/// One transfer at a time.
+///
+/// Queueing copies rather than running them all at once is the whole feature:
+/// four copies to one disk finish later than four copies in a row, and four
+/// progress dialogs each claiming a share of the throughput is a worse lie
+/// than one honest one with the rest waiting.
+///
+/// ponytail: a lock is the queue. It gives the ordering a queue would and
+/// nothing else — no list to look at, no reordering, no cancelling one that
+/// has not started. Build those the day there is somewhere to show them.
+static TRANSFERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Is a transfer running, or waiting to? What the footer uses to say so.
+pub fn transfer_running() -> bool {
+    TRANSFERS.try_lock().is_err()
+}
+
 pub fn spawn<F>(op: Op, owner: OwnerWindow, deliver: F)
 where
     F: FnOnce(Box<OpResult>) + Send + 'static,
 {
     std::thread::spawn(move || {
+        // Held for the whole operation, so the next one starts when this one
+        // is finished rather than beside it.
+        let _turn = op
+            .is_transfer()
+            .then(|| TRANSFERS.lock().unwrap_or_else(|e| e.into_inner()));
         // IFileOperation requires an STA: its progress UI is a window.
         let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         let result = match perform(&op, owner.hwnd()) {
@@ -357,7 +384,7 @@ pub enum DropEffect {
 /// Explorer marks a cut-vs-copy with this registered format. Registering the
 /// same name gets us the same id, which is how interop works.
 fn preferred_drop_effect_format() -> u32 {
-    let name = to_wide("Preferred DropEffect");
+    let name = wide("Preferred DropEffect");
     unsafe { RegisterClipboardFormatW(PCWSTR::from_raw(name.as_ptr())) }
 }
 
@@ -515,14 +542,44 @@ pub fn clipboard_write_text(owner: HWND, text: &str) -> windows::core::Result<()
     }
 }
 
+/// Take plain text off the clipboard, if there is any.
+///
+/// The mirror of `clipboard_write_text`, for the editors that are ours rather
+/// than Windows': a real EDIT control does its own pasting.
+pub fn clipboard_read_text(owner: HWND) -> Option<String> {
+    unsafe {
+        if !IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_ok() {
+            return None;
+        }
+        OpenClipboard(Some(owner)).ok()?;
+        let out = (|| -> Option<String> {
+            let handle = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
+            let hg = HGLOBAL(handle.0);
+            let p = GlobalLock(hg) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut len = 0usize;
+            while *p.add(len) != 0 && len < 4096 {
+                len += 1;
+            }
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+            let _ = GlobalUnlock(hg);
+            Some(text)
+        })();
+        let _ = CloseClipboard();
+        out
+    }
+}
+
 /// Open a shell at `dir`. Windows Terminal if it is installed, PowerShell if
 /// not — both are launched through the shell, so neither needs a full path.
 pub fn open_terminal(owner: HWND, dir: &str) -> windows::core::Result<()> {
-    let verb = to_wide("open");
-    let cwd = to_wide(dir);
+    let verb = wide("open");
+    let cwd = wide(dir);
     let mut last = windows::core::Error::empty();
     for exe in ["wt.exe", "powershell.exe", "cmd.exe"] {
-        let file = to_wide(exe);
+        let file = wide(exe);
         let h = unsafe {
             ShellExecuteW(
                 Some(owner),
@@ -543,13 +600,13 @@ pub fn open_terminal(owner: HWND, dir: &str) -> windows::core::Result<()> {
 }
 
 pub fn shell_open(owner: HWND, path: &str) -> windows::core::Result<()> {
-    let wide = to_wide(path);
-    let verb = to_wide("open");
+    let file = wide(path);
+    let verb = wide("open");
     let result = unsafe {
         ShellExecuteW(
             Some(owner),
             PCWSTR::from_raw(verb.as_ptr()),
-            PCWSTR::from_raw(wide.as_ptr()),
+            PCWSTR::from_raw(file.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
@@ -565,13 +622,13 @@ pub fn shell_open(owner: HWND, path: &str) -> windows::core::Result<()> {
 
 /// Show the shell's Properties dialog for a path.
 pub fn shell_properties(owner: HWND, path: &str) -> windows::core::Result<()> {
-    let wide = to_wide(path);
-    let verb = to_wide("properties");
+    let file = wide(path);
+    let verb = wide("properties");
     let result = unsafe {
         ShellExecuteW(
             Some(owner),
             PCWSTR::from_raw(verb.as_ptr()),
-            PCWSTR::from_raw(wide.as_ptr()),
+            PCWSTR::from_raw(file.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
@@ -587,6 +644,18 @@ pub fn shell_properties(owner: HWND, path: &str) -> windows::core::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_operations_that_move_bytes_wait_their_turn() {
+        // The point of the queue: a rename or a delete is instant and must
+        // not sit behind a copy, which is the one thing that is not.
+        let paths = || vec!["C:\\a\\one.txt".to_string()];
+        assert!(Op::Copy { sources: paths(), dest_dir: "D:\\b".into() }.is_transfer());
+        assert!(Op::Move { sources: paths(), dest_dir: "D:\\b".into() }.is_transfer());
+        assert!(!Op::Delete { sources: paths(), permanent: false }.is_transfer());
+        assert!(!Op::Rename { source: paths()[0].clone(), new_name: "two.txt".into() }.is_transfer());
+        assert!(!Op::NewFolder { parent: "C:\\a".into(), name: "new".into() }.is_transfer());
+    }
 
     #[test]
     fn affected_dirs_covers_both_ends_of_a_move() {

@@ -104,7 +104,9 @@ impl FileEntry {
     }
 }
 
-fn to_wide(s: &str) -> Vec<u16> {
+/// A UTF-16 string with the NUL Windows expects. Here rather than in each
+/// module that needs one: it was written out nine times.
+pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -240,7 +242,7 @@ pub fn list_any(path: &str) -> Result<Vec<FileEntry>, String> {
 pub fn list_dir(path: &str) -> Result<Vec<FileEntry>, std::io::Error> {
     let extended = to_extended(path);
     let base = extended.trim_end_matches('\\');
-    let search = to_wide(&format!("{}\\*", base));
+    let search = wide(&format!("{}\\*", base));
 
     let mut data = WIN32_FIND_DATAW::default();
     let handle = unsafe {
@@ -505,7 +507,7 @@ pub fn drives() -> Vec<Drive> {
             continue;
         }
         let root = format!("{}:\\", (b'A' + i as u8) as char);
-        let wide = to_wide(&root);
+        let wide = wide(&root);
 
         let kind = unsafe { GetDriveTypeW(PCWSTR::from_raw(wide.as_ptr())) };
         if kind == DRIVE_NO_ROOT_DIR {

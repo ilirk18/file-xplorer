@@ -15,11 +15,11 @@ the current state so context is never lost.
 | 4 | [phase-4.md](phase-4.md) | Done | Shell file operations, multi-select, async I/O, DPI |
 | 5 | [phase-5.md](phase-5.md) | Done | Layout module, sidebar, filter, theming, visual overhaul |
 | 6 | [phase-6.md](phase-6.md) | Done | Palette, search, drag & drop, shell menu, watching, batch rename, settings |
-| 8 | [phase-8.md](phase-8.md) | Done | Themed context menu and tab strip, Ctrl+L, terminal, pins, autosave, tab moving, tree reveal, column resize, content compare, archiving |
-| 9+ | [phase-9-plan.md](phase-9-plan.md) | Planned | Nested layouts, view modes, default manager, and the rest of the File Pilot gap |
 | 7 | [phase-7.md](phase-7.md) | Done | Split `main.rs`, four panes, undo, content search, session restore, Type column, folder tree, archives |
+| 8 | [phase-8.md](phase-8.md) | Done | Themed context menu and tab strip, Ctrl+L, terminal, pins, autosave, tab moving, tree reveal, column resize, content compare, archiving |
+| 9 | [phase-9.md](phase-9.md) | Done | Second window, pane tree, view continuum, default manager, customization, network |
 
-**Ideas (not phased yet):** [file-pilot-comparison.md](file-pilot-comparison.md) · [powertoys-inspired-ideas.md](powertoys-inspired-ideas.md)
+**Ideas and plans:** [file-pilot-comparison.md](file-pilot-comparison.md) · [phase-9-plan.md](phase-9-plan.md) (the reasoning behind phase 9, kept for the arguments-against)
 
 ---
 
@@ -57,6 +57,8 @@ the current state so context is never lost.
 | `src/uia.rs` | UI Automation providers, so a screen reader can read the listing |
 | `src/pidl.rs` | Shell item id lists, freed on drop |
 | `src/dialog.rs` | Shared dialog font handling |
+| `src/multi_rename.rs` | Renaming every selected file at once, in place |
+| `src/default_app.rs` | Registering as the default file manager, and undoing it |
 | `build.rs` + `app.manifest` | Embeds the manifest: PerMonitorV2 DPI, long paths, UTF-8, Common Controls v6 |
 
 ### Architectural rules
@@ -87,7 +89,9 @@ the current state so context is never lost.
   failures. See [.cursor/rules/phase-tests.mdc](../.cursor/rules/phase-tests.mdc).
 - **Docs**: after each phase add or update `docs/phase-N.md` and this index.
 
-Current: **267 tests, zero warnings** (`cargo test`).
+Current: **303 tests, zero warnings** (`cargo test`). CI runs both on
+`windows-latest` on every push and pull request:
+[.github/workflows/ci.yml](../.github/workflows/ci.yml).
 
 ---
 
@@ -99,4 +103,4 @@ Current: **267 tests, zero warnings** (`cargo test`).
 
 ---
 
-*Last updated: after Phase 8.*
+*Last updated: after Phase 9.*
