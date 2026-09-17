@@ -237,9 +237,10 @@ the registry currently says.
 - Writes `Directory`, `Drive` and `Folder`'s `shell\open\command` under
   `HKCU\Software\Classes`. HKCU only: this user's account, no administrator
   rights, no other account affected, Explorer itself untouched.
-- Records what each key said first under `HKCU\Software\FileXplorer`, and
-  never records our own command over that — the first backup is the true
-  one, so pressing it twice cannot lose the original.
+- Records what each key said first under `HKCU\Software\Jamb` (and still
+  reads a backup left under the old `FileXplorer` key), and never records
+  our own command over that — the first backup is the true one, so pressing
+  it twice cannot lose the original.
 - **Restore undoes exactly what was done**, and no more: our default value,
   then each key above it *only if it is now completely empty*. Deleting the
   `shell` branch outright, which is what the first draft did, would have taken
