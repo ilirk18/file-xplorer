@@ -1,4 +1,4 @@
-# The project's standing claim is "303 tests, zero warnings". This runs both,
+# The project's standing claim is "317 tests, zero warnings". This runs both,
 # on the only OS the app builds for.
 #
 # Not gated on `cargo fmt` or `cargo clippy`: neither is clean today, and a
