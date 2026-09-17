@@ -18,7 +18,6 @@ use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::IO::CancelIoEx;
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use crate::layout::Side;
 
 /// A handle passed between threads. Windows handles are process-wide values;
 /// the only rule we need to honour is that nobody uses one after it is closed,
@@ -55,7 +54,7 @@ impl Watcher {
     /// which is not an error worth reporting: it just means no live updates.
     pub fn start(
         hwnd: windows::Win32::Foundation::HWND,
-        side: Side,
+        pid: usize,
         message: u32,
         path: &str,
     ) -> Option<Watcher> {
@@ -84,10 +83,7 @@ impl Watcher {
         let thread_stop = stop.clone();
         let thread_handle = SendHandle(handle);
         let thread_hwnd = SendHwnd(hwnd);
-        let side_index = match side {
-            Side::Left => 0usize,
-            Side::Right => 1usize,
-        };
+
 
         std::thread::spawn(move || {
             let handle = thread_handle.get();
@@ -123,7 +119,7 @@ impl Watcher {
                 // going to re-read the whole directory anyway, and parsing the
                 // record list would only tell us something we discard.
                 let posted = unsafe {
-                    PostMessageW(Some(hwnd), message, WPARAM(side_index), LPARAM(0))
+                    PostMessageW(Some(hwnd), message, WPARAM(pid), LPARAM(0))
                 };
                 if posted.is_err() {
                     break;

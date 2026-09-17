@@ -40,6 +40,23 @@ impl FileEntry {
         }
     }
 
+    /// Display string for the Type column.
+    ///
+    /// Derived from the extension rather than asked of the shell: SHGetFileInfo
+    /// with SHGFI_TYPENAME would give "Rust Source File" where this gives "RS
+    /// file", but it is a registry lookup per extension and this column exists
+    /// to be sorted on, not read aloud.
+    pub fn type_display(&self) -> String {
+        if self.is_dir {
+            return "File folder".to_string();
+        }
+        match self.extension.as_deref() {
+            // The extension already carries its dot.
+            Some(ext) if ext.len() > 1 => format!("{} file", ext[1..].to_uppercase()),
+            _ => "File".to_string(),
+        }
+    }
+
     /// Display string for the Date Modified column, in local time.
     pub fn date_display(&self) -> String {
         format_filetime(self.modified)

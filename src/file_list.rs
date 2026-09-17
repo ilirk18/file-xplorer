@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 pub enum SortKey {
     #[default]
     Name,
+    Type,
     Size,
     Date,
 }
@@ -310,6 +311,14 @@ impl FileList {
             }
             let cmp = match key {
                 SortKey::Name => natural_cmp(&a.name, &b.name),
+                // Compare the extension, not the rendered label: the label is
+                // derived from it and sorting the label would order "File"
+                // before every real type purely because of the wording.
+                SortKey::Type => a
+                    .extension
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.extension.as_deref().unwrap_or("")),
                 SortKey::Size => a.size.cmp(&b.size),
                 SortKey::Date => a.modified.cmp(&b.modified),
             };

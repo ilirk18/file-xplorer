@@ -97,6 +97,85 @@ impl Op {
             Op::NewFolder { parent, .. } => vec![parent.clone()],
         }
     }
+
+    /// The operation that puts things back, or None when there is no honest
+    /// way to do so.
+    ///
+    /// Deleting is the interesting omission. `FOF_ALLOWUNDO` puts deleted
+    /// items in the Recycle Bin, but nothing in the shell API asks for them
+    /// back by name, and inventing a "restore" that guessed would be worse
+    /// than not offering one. The Recycle Bin already does this job.
+    ///
+    /// An undone copy or new folder goes to the Recycle Bin rather than being
+    /// erased, because undo should not be the one operation in the app that
+    /// destroys something permanently.
+    ///
+    /// Undo cannot bring back a file that was overwritten during the original
+    /// operation: the shell asked before replacing it, and the answer is gone.
+    pub fn inverse(&self) -> Option<Op> {
+        use crate::fs::{path_join, path_leaf, path_parent};
+        match self {
+            Op::Copy { sources, dest_dir } => Some(Op::Delete {
+                sources: sources
+                    .iter()
+                    .map(|s| path_join(dest_dir, &path_leaf(s)))
+                    .collect(),
+                permanent: false,
+            }),
+            Op::Move { sources, dest_dir } => {
+                // Everything has to go back to one folder, so everything must
+                // have come from one. A selection always does; a drop of a
+                // mixed set from elsewhere might not, and is left un-undoable
+                // rather than half-restored.
+                let home = path_parent(sources.first()?)?;
+                if sources
+                    .iter()
+                    .any(|s| path_parent(s).as_deref() != Some(home.as_str()))
+                {
+                    return None;
+                }
+                Some(Op::Move {
+                    sources: sources
+                        .iter()
+                        .map(|s| path_join(dest_dir, &path_leaf(s)))
+                        .collect(),
+                    dest_dir: home,
+                })
+            }
+            Op::Rename { source, new_name } => {
+                let parent = path_parent(source)?;
+                Some(Op::Rename {
+                    source: path_join(&parent, new_name),
+                    new_name: path_leaf(source),
+                })
+            }
+            Op::RenameMany { items } => Some(Op::RenameMany {
+                items: items
+                    .iter()
+                    .filter_map(|(src, new)| {
+                        let parent = path_parent(src)?;
+                        Some((path_join(&parent, new), path_leaf(src)))
+                    })
+                    .collect(),
+            }),
+            Op::NewFolder { parent, name } => Some(Op::Delete {
+                sources: vec![path_join(parent, name)],
+                permanent: false,
+            }),
+            Op::Delete { .. } => None,
+        }
+    }
+
+    /// What the footer says while this is running.
+    pub fn progress_text(&self) -> &'static str {
+        match self {
+            Op::Copy { .. } => "Copying\u{2026}",
+            Op::Move { .. } => "Moving\u{2026}",
+            Op::Delete { .. } => "Deleting\u{2026}",
+            Op::Rename { .. } | Op::RenameMany { .. } => "Renaming\u{2026}",
+            Op::NewFolder { .. } => "Creating folder\u{2026}",
+        }
+    }
 }
 
 /// Result of one completed operation, delivered back to the UI thread.
@@ -455,5 +534,126 @@ mod tests {
         // Explorer interop depends on these exact numbers.
         assert_eq!(DropEffect::Copy as u32, 1);
         assert_eq!(DropEffect::Move as u32, 2);
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::*;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn undoing_a_copy_recycles_what_landed_at_the_destination() {
+        let op = Op::Copy {
+            sources: v(&["C:\\a\\one.txt", "C:\\a\\two.txt"]),
+            dest_dir: "D:\\b".into(),
+        };
+        match op.inverse().unwrap() {
+            Op::Delete { sources, permanent } => {
+                assert_eq!(sources, v(&["D:\\b\\one.txt", "D:\\b\\two.txt"]));
+                assert!(!permanent, "undo must never be the one path that erases");
+            }
+            other => panic!("expected a delete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn undoing_a_move_sends_everything_home() {
+        let op = Op::Move {
+            sources: v(&["C:\\a\\one.txt", "C:\\a\\two.txt"]),
+            dest_dir: "D:\\b".into(),
+        };
+        match op.inverse().unwrap() {
+            Op::Move { sources, dest_dir } => {
+                assert_eq!(sources, v(&["D:\\b\\one.txt", "D:\\b\\two.txt"]));
+                assert_eq!(dest_dir, "C:\\a");
+            }
+            other => panic!("expected a move, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_move_from_two_folders_cannot_be_undone() {
+        // There is no single folder to put them back into, and a half-restore
+        // would be worse than saying no.
+        let op = Op::Move {
+            sources: v(&["C:\\a\\one.txt", "C:\\other\\two.txt"]),
+            dest_dir: "D:\\b".into(),
+        };
+        assert!(op.inverse().is_none());
+    }
+
+    #[test]
+    fn undoing_a_rename_puts_the_old_name_back() {
+        let op = Op::Rename {
+            source: "C:\\a\\old.txt".into(),
+            new_name: "new.txt".into(),
+        };
+        match op.inverse().unwrap() {
+            Op::Rename { source, new_name } => {
+                assert_eq!(source, "C:\\a\\new.txt");
+                assert_eq!(new_name, "old.txt");
+            }
+            other => panic!("expected a rename, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn undoing_a_batch_rename_is_one_step_not_n() {
+        let op = Op::RenameMany {
+            items: vec![
+                ("C:\\a\\x.txt".into(), "1.txt".into()),
+                ("C:\\a\\y.txt".into(), "2.txt".into()),
+            ],
+        };
+        match op.inverse().unwrap() {
+            Op::RenameMany { items } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], ("C:\\a\\1.txt".to_string(), "x.txt".to_string()));
+            }
+            other => panic!("expected a batch rename, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn undoing_a_new_folder_removes_it() {
+        let op = Op::NewFolder {
+            parent: "C:\\a".into(),
+            name: "Notes".into(),
+        };
+        match op.inverse().unwrap() {
+            Op::Delete { sources, .. } => assert_eq!(sources, v(&["C:\\a\\Notes"])),
+            other => panic!("expected a delete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_delete_is_the_recycle_bins_to_undo_not_ours() {
+        let op = Op::Delete {
+            sources: v(&["C:\\a\\gone.txt"]),
+            permanent: false,
+        };
+        assert!(op.inverse().is_none());
+    }
+
+    #[test]
+    fn undo_round_trips_through_its_own_inverse() {
+        // Undoing an undo has to land back where it started, or the stack
+        // would drift after two presses.
+        let op = Op::Move {
+            sources: v(&["C:\\a\\one.txt"]),
+            dest_dir: "D:\\b".into(),
+        };
+        let back = op.inverse().unwrap().inverse().unwrap();
+        match back {
+            Op::Move { sources, dest_dir } => {
+                assert_eq!(sources, v(&["C:\\a\\one.txt"]));
+                assert_eq!(dest_dir, "D:\\b");
+            }
+            other => panic!("expected a move, got {:?}", other),
+        }
     }
 }
