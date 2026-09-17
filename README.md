@@ -3,7 +3,7 @@
 A fast, native, multi-pane file manager for Windows. Win32 + Direct2D, no
 runtime, no framework, under a megabyte.
 
-**Full context and phase docs:** see **[docs/INDEX.md](docs/INDEX.md)**.
+**Repo:** [github.com/ilirk18/jamb](https://github.com/ilirk18/jamb) · **Docs:** [docs/INDEX.md](docs/INDEX.md)
 
 ---
 
@@ -224,7 +224,7 @@ secondary text.
 
 **Settings stick.** Pane count, theme, sidebar visibility, hidden files, the
 divider positions, the window box, pinned folders, recent folders, per-pane sort, column widths
-and every open tab live in `%APPDATA%\FileXplorer\settings.txt`. They are
+and every open tab live in `%APPDATA%\Jamb\settings.txt`. They are
 written a few seconds after anything changes, not only on exit, so a crash does
 not cost you the session.
 It is plain `key=value` text you can edit or delete; anything unreadable falls

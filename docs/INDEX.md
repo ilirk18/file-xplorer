@@ -19,7 +19,7 @@ the current state so context is never lost.
 | 8 | [phase-8.md](phase-8.md) | Done | Themed context menu and tab strip, Ctrl+L, terminal, pins, autosave, tab moving, tree reveal, column resize, content compare, archiving |
 | 9 | [phase-9.md](phase-9.md) | Done | Second window, pane tree, view continuum, default manager, customization, network |
 
-**Ideas and plans:** [file-pilot-comparison.md](file-pilot-comparison.md) · [powertoys-inspired-ideas.md](powertoys-inspired-ideas.md) · [phase-9-plan.md](phase-9-plan.md) (the reasoning behind phase 9, kept for the arguments-against)
+**Ideas and plans:** [file-pilot-comparison.md](file-pilot-comparison.md) · [phase-9-plan.md](phase-9-plan.md) (the reasoning behind phase 9, kept for the arguments-against)
 
 ---
 
