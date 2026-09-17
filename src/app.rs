@@ -258,6 +258,14 @@ pub struct AppState {
     pub pins: Vec<String>,
     /// Shell verbs hoisted to the top of the context menu, by menu text.
     pub pin_actions: Vec<String>,
+    /// UI font family and size, and row density, as the config stores them.
+    /// Held here because the metrics and the text formats are built from them
+    /// and both have to be rebuilt together.
+    pub font: String,
+    pub font_size: i32,
+    pub density: i32,
+    /// Size folders on opening a folder, rather than on request.
+    pub folder_sizes: bool,
     /// Type, Size and Date column widths in DIPs. Kept here rather than in
     /// `Metrics` because they are a preference, not a measurement — `metrics`
     /// holds the scaled copy the layout reads.
@@ -303,6 +311,11 @@ pub struct AppState {
     /// The key a worker is currently fetching, so one selection does not
     /// spawn a thread per repaint.
     pub preview_pending: Option<String>,
+    /// The folder the inspector is having sized, if any. One at a time: a
+    /// recursive walk is the most expensive thing this app starts, and holding
+    /// down an arrow key over a column of big folders would otherwise start one
+    /// per row.
+    pub size_pending: Option<String>,
     /// The inline rename editor, while a name is being typed over.
     pub rename: Option<crate::rename::InlineRename>,
     /// Folders visited, most recent first, offered by "Recent folders".
@@ -351,12 +364,10 @@ pub struct AppState {
 impl AppState {
     pub fn new(dpi: u32, opts: crate::WindowOpts) -> Result<Self> {
         let cfg = Config::load();
-        let theme = if cfg.theme_dark {
-            Theme::Dark
-        } else {
-            Theme::Light
-        };
-        let metrics = Metrics::for_dpi(dpi);
+        // A name that is no longer in the table falls back to the default
+        // rather than to a blank window.
+        let theme = Theme::by_name(&cfg.theme).unwrap_or_default();
+        let metrics = Metrics::sized(dpi, cfg.font_size, cfg.density);
         let panes: Vec<Pane> = (0..MAX_PANES)
             .map(|_| {
                 let mut p = Pane::new();
@@ -366,7 +377,7 @@ impl AppState {
             })
             .collect();
         Ok(Self {
-            renderer: Renderer::new(theme, dpi)?,
+            renderer: Renderer::new(theme, dpi, &cfg.font, cfg.font_size)?,
             metrics,
             dpi,
             client: Rect::default(),
@@ -383,6 +394,10 @@ impl AppState {
             sidebar_scroll: 0,
             pins: cfg.pins.clone(),
             pin_actions: cfg.pin_actions.clone(),
+            font: cfg.font.clone(),
+            font_size: cfg.font_size,
+            density: cfg.density,
+            folder_sizes: cfg.folder_sizes,
             col_widths: cfg.col_widths,
             last_saved: cfg.clone(),
             tab_drag: None,
@@ -417,6 +432,7 @@ impl AppState {
             inspector: cfg.inspector,
             preview: None,
             preview_pending: None,
+            size_pending: None,
             rename: None,
             recent: cfg.recent.clone(),
             folder_view: std::collections::HashMap::new(),
@@ -561,8 +577,19 @@ impl AppState {
 
     /// Push the DIP column widths into the scaled metrics the layout reads.
     /// Called on load, on a DPI change, and after a resize drag.
+    /// Pixels per stored column width.
+    ///
+    /// Columns are stored at 100% text and scaled here, because what they hold
+    /// is text: at 125% the date needs 25% more room, and a column that did not
+    /// grow with it just clipped the year.
+    pub fn col_scale(&self) -> f32 {
+        let font = self.font_size.clamp(crate::layout::FONT_MIN, crate::layout::FONT_MAX);
+        self.metrics.scale * (font as f32) / 100.0
+    }
+
     pub fn apply_col_widths(&mut self) {
-        let s = |v: i32| ((v as f32) * self.metrics.scale).round() as i32;
+        let k = self.col_scale();
+        let s = |v: i32| ((v as f32) * k).round() as i32;
         self.metrics.col_type_w = s(self.col_widths[0]);
         self.metrics.col_size_w = s(self.col_widths[1]);
         self.metrics.col_date_w = s(self.col_widths[2]);
@@ -807,6 +834,23 @@ impl AppState {
     /// Called from the paint path, which is where the final geometry exists,
     /// so a resize, a pane-count change or a hidden sidebar updates it without
     /// each of them having to remember.
+    /// Rebuild everything whose size is measured in text: the metrics, the row
+    /// height each pane scrolls and hit-tests by, the column widths and the
+    /// grid's columns-per-line.
+    ///
+    /// One function because there are now three ways to change that size — a
+    /// new monitor, a new font, a new density — and a pane still scrolling by
+    /// the old row height is a list that selects the wrong row.
+    pub fn apply_metrics(&mut self) {
+        self.metrics = Metrics::sized(self.dpi, self.font_size, self.density);
+        let row_h = self.metrics.row_h as u32;
+        for p in &mut self.panes {
+            p.set_row_height(row_h);
+        }
+        self.apply_col_widths();
+        self.sync_columns();
+    }
+
     pub fn sync_columns(&mut self) {
         let layout = self.layout();
         for pid in self.visible().collect::<Vec<_>>() {
@@ -900,6 +944,9 @@ impl AppState {
         let Some((key, is_dir, extension)) = self.preview_key() else {
             self.preview = None;
             self.preview_pending = None;
+            // Nothing is being looked at, so nothing is waiting to be sized.
+            // This is also what frees a slot whose answer never arrived.
+            self.size_pending = None;
             return;
         };
         if self.preview.as_ref().is_some_and(|(k, _)| *k == key)
@@ -908,6 +955,7 @@ impl AppState {
             return;
         }
         self.preview_pending = Some(key.clone());
+        self.size_folder(hwnd);
 
         // The key carries the modified time after a '|', which a path cannot
         // contain, so the path is everything before the last one.
@@ -929,6 +977,45 @@ impl AppState {
                 unsafe { drop(Box::from_raw(raw)) };
             }
         });
+    }
+
+    /// Size the one folder the inspector is showing, if its size is not known.
+    ///
+    /// The panel has a Size row and a folder has nothing to put in it until
+    /// somebody walks the tree. Walking the one folder you are looking at is
+    /// the smallest version of that, and it feeds the listing's Size column
+    /// through the same message the whole-listing sizing uses.
+    ///
+    /// ponytail: no cancellation \u2014 arrow off a huge folder and its walk
+    /// runs to the end, wasting the disk but not the window. The upgrade is a
+    /// stop flag that `fs::dir_size` checks.
+    fn size_folder(&mut self, hwnd: HWND) {
+        if self.size_pending.is_some() {
+            return;
+        }
+        let pid = self.focused;
+        // Everything read from the pane first: the spawn borrows self mutably.
+        let (dir, tab_id, want) = {
+            let pane = self.pane(pid);
+            let dir = pane.current_path().to_string();
+            // Nothing to walk in the shell namespace or inside an archive, and
+            // a reparse point is a loop waiting to happen.
+            let walkable = !dir.is_empty()
+                && !crate::shellns::is_shell_path(&dir)
+                && crate::archive::split(&dir).is_none();
+            let want = pane
+                .list()
+                .cursor_entry()
+                .filter(|_| walkable)
+                .filter(|e| e.is_dir && !e.dir_size_known && !e.is_reparse)
+                .map(|e| e.name.clone());
+            (dir, pane.active_tab_id(), want)
+        };
+        let Some(name) = want else {
+            return;
+        };
+        self.size_pending = Some(fs::path_join(&dir, &name));
+        crate::commands::spawn_dir_sizes(hwnd, pid, tab_id, dir, vec![name]);
     }
 
     /// Record a folder as visited. Most recent first, no duplicates, bounded.
@@ -968,7 +1055,11 @@ impl AppState {
     pub fn config(&self, hwnd: HWND) -> Config {
         let mut c = Config {
             layout: crate::config::tree_to_text(&self.layout_tree),
-            theme_dark: self.theme.is_dark(),
+            theme: self.theme.name().to_string(),
+            font: self.font.clone(),
+            font_size: self.font_size,
+            density: self.density,
+            folder_sizes: self.folder_sizes,
             sidebar_visible: self.sidebar_visible,
             show_hidden: self.show_hidden,
             sync_scroll: self.sync_scroll,
@@ -1297,10 +1388,10 @@ mod tests {
     fn titlebar_caption_matches_the_tab_strip() {
         // The caption is painted by DWM from a COLORREF; if this mapping is
         // wrong the title bar is a different grey from the rest of the chrome.
-        let p = Theme::Dark.palette();
+        let p = Theme::DARK.palette();
         assert_eq!(colorref(p.tab_bar_bg).0, 0x00181514); // 0x141518 in BGR
         assert_eq!(colorref(p.text).0, 0x00EDEAE8); // 0xE8EAED in BGR
-        let light = Theme::Light.palette();
+        let light = Theme::by_name("Light").unwrap().palette();
         assert_eq!(colorref(light.tab_bar_bg).0, 0x00EDE9E7); // 0xE7E9ED in BGR
     }
 }

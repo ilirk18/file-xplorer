@@ -37,6 +37,9 @@ struct MenuItem {
     text: Vec<u16>,
     accel: Vec<u16>,
     separator: bool,
+    /// Opens a submenu. Windows draws the arrow for these even though they are
+    /// owner-drawn, so all this does is reserve the room for it.
+    popup: bool,
 }
 
 struct Ctx {
@@ -127,6 +130,7 @@ impl ThemedMenu {
                 text: wide(text),
                 accel: wide(accel),
                 separator: false,
+                popup: false,
             },
         );
     }
@@ -143,6 +147,7 @@ impl ThemedMenu {
                 text: wide(text),
                 accel: Vec::new(),
                 separator: false,
+                popup: false,
             },
         );
     }
@@ -156,8 +161,59 @@ impl ThemedMenu {
                 text: Vec::new(),
                 accel: Vec::new(),
                 separator: true,
+                popup: false,
             },
         );
+    }
+
+    /// Add a submenu and return it, so the caller can fill it.
+    ///
+    /// With MF_POPUP the id slot carries the child's handle instead of a
+    /// command id, which is why this cannot go through `add`. Destroying the
+    /// parent destroys the child with it, so ownership does not change.
+    ///
+    /// Returns None only if Windows refuses to make a menu, in which case the
+    /// caller has nothing to fill and the entry is simply not there.
+    pub fn submenu(&mut self, menu: HMENU, text: &str) -> Option<HMENU> {
+        let child = unsafe { CreatePopupMenu().ok()? };
+        // The child inherits the parent's background, and its items are drawn
+        // by the same owner-draw path: the pointer check in `ours` is by
+        // item, not by menu.
+        let info = MENUINFO {
+            cbSize: std::mem::size_of::<MENUINFO>() as u32,
+            fMask: MIM_BACKGROUND | MIM_APPLYTOSUBMENUS,
+            hbrBack: self.back,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = SetMenuInfo(child, &info);
+        }
+        self.place_popup(menu, child, text);
+        Some(child)
+    }
+
+    fn place_popup(&mut self, menu: HMENU, child: HMENU, text: &str) {
+        let boxed = Box::new(MenuItem {
+            text: wide(text),
+            accel: Vec::new(),
+            separator: false,
+            popup: true,
+        });
+        let ptr = &*boxed as *const MenuItem as usize;
+        self.items.push(boxed);
+        CTX.with(|c| {
+            if let Some(ctx) = c.borrow_mut().as_mut() {
+                ctx.ours.insert(ptr);
+            }
+        });
+        unsafe {
+            let _ = AppendMenuW(
+                menu,
+                MF_OWNERDRAW | MF_POPUP,
+                child.0 as usize,
+                PCWSTR(ptr as *const u16),
+            );
+        }
     }
 
     /// Id 0, which `TrackPopupMenu` reports the same as "nothing was chosen".
@@ -169,6 +225,7 @@ impl ThemedMenu {
                 text: Vec::new(),
                 accel: Vec::new(),
                 separator: true,
+                popup: false,
             },
         );
     }
@@ -221,7 +278,10 @@ pub fn handle_menu_msg(msg: u32, _wparam: WPARAM, lparam: LPARAM) -> Option<LRES
                 let accel = measure(ctx.font, &item.accel);
                 // Four pads: leading, between text and accelerator, trailing,
                 // and one more so the gap between the two columns reads.
-                mis.itemWidth = (text + accel + ctx.pad * 4) as u32;
+                // A submenu needs a column for the arrow Windows draws itself:
+                // without it the arrow lands on the last letter of the label.
+                let arrow = if item.popup { ctx.row_h } else { 0 };
+                mis.itemWidth = (text + accel + arrow + ctx.pad * 4) as u32;
                 mis.itemHeight = ctx.row_h as u32;
                 Some(LRESULT(1))
             })

@@ -10,7 +10,7 @@
 // there is nothing useful to carry across.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WPARAM};
@@ -45,13 +45,23 @@ impl SendHwnd {
 }
 
 pub struct Watcher {
-    handle: SendHandle,
+    /// Filled in by the watching thread once the directory is open, and
+    /// closed by that same thread when it exits. The lock is what lets the UI
+    /// cancel a read without racing that close.
+    handle: Arc<Mutex<Option<SendHandle>>>,
     stop: Arc<AtomicBool>,
 }
 
 impl Watcher {
-    /// Begin watching `path`. Returns None if the directory cannot be opened,
-    /// which is not an error worth reporting: it just means no live updates.
+    /// Begin watching `path`.
+    ///
+    /// Returns immediately: opening the directory happens on the watching
+    /// thread, because `CreateFileW` on an unreachable share blocks until SMB
+    /// gives up, and this is called from the UI thread every time a pane
+    /// navigates. A share that is merely slow used to freeze the window.
+    ///
+    /// Failing to open is not an error worth reporting — it only means no
+    /// live updates for that folder.
     pub fn start(
         hwnd: windows::Win32::Foundation::HWND,
         pid: usize,
@@ -63,30 +73,42 @@ impl Watcher {
         }
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
 
-        // FILE_FLAG_BACKUP_SEMANTICS is what makes CreateFileW open a directory.
-        // Sharing everything so our watch never blocks anyone else's rename or
-        // delete of this folder.
-        let handle = unsafe {
-            CreateFileW(
-                PCWSTR::from_raw(wide.as_ptr()),
-                FILE_LIST_DIRECTORY.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                None,
-            )
-        }
-        .ok()?;
-
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
-        let thread_handle = SendHandle(handle);
+        let shared: Arc<Mutex<Option<SendHandle>>> = Arc::new(Mutex::new(None));
+        let thread_shared = shared.clone();
         let thread_hwnd = SendHwnd(hwnd);
 
-
         std::thread::spawn(move || {
-            let handle = thread_handle.get();
+            // FILE_FLAG_BACKUP_SEMANTICS is what makes CreateFileW open a
+            // directory. Sharing everything so our watch never blocks anyone
+            // else's rename or delete of this folder.
+            let Ok(handle) = (unsafe {
+                CreateFileW(
+                    PCWSTR::from_raw(wide.as_ptr()),
+                    FILE_LIST_DIRECTORY.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+            }) else {
+                return;
+            };
+            // The pane may already have moved on while the share was timing
+            // out. Publishing the handle and checking the flag under one lock
+            // is what keeps `stop` from missing it.
+            {
+                let mut slot = thread_shared.lock().unwrap_or_else(|e| e.into_inner());
+                if thread_stop.load(Ordering::Relaxed) {
+                    unsafe {
+                        let _ = CloseHandle(handle);
+                    }
+                    return;
+                }
+                *slot = Some(SendHandle(handle));
+            }
             let hwnd = thread_hwnd.get();
             let mut buf = vec![0u8; 8192];
             loop {
@@ -125,23 +147,37 @@ impl Watcher {
                     break;
                 }
             }
-            unsafe {
-                let _ = CloseHandle(handle);
+            // This thread is the only closer. Taking it under the lock is
+            // what stops `stop` from cancelling a handle that is already gone.
+            let taken = thread_shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(h) = taken {
+                unsafe {
+                    let _ = CloseHandle(h.get());
+                }
             }
         });
 
-        Some(Watcher {
-            handle: SendHandle(handle),
-            stop,
-        })
+        Some(Watcher { handle: shared, stop })
     }
 
     fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Unblocks the thread's ReadDirectoryChangesW; the thread then closes
-        // the handle itself, so there is exactly one owner of the close.
-        unsafe {
-            let _ = CancelIoEx(self.handle.0, None);
+        // The thread is still the only one that closes the handle, as before.
+        // Cancelling under the same lock it closes under is what stops us
+        // cancelling a handle it has just closed and Windows has handed to
+        // somebody else.
+        //
+        // If the directory is not open yet — a share that is still timing
+        // out — there is nothing to cancel, and the flag set above is what
+        // the thread checks before it publishes a handle at all.
+        let slot = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = *slot {
+            unsafe {
+                let _ = CancelIoEx(h.get(), None);
+            }
         }
     }
 }
@@ -149,5 +185,46 @@ impl Watcher {
 impl Drop for Watcher {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::HWND;
+
+    #[test]
+    fn starting_a_watch_never_waits_for_the_directory() {
+        // The whole point of opening on the thread: an unreachable share makes
+        // CreateFileW sit there until SMB gives up, and this is called from the
+        // UI thread on every navigation. A .invalid host cannot resolve, by
+        // RFC 2606, so this is the slow case on any machine.
+        let path = concat!(r"\\", r"\\", "no-such-host.invalid", r"\\", "share");
+        let began = std::time::Instant::now();
+        let w = Watcher::start(HWND::default(), 0, 0, path);
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(250),
+            "start blocked for {:?}",
+            began.elapsed()
+        );
+        // And stopping one whose handle was never published is not a crash:
+        // the thread is still inside CreateFileW at this point.
+        drop(w);
+    }
+
+    #[test]
+    fn a_watch_on_a_real_folder_starts_and_stops_cleanly() {
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let w = Watcher::start(HWND::default(), 0, 0, &dir).expect("a watcher");
+        // Long enough for the thread to have opened the directory and be
+        // blocked in ReadDirectoryChangesW, which is the case `stop` cancels.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        drop(w);
+    }
+
+    #[test]
+    fn an_empty_path_is_not_watched_at_all() {
+        assert!(Watcher::start(HWND::default(), 0, 0, "").is_none());
     }
 }

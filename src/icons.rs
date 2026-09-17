@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
-use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
+use windows::Win32::UI::Shell::{PathIsNetworkPathW, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
 fn wide(s: &str) -> Vec<u16> {
@@ -79,6 +79,17 @@ unsafe fn lookup(key: &str) -> Option<HICON> {
         // Recycle Bin's icon is the one that says whether it is full.
         if crate::shellns::is_shell_path(real) {
             return icon_for_shell_path(real);
+        }
+        // A real location is a disk read, and on an unreachable share that
+        // read blocks until SMB gives up \u2014 on the paint path, since this is
+        // what draws the sidebar.
+        //
+        // ponytail: a network place gets the generic folder icon. Asking for
+        // the real one on a worker and filling it in later is the upgrade, and
+        // it is the thumbnail cache's shape; nobody has missed the icon yet.
+        let w = wide(real);
+        if PathIsNetworkPathW(PCWSTR::from_raw(w.as_ptr())).as_bool() {
+            return lookup("<dir>");
         }
         (
             real.to_string(),

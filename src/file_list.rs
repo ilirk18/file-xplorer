@@ -234,7 +234,10 @@ impl FileList {
     pub fn selected_size(&self) -> u64 {
         self.selected_entries()
             .iter()
-            .filter(|e| !e.is_dir)
+            // A folder counts once somebody has walked it. Before that its
+            // size is not zero, it is unknown, and adding zero would be a
+            // quieter kind of wrong.
+            .filter(|e| !e.is_dir || e.dir_size_known)
             .map(|e| e.size)
             .sum()
     }
@@ -475,6 +478,10 @@ impl FileList {
     pub fn set_entries(&mut self, entries: Vec<FileEntry>) {
         // A comparison belongs to the listing it was run on.
         self.differing.clear();
+        // So does a folder size. They are keyed by name, and two folders in
+        // two places can share one \u2014 which showed the old folder's size
+        // against the new folder's name.
+        self.dir_sizes.clear();
         self.all = entries;
         self.rebuild();
         self.scroll_offset = 0;
@@ -889,10 +896,26 @@ mod tests {
         let docs = list.entries.iter().find(|e| e.name == "docs").unwrap();
         assert_eq!(docs.size_display(), "2 KB");
 
+        // And the footer's total agrees with the column: an unwalked folder is
+        // left out, a walked one is counted.
+        let docs_row = list.entries.iter().position(|e| e.name == "docs").unwrap() as u32;
+        list.select(docs_row, crate::file_list::SelectMode::Replace);
+        assert_eq!(list.selected_size(), 2048);
+        let src_row = list.entries.iter().position(|e| e.name == "src").unwrap() as u32;
+        list.select(src_row, crate::file_list::SelectMode::Replace);
+        assert_eq!(list.selected_size(), 0, "not walked, so not counted");
+
         // A reload must not throw the work away.
         list.refresh_entries(vec![entry("docs", true), entry("src", true)]);
         let docs = list.entries.iter().find(|e| e.name == "docs").unwrap();
         assert_eq!(docs.size_display(), "2 KB");
+
+        // Navigating somewhere else must. Sizes are keyed by name, and every
+        // second project has a "docs" in it \u2014 this showed the last
+        // folder's size against the new folder's name.
+        list.set_entries(vec![entry("docs", true), entry("bin", true)]);
+        let docs = list.entries.iter().find(|e| e.name == "docs").unwrap();
+        assert_eq!(docs.size_display(), "", "a different folder, a different size");
     }
 
     #[test]

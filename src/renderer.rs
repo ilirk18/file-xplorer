@@ -39,6 +39,9 @@ use crate::layout::{
 use crate::theme::{Palette, Rgb, Theme};
 
 // Segoe MDL2 Assets code points. Present on every Windows 10 and 11 install.
+/// What the UI is drawn in unless the settings say otherwise.
+pub const DEFAULT_FONT: &str = "Segoe UI";
+
 pub mod glyph {
     pub const BACK: &str = "\u{E72B}";
     pub const FORWARD: &str = "\u{E72A}";
@@ -58,9 +61,12 @@ pub mod glyph {
     pub const DELETE: &str = "\u{E74D}";
     pub const SORT: &str = "\u{E8CB}";
     pub const VIEW: &str = "\u{E890}";
-    pub const MORE: &str = "\u{E712}";
-    pub const PANE: &str = "\u{E8A0}";
+    /// The details panel, shut and open. A toggle whose icon never changes is
+    /// a button that does not say what it did.
+    pub const PANE_CLOSED: &str = "\u{E8A0}";
+    pub const PANE_OPEN: &str = "\u{E8A1}";
     pub const SHARE: &str = "\u{E72D}";
+    pub const SETTINGS: &str = "\u{E713}";
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -134,6 +140,9 @@ pub struct BarButtonView<'a> {
     pub label: &'a str,
     pub menu: bool,
     pub enabled: bool,
+    /// A toggle that is currently on, drawn in the accent colour so the state
+    /// reads without having to remember which icon means which.
+    pub on: bool,
 }
 
 /// Everything the renderer needs to paint the sidebar.
@@ -149,12 +158,16 @@ pub struct SidebarView<'a> {
 }
 
 struct Formats {
+    /// The inspector's heading: the one place a name is a title rather than a
+    /// row.
+    title: IDWriteTextFormat,
     body: IDWriteTextFormat,
     body_right: IDWriteTextFormat,
     small: IDWriteTextFormat,
     small_bold: IDWriteTextFormat,
     small_right: IDWriteTextFormat,
     tiny: IDWriteTextFormat,
+    tiny_right: IDWriteTextFormat,
     caption: IDWriteTextFormat,
     icon: IDWriteTextFormat,
     centered: IDWriteTextFormat,
@@ -174,6 +187,9 @@ pub struct Renderer {
     formats: Formats,
     theme: Theme,
     dpi: u32,
+    /// The UI font family and its size as a percentage. Kept so the formats
+    /// can be rebuilt at a new DPI without asking the caller again.
+    font: (String, i32),
 
     icons: IconCache,
     /// Shell icons converted to D2D bitmaps. Cleared whenever the render target
@@ -192,13 +208,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(theme: Theme, dpi: u32) -> Result<Self> {
+    pub fn new(theme: Theme, dpi: u32, font: &str, font_pct: i32) -> Result<Self> {
         let factory: ID2D1Factory1 =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         let wic: IWICImagingFactory =
             unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
-        let formats = Self::make_formats(&dwrite, dpi)?;
+        let formats = Self::make_formats(&dwrite, dpi, font, font_pct)?;
         Ok(Self {
             factory,
             dwrite,
@@ -208,6 +224,7 @@ impl Renderer {
             formats,
             theme,
             dpi,
+            font: (font.to_string(), font_pct),
             icons: IconCache::new(),
             icon_bitmaps: HashMap::new(),
             preview_bitmap: None,
@@ -216,9 +233,23 @@ impl Renderer {
         })
     }
 
-    fn make_formats(dwrite: &IDWriteFactory, dpi: u32) -> Result<Formats> {
-        let scale = dpi as f32 / 96.0;
-        let ui = wide("Segoe UI");
+    fn make_formats(
+        dwrite: &IDWriteFactory,
+        dpi: u32,
+        family: &str,
+        font_pct: i32,
+    ) -> Result<Formats> {
+        // A family DirectWrite does not know falls back to a default at draw
+        // time rather than failing here, which is the behaviour we want: a
+        // typo in the settings file should not be a window that will not open.
+        let scale = dpi as f32 / 96.0
+            * (font_pct.clamp(crate::layout::FONT_MIN, crate::layout::FONT_MAX) as f32)
+            / 100.0;
+        let ui = wide(if family.trim().is_empty() {
+            DEFAULT_FONT
+        } else {
+            family.trim()
+        });
         let mdl2 = wide("Segoe MDL2 Assets");
         let locale = wide("en-us");
 
@@ -266,12 +297,14 @@ impl Renderer {
         use DWRITE_TEXT_ALIGNMENT_TRAILING as TRAILING;
 
         Ok(Formats {
+            title: mk(&ui, 15.0, SEMI, LEADING, true)?,
             body: mk(&ui, 12.5, NORMAL, LEADING, true)?,
             body_right: mk(&ui, 12.5, NORMAL, TRAILING, true)?,
             small: mk(&ui, 12.0, NORMAL, LEADING, true)?,
             small_bold: mk(&ui, 12.0, SEMI, LEADING, true)?,
             small_right: mk(&ui, 12.0, NORMAL, TRAILING, true)?,
             tiny: mk(&ui, 10.5, NORMAL, LEADING, true)?,
+            tiny_right: mk(&ui, 10.5, NORMAL, TRAILING, true)?,
             caption: mk(&ui, 10.5, SEMI, LEADING, true)?,
             icon: mk(&mdl2, 10.0, NORMAL, CENTER, false)?,
             centered: mk(&ui, 12.5, NORMAL, CENTER, false)?,
@@ -300,6 +333,54 @@ impl Renderer {
         self.theme = theme;
     }
 
+    /// Change the UI font. The glyph font is not a choice: it is the icon set.
+    pub fn set_font(&mut self, family: &str, font_pct: i32) -> Result<()> {
+        self.font = (family.to_string(), font_pct);
+        self.formats = Self::make_formats(&self.dwrite, self.dpi, family, font_pct)?;
+        self.measure_cache.borrow_mut().clear();
+        Ok(())
+    }
+
+    /// Every font family installed, sorted. Asked once, when the picker opens.
+    pub fn font_families(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        unsafe {
+            let mut collection = None;
+            if self
+                .dwrite
+                .GetSystemFontCollection(&mut collection, false)
+                .is_err()
+            {
+                return out;
+            }
+            let Some(collection) = collection else {
+                return out;
+            };
+            for i in 0..collection.GetFontFamilyCount() {
+                let Ok(family) = collection.GetFontFamily(i) else {
+                    continue;
+                };
+                let Ok(names) = family.GetFamilyNames() else {
+                    continue;
+                };
+                // Index 0 is the family's own preferred name; asking for the
+                // user's locale and falling back to it is more code than this
+                // list is worth.
+                let Ok(len) = names.GetStringLength(0) else {
+                    continue;
+                };
+                let mut buf = vec![0u16; len as usize + 1];
+                if names.GetString(0, &mut buf).is_err() {
+                    continue;
+                }
+                let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                out.push(String::from_utf16_lossy(&buf[..end]));
+            }
+        }
+        out.sort();
+        out
+    }
+
     fn palette(&self) -> &'static Palette {
         self.theme.palette()
     }
@@ -310,7 +391,7 @@ impl Renderer {
             return Ok(());
         }
         self.dpi = dpi;
-        self.formats = Self::make_formats(&self.dwrite, dpi)?;
+        self.formats = Self::make_formats(&self.dwrite, dpi, &self.font.0, self.font.1)?;
         self.measure_cache.borrow_mut().clear();
         Ok(())
     }
@@ -577,7 +658,13 @@ impl Renderer {
             if item.enabled && hover == Some(Hit::Bar(i)) {
                 self.fill_rounded(r, m.radius, p.row_hover);
             }
-            let fg = if item.enabled { p.text } else { p.text_faint };
+            let fg = if !item.enabled {
+                p.text_faint
+            } else if item.on {
+                p.accent
+            } else {
+                p.text
+            };
 
             // Glyph first, then the label, then the chevron — laid out left to
             // right so an icon-only button centres its glyph in the whole
@@ -624,23 +711,22 @@ impl Renderer {
         self.push_clip(r);
         let inner = Rect::new(r.x + m.pad * 2, r.y + m.pad, r.w - m.pad * 3, r.h - m.pad * 2);
         let line = m.row_h;
+        let hair = 1.max(m.scale as i32);
 
-        // Name first, then the facts, then whatever the file itself can show.
+        // The name is a title, not a row: it is the only thing in the panel
+        // that says what everything else is about.
         let mut y = inner.y;
         self.text(
             name,
-            Rect::new(inner.x, y, inner.w, line),
+            Rect::new(inner.x, y, inner.w, line * 5 / 4),
             p.text,
-            &self.formats.small_bold.clone(),
+            &self.formats.title.clone(),
         );
-        y += line;
-        for fact in [&v.kind, &v.size, &v.modified] {
-            if fact.is_empty() {
-                continue;
-            }
+        y += line * 5 / 4;
+        if !v.kind.is_empty() {
             self.text(
-                fact,
-                Rect::new(inner.x, y, inner.w, line),
+                &v.kind,
+                Rect::new(inner.x, y, inner.w, line * 3 / 4),
                 p.text_muted,
                 &self.formats.tiny.clone(),
             );
@@ -648,41 +734,137 @@ impl Renderer {
         }
         y += m.pad;
 
+        // Facts as a two-column table: the label says what the number is, and
+        // the numbers line up with each other down the right-hand edge.
+        let label_w = inner.w * 2 / 5;
+        for (label, value) in [("Size", &v.size), ("Modified", &v.modified)] {
+            if value.is_empty() {
+                continue;
+            }
+            self.fill(Rect::new(inner.x, y, inner.w, hair), p.divider);
+            y += m.pad / 2;
+            let h = line * 4 / 5;
+            self.text(
+                label,
+                Rect::new(inner.x, y, label_w, h),
+                p.text_faint,
+                &self.formats.tiny.clone(),
+            );
+            self.text(
+                value,
+                Rect::new(inner.x + label_w, y, inner.w - label_w, h),
+                p.text,
+                &self.formats.small_right.clone(),
+            );
+            y += h + m.pad / 2;
+        }
+
         let body = Rect::new(inner.x, y, inner.w, (inner.bottom() - y).max(0));
         if body.h <= line {
             self.pop_clip();
             return;
         }
-        let faint = |r: &mut Self, msg: &str| {
-            r.text(
-                msg,
-                Rect::new(body.x, body.y, body.w, line),
-                p.text_faint,
-                &r.formats.tiny.clone(),
-            )
-        };
         match v.preview {
             Some((key, crate::preview::Preview::Image(hbm))) => {
+                let body = self.section(body, "PREVIEW", "", m, p);
                 self.draw_preview_image(key, *hbm, body)
             }
             Some((_, crate::preview::Preview::Text(text))) => {
+                let body = self.section(body, "PREVIEW", "", m, p);
                 self.text(text, body, p.text_muted, &self.formats.preview.clone())
             }
-            // Peeking into a folder: the names, and how many did not fit.
-            Some((_, crate::preview::Preview::Folder { names, more })) => {
-                let mut listing = names.join("\r\n");
-                if *more > 0 {
-                    listing.push_str(&format!("\r\n\u{2026} and {} more", more));
-                }
-                self.text(&listing, body, p.text_muted, &self.formats.preview.clone())
+            // Peeking into a folder: the same icons the listing draws, and a
+            // count that says whether this is all of it.
+            Some((_, crate::preview::Preview::Folder { items, more })) => {
+                let total = items.len() + more;
+                let count = if *more > 0 {
+                    format!("{} of {}", items.len(), total)
+                } else if total == 1 {
+                    "1 item".to_string()
+                } else {
+                    format!("{} items", total)
+                };
+                let body = self.section(body, "CONTENTS", &count, m, p);
+                self.draw_peek(items, body, m, p);
             }
             Some((_, crate::preview::Preview::None)) => {
-                faint(self, "No preview for this kind of file.")
+                self.text(
+                    "No preview for this kind of file.",
+                    Rect::new(body.x, body.y + m.pad, body.w, line),
+                    p.text_faint,
+                    &self.formats.tiny.clone(),
+                );
             }
             // Nothing has come back from the worker yet.
-            None => faint(self, "Reading\u{2026}"),
+            None => {
+                self.text(
+                    "Reading\u{2026}",
+                    Rect::new(body.x, body.y + m.pad, body.w, line),
+                    p.text_faint,
+                    &self.formats.tiny.clone(),
+                );
+            }
         }
         self.pop_clip();
+    }
+
+    /// A rule, a heading and an optional count on its right. Returns what is
+    /// left of `area` underneath it.
+    fn section(&mut self, area: Rect, label: &str, right: &str, m: Metrics, p: &Palette) -> Rect {
+        let hair = 1.max(m.scale as i32);
+        let h = m.row_h * 4 / 5;
+        self.fill(Rect::new(area.x, area.y, area.w, hair), p.divider);
+        let y = area.y + m.pad / 2;
+        self.text(
+            label,
+            Rect::new(area.x, y, area.w, h),
+            p.text_faint,
+            &self.formats.caption.clone(),
+        );
+        if !right.is_empty() {
+            self.text(
+                right,
+                Rect::new(area.x, y, area.w, h),
+                p.text_faint,
+                &self.formats.tiny_right.clone(),
+            );
+        }
+        let used = m.pad / 2 + h + m.pad / 2;
+        Rect::new(area.x, area.y + used, area.w, (area.h - used).max(0))
+    }
+
+    /// The folder peek, one row per entry, stopping at the bottom of the panel
+    /// rather than drawing rows nobody can see.
+    fn draw_peek(
+        &mut self,
+        items: &[crate::preview::PeekItem],
+        area: Rect,
+        m: Metrics,
+        p: &Palette,
+    ) {
+        let h = m.row_h * 4 / 5;
+        let gap = m.pad / 2;
+        let mut y = area.y;
+        for it in items {
+            if y + h > area.bottom() {
+                break;
+            }
+            let icon = Rect::new(
+                area.x,
+                y + (h - m.icon_size) / 2,
+                m.icon_size,
+                m.icon_size,
+            );
+            self.draw_icon(&icon_key(it.extension.as_deref(), it.is_dir), icon);
+            let text_x = area.x + m.icon_size + gap;
+            self.text(
+                &it.name,
+                Rect::new(text_x, y, (area.right() - text_x).max(0), h),
+                if it.is_dir { p.text } else { p.text_muted },
+                &self.formats.tiny.clone(),
+            );
+            y += h;
+        }
     }
 
     /// Fit the thumbnail inside `area` without stretching it, pinned to the

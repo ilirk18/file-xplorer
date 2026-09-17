@@ -33,7 +33,20 @@ pub struct Config {
     /// `pane_count`/`splits` pair is still read so a settings file from before
     /// trees opens the way it was left.
     pub layout: String,
-    pub theme_dark: bool,
+    /// Theme by name, as `theme.rs` spells it. A name rather than an index so
+     /// the file still means the same thing when the table gains a row.
+    pub theme: String,
+    /// UI font family, and its size as a percentage. A family the system does
+    /// not have falls back at draw time rather than failing to start.
+    pub font: String,
+    pub font_size: i32,
+    /// Row height as a percentage. Text size already moves rows; this is the
+    /// part on top of it that is taste.
+    pub density: i32,
+    /// Size folders automatically when a folder opens. Off by default: a
+    /// recursive walk of a drive is how a file manager earns a reputation for
+    /// hanging, and the on-request command is still there.
+    pub folder_sizes: bool,
     pub sidebar_visible: bool,
     pub inspector: bool,
     pub command_bar: bool,
@@ -90,7 +103,12 @@ impl Default for Config {
             layout: String::new(),
             // No saved preference means "whatever Windows is set to". Once the
             // user toggles the theme the key is written and wins from then on.
-            theme_dark: crate::theme::system_dark(),
+            // No saved preference means "whatever Windows is set to".
+            theme: if crate::theme::system_dark() { "Dark" } else { "Light" }.to_string(),
+            font: crate::renderer::DEFAULT_FONT.to_string(),
+            font_size: 100,
+            density: 100,
+            folder_sizes: false,
             sidebar_visible: true,
             inspector: false,
             command_bar: true,
@@ -182,7 +200,11 @@ impl Config {
         format!(
             "# File Xplorer settings\n\
              layout={}\n\
-             theme_dark={}\n\
+             theme={}\n\
+             font={}\n\
+             font_size={}\n\
+             density={}\n\
+             folder_sizes={}\n\
              sidebar_visible={}\n\
              inspector={}\n\
              command_bar={}\n\
@@ -198,7 +220,11 @@ impl Config {
              compare={}\n\
              col_widths={},{},{}\n{}",
             self.layout,
-            self.theme_dark,
+            self.theme,
+            self.font,
+            self.font_size,
+            self.density,
+            self.folder_sizes,
             self.sidebar_visible,
             self.inspector,
             self.command_bar,
@@ -290,7 +316,27 @@ impl Config {
                         c.layout = tree_to_text(&crate::layout::Node::columns(2));
                     }
                 }
-                "theme_dark" => c.theme_dark = value.parse().unwrap_or(c.theme_dark),
+                "font" => {
+                    if !value.is_empty() {
+                        c.font = value.to_string();
+                    }
+                }
+                "font_size" => c.font_size = value.parse().unwrap_or(c.font_size),
+                "density" => c.density = value.parse().unwrap_or(c.density),
+                "folder_sizes" => c.folder_sizes = value.parse().unwrap_or(c.folder_sizes),
+                "theme" => {
+                    if !value.is_empty() {
+                        c.theme = value.to_string();
+                    }
+                }
+                // Files written before themes had names.
+                "theme_dark" => {
+                    c.theme = match value.parse::<bool>() {
+                        Ok(true) => "Dark".into(),
+                        Ok(false) => "Light".into(),
+                        Err(_) => c.theme,
+                    }
+                }
                 "sidebar_visible" => {
                     c.sidebar_visible = value.parse().unwrap_or(c.sidebar_visible)
                 }
@@ -528,7 +574,11 @@ mod tests {
     fn round_trips() {
         let c = Config {
             layout: "V(0,0.5,V(1,0.5,2))".to_string(),
-            theme_dark: false,
+            theme: "Sepia".into(),
+            font: "Consolas".into(),
+            font_size: 125,
+            density: 85,
+            folder_sizes: true,
             sidebar_visible: false,
             inspector: true,
             command_bar: false,
@@ -640,6 +690,6 @@ mod tests {
     #[test]
     fn comments_and_whitespace_are_tolerated() {
         let c = Config::from_text("# hi\n\n  theme_dark = false  \n");
-        assert!(!c.theme_dark);
+        assert_eq!(c.theme, "Light", "a file from before themes had names");
     }
 }

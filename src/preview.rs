@@ -32,9 +32,9 @@ pub enum Preview {
     /// A shell thumbnail. Owned: the bitmap is deleted when this is dropped.
     Image(HBITMAP),
     Text(String),
-    /// What is inside a folder, without going into it: names, folders first,
-    /// and how many more there were.
-    Folder { names: Vec<String>, more: usize },
+    /// What is inside a folder, without going into it: entries, folders
+    /// first, and how many more there were.
+    Folder { items: Vec<PeekItem>, more: usize },
     /// Nothing to show beyond the facts the listing already has.
     None,
 }
@@ -153,6 +153,15 @@ pub fn cell_image(path: &str, extension: Option<&str>, edge: i32) -> Option<HBIT
 /// `edge` is the longest side wanted, in pixels. The shell is allowed to
 /// return something larger (SIIGBF_BIGGERSIZEOK) because a cached thumbnail at
 /// the next size up is free, while forcing an exact size re-renders it.
+/// One line of a folder peek. Carries what the icon lookup needs, so the
+/// inspector can draw the same icons the listing does rather than marking
+/// folders with a trailing slash.
+pub struct PeekItem {
+    pub name: String,
+    pub is_dir: bool,
+    pub extension: Option<String>,
+}
+
 /// Names offered for a folder. A screenful; past that the answer to "what is
 /// in here" is to go in.
 const PEEK_NAMES: usize = 60;
@@ -172,15 +181,13 @@ pub fn build(path: &str, is_dir: bool, extension: Option<&str>, edge: i32) -> Pr
         });
         let more = entries.len().saturating_sub(PEEK_NAMES);
         return Preview::Folder {
-            names: entries
+            items: entries
                 .iter()
                 .take(PEEK_NAMES)
-                .map(|e| {
-                    if e.is_dir {
-                        format!("{}\\", e.name)
-                    } else {
-                        e.name.clone()
-                    }
+                .map(|e| PeekItem {
+                    name: e.name.clone(),
+                    is_dir: e.is_dir,
+                    extension: e.extension.clone(),
                 })
                 .collect(),
             more,
@@ -274,9 +281,15 @@ mod tests {
         let path = dir.to_string_lossy().into_owned();
 
         match build(&path, true, None, 256) {
-            Preview::Folder { ref names, more } => {
-                // Folders first whatever they are called, and marked as such.
-                assert_eq!(names[..], ["zeta-folder\\".to_string(), "alpha.txt".to_string()]);
+            Preview::Folder { ref items, more } => {
+                // Folders first whatever they are called, and each carrying
+                // what the icon lookup needs — which is why the name is no
+                // longer decorated with a slash to say it is one.
+                let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+                assert_eq!(names, ["zeta-folder", "alpha.txt"]);
+                assert!(items[0].is_dir);
+                assert!(!items[1].is_dir);
+                assert_eq!(items[1].extension.as_deref(), Some(".txt"));
                 assert_eq!(more, 0);
             }
             _ => panic!("a folder should preview as its contents"),
@@ -293,8 +306,8 @@ mod tests {
             std::fs::write(dir.join(format!("f{:03}.txt", i)), b"x").unwrap();
         }
         match build(&dir.to_string_lossy(), true, None, 256) {
-            Preview::Folder { ref names, more } => {
-                assert_eq!(names.len(), PEEK_NAMES);
+            Preview::Folder { ref items, more } => {
+                assert_eq!(items.len(), PEEK_NAMES);
                 assert_eq!(more, 7);
             }
             _ => panic!("still a folder"),
