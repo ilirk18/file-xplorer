@@ -23,6 +23,10 @@ pub fn push_recent(history: &mut Vec<String>, path: &str) {
     history.truncate(MAX_RECENT);
 }
 
+/// How many folders keep their own sort and view. Only a deliberate change
+/// writes one, so this is a few years of them.
+pub const MAX_FOLDER_VIEWS: usize = 200;
+
 /// How many visited folders are kept. Enough to cover a session's worth of
 /// jumping about, short enough that the list stays pickable.
 pub const MAX_RECENT: usize = 20;
@@ -30,8 +34,8 @@ pub const MAX_RECENT: usize = 20;
 #[derive(Clone, PartialEq, Debug)]
 pub struct Config {
     /// The pane tree, as text. Empty means "one pane", and the older
-    /// `pane_count`/`splits` pair is still read so a settings file from before
-    /// trees opens the way it was left.
+    /// `pane_count` key is still read so a settings file from before trees
+    /// opens the way it was left.
     pub layout: String,
     /// Theme by name, as `theme.rs` spells it. A name rather than an index so
      /// the file still means the same thing when the table gains a row.
@@ -53,11 +57,6 @@ pub struct Config {
     /// Icon edge in DIPs, or 0 for the details list.
     pub icons: i32,
     pub show_hidden: bool,
-    /// One fraction of the body width per divider. Fractions rather than
-    /// pixels so a window resize keeps the panes in proportion; an empty or
-    /// wrong-length list means "share the width evenly".
-    pub splits: Vec<f32>,
-
     /// Restored window box. `win_x == UNSET` means "let Windows place it".
     pub win_x: i32,
     pub win_y: i32,
@@ -80,6 +79,12 @@ pub struct Config {
     /// the menu showed. Matching on text is approximate once the machine
     /// changes language, which is honest for a convenience feature.
     pub pin_actions: Vec<String>,
+    /// How each folder was last looked at, most recently changed first, as
+    /// (lowercased path, sort key, ascending, icon size).
+    pub folder_views: Vec<(String, u8, bool, i32)>,
+    /// Named pane trees, as (name, the same text `layout` uses). A saved
+    /// layout is a layout, so it is stored the way one already is.
+    pub saved_layouts: Vec<(String, String)>,
     /// Shortcuts that differ from the defaults, as (chord text, command
     /// label). An empty chord means the command has had its shortcut removed.
     pub binds: Vec<(String, String)>,
@@ -114,7 +119,6 @@ impl Default for Config {
             command_bar: true,
             icons: 0,
             show_hidden: false,
-            splits: Vec::new(),
             win_x: UNSET,
             win_y: UNSET,
             win_w: 1200,
@@ -126,34 +130,13 @@ impl Default for Config {
             active_tab: vec![0; MAX_PANES],
             pins: Vec::new(),
             pin_actions: Vec::new(),
+            saved_layouts: Vec::new(),
+            folder_views: Vec::new(),
             recent: Vec::new(),
             binds: Vec::new(),
             sort: vec![(0, true); MAX_PANES],
             col_widths: [96, 84, 124],
         }
-    }
-}
-
-/// Fractions as plain text: "0.33,0.66". Anything unparseable yields an empty
-/// list, which the layout reads as "share the width evenly".
-fn join_splits(splits: &[f32]) -> String {
-    splits
-        .iter()
-        .map(|f| format!("{:.4}", f))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn parse_splits(value: &str) -> Vec<f32> {
-    if value.trim().is_empty() {
-        return Vec::new();
-    }
-    let parsed: Option<Vec<f32>> = value.split(',').map(|p| p.trim().parse().ok()).collect();
-    // A fraction outside 0..1 would put a divider off screen; drop the lot and
-    // let the layout even things out rather than restoring something unusable.
-    match parsed {
-        Some(v) if v.iter().all(|f| (0.0..=1.0).contains(f)) => v,
-        _ => Vec::new(),
     }
 }
 
@@ -210,7 +193,6 @@ impl Config {
              command_bar={}\n\
              icons={}\n\
              show_hidden={}\n\
-             splits={}\n\
              win_x={}\n\
              win_y={}\n\
              win_w={}\n\
@@ -230,7 +212,6 @@ impl Config {
             self.command_bar,
             self.icons,
             self.show_hidden,
-            join_splits(&self.splits),
             self.win_x,
             self.win_y,
             self.win_w,
@@ -256,6 +237,14 @@ impl Config {
         }
         for a in &self.pin_actions {
             out.push_str(&format!("pinaction={}\n", a));
+        }
+        for (path, key, asc, icons) in self.folder_views.iter().take(MAX_FOLDER_VIEWS) {
+            out.push_str(&format!("folderview={}={},{},{}
+", path, key, asc, icons));
+        }
+        for (name, tree) in &self.saved_layouts {
+            out.push_str(&format!("savedlayout={}={}
+", name, tree));
         }
         for (chord, label) in &self.binds {
             out.push_str(&format!("bind={}={}
@@ -352,7 +341,6 @@ impl Config {
                     }
                 }
                 "show_hidden" => c.show_hidden = value.parse().unwrap_or(c.show_hidden),
-                "splits" => c.splits = parse_splits(value),
                 "win_x" => c.win_x = value.parse().unwrap_or(c.win_x),
                 "win_y" => c.win_y = value.parse().unwrap_or(c.win_y),
                 "win_w" => c.win_w = value.parse().unwrap_or(c.win_w),
@@ -368,6 +356,33 @@ impl Config {
                 "pinaction" => {
                     if !value.is_empty() {
                         c.pin_actions.push(value.to_string());
+                    }
+                }
+                // `folderview=<path>=<key>,<ascending>,<icons>`. The path
+                // comes first and can hold anything, so as with `bind` the
+                // split is at the first "=" and the fixed part is what follows.
+                "folderview" => {
+                    if c.folder_views.len() >= MAX_FOLDER_VIEWS {
+                        continue;
+                    }
+                    if let Some((path, rest)) = value.split_once('=') {
+                        let f: Vec<&str> = rest.split(',').collect();
+                        if let (3, false) = (f.len(), path.is_empty()) {
+                            if let (Ok(key), Ok(asc), Ok(icons)) =
+                                (f[0].trim().parse(), f[1].trim().parse(), f[2].trim().parse())
+                            {
+                                c.folder_views.push((path.to_lowercase(), key, asc, icons));
+                            }
+                        }
+                    }
+                }
+                // `savedlayout=<name>=<tree>`, split at the first "=" as
+                // `bind` is: a name is free text and a tree never contains one.
+                "savedlayout" => {
+                    if let Some((name, tree)) = value.split_once('=') {
+                        if !name.is_empty() && tree_checked(tree).is_some() {
+                            c.saved_layouts.push((name.to_string(), tree.to_string()));
+                        }
                     }
                 }
                 "bind" => {
@@ -474,30 +489,51 @@ fn parse_node(text: &str) -> Option<(crate::layout::Node, &str)> {
     ))
 }
 
-impl Config {
-    /// The saved tree, or one pane. A tree naming the same pane twice is
-    /// refused: two leaves sharing an id would be two views of one pane's
-    /// tabs, and every operation on it would fight itself.
-    pub fn tree(&self) -> crate::layout::Node {
-        let fallback = || crate::layout::Node::columns(1);
-        let Some(node) = tree_from_text(&self.layout) else {
-            return fallback();
-        };
-        let leaves = node.leaves();
-        let mut seen: Vec<crate::layout::PaneId> = Vec::new();
-        for id in &leaves {
-            if seen.contains(id) {
-                return fallback();
-            }
-            seen.push(*id);
+/// A tree that is safe to show. A tree naming the same pane twice is refused:
+/// two leaves sharing an id would be two views of one pane's tabs, and every
+/// operation on it would fight itself.
+pub fn tree_checked(text: &str) -> Option<crate::layout::Node> {
+    let node = tree_from_text(text)?;
+    let mut seen: Vec<crate::layout::PaneId> = Vec::new();
+    for id in node.leaves() {
+        if seen.contains(&id) {
+            return None;
         }
-        node
+        seen.push(id);
+    }
+    Some(node)
+}
+
+impl Config {
+    /// The saved tree, or one pane, because a settings file nobody can parse
+    /// should still start the app.
+    pub fn tree(&self) -> crate::layout::Node {
+        tree_checked(&self.layout).unwrap_or_else(|| crate::layout::Node::columns(1))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_view_is_lowercased_and_a_malformed_one_is_dropped() {
+        let c = Config::from_text(
+            "folderview=C:\\Users=2,false,-72\nfolderview=C:\\bad=2,false\nfolderview=C:\\x=zz,true,0\n",
+        );
+        assert_eq!(c.folder_views, vec![("c:\\users".to_string(), 2, false, -72)]);
+    }
+
+    #[test]
+    fn a_saved_layout_that_will_not_parse_is_dropped_on_the_way_in() {
+        // A tree that will not parse, and one naming a pane twice, are both
+        // refused on the way in: a layout you cannot switch to is worse in
+        // the list than missing from it.
+        let c = Config::from_text(
+            "savedlayout=Bad=V(0,0.5,\nsavedlayout=Twice=V(0,0.500,0)\nsavedlayout=Good=1\n",
+        );
+        assert_eq!(c.saved_layouts, vec![("Good".to_string(), "1".to_string())]);
+    }
 
     #[test]
     fn recent_is_most_recent_first_deduplicated_and_bounded() {
@@ -584,7 +620,6 @@ mod tests {
             command_bar: false,
             icons: 96,
             show_hidden: true,
-            splits: vec![0.25, 0.75],
             win_x: -1400,
             win_y: 20,
             win_w: 900,
@@ -599,6 +634,8 @@ mod tests {
                 Vec::new(),
             ],
             active_tab: vec![1, 0, 0, 0],
+            folder_views: vec![("c:\\users\\foo".into(), 2, false, -72)],
+            saved_layouts: vec![("Two up".into(), "V(0,0.500,1)".into())],
             pins: vec!["C:\\pinned".into()],
             // A label with a space and an ampersand: menu text has both.
             pin_actions: vec!["Open with".into(), "Scan && clean".into()],
@@ -638,13 +675,6 @@ mod tests {
         // An older build must survive a file written by a newer one.
         let c = Config::from_text("pane_count=2\nfuture_option=42\n");
         assert_eq!(c.tree().count(), 2);
-    }
-
-    #[test]
-    fn a_split_outside_the_window_is_rejected_whole() {
-        // 1.4 would put a divider past the right edge; the pair goes with it.
-        assert!(Config::from_text("splits=0.5,1.4\n").splits.is_empty());
-        assert_eq!(Config::from_text("splits=0.5\n").splits, vec![0.5]);
     }
 
     #[test]

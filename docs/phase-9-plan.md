@@ -19,8 +19,8 @@ three other things are blocked behind it.
 | # | Work | Cost | Risk | Why here |
 |---|---|---|---|---|
 | 9 | Command line, multiple windows | Low | Low | Blocks 13; two-line feature, long-standing hole |
-| 10 | ~~Nested H/V layouts~~ — done. Saved layouts remain | **High** | **High** | Their headline; rewrote the pane model |
-| 11 | View continuum, tiles and list modes | Medium | Low | Grid machinery already generalises |
+| 10 | ~~Nested H/V layouts, saved layouts~~ — done | **High** | **High** | Their headline; rewrote the pane model |
+| 11 | ~~View continuum, tiles and list modes~~ — done | Medium | Low | Grid machinery already generalises |
 | 12 | ~~Searchable and pinnable context menu, richer GoTo~~ — done | Medium | Low | All of it reused the palette |
 | 12b | ~~Command bar: overflow, Share~~ — done; per-pane placement declined | Low | Low | The bar itself was done; these were what it did not cover |
 | 13 | ~~Default file manager~~ — written, yours to run | Medium | Medium | "More than both" — neither does it |
@@ -102,8 +102,19 @@ because a ratio is a fraction of whatever space its node actually got and only
 placement knows what that was. `Layout.client` went with it, having lost its
 last reader.
 
-Still to do: **saved named layouts**. The tree is already a string, so this is
-`savedlayout:<name>=` lines and two palette commands.
+**Saved named layouts — done.** The tree was already a string, so this was
+`savedlayout=<name>=<tree>` lines, spelled like `bind=` rather than the
+`savedlayout:<name>=` this plan first proposed: one key shape in the file beats
+two, and the value already splits at its first `=`.
+
+- A layout that will not parse, or that names one pane twice, is dropped as the
+  file is read — the check `Config::tree` already made for the live layout,
+  lifted out as `tree_checked` and now made by both.
+- Switching keeps the tabs of panes the layout leaves out, exactly as closing a
+  pane does, so switching back brings them straight back.
+- Saving over a name replaces it. Two layouts with one name is the shape of a
+  bug rather than a feature, and `=` in a typed name becomes `-` because the
+  name is written in front of the tree.
 
 ### Risk (as written beforehand)
 
@@ -135,9 +146,17 @@ separate a details row from an icon cell.
 - `folder_view` already remembers `(sort, order, grid)` per folder — `grid`
   becomes `view` and the feature is per-folder on day one.
 
-**Cheap because phase 4 paid for it.** The one real cost is that the thumbnail
-cache's memory ceiling is in *entries*, and a 256px thumbnail is sixteen times a
-72px one. `MAX_THUMBS` should become a byte budget.
+**Cheap because phase 4 paid for it.** It stayed one scalar rather than
+becoming a `View` enum: zero is the details list, a positive number is an icon
+grid at that size, and a *negative* one is the same grid with the label beside
+the icon — Tiles at a big icon, List at a small one. Everything that remembers
+a view already carried exactly one number, and a second flag beside it would be
+a second thing to keep in step. `cell_parts` returns the two rectangles and
+nothing else changed; the wheel steps the size and leaves the side alone.
+
+The thumbnail cache's ceiling was the one real cost, and it is now a byte
+budget rather than 400 entries of whatever size the view was asking for —
+between 8 and 100 MB depending on the icon size, which is not a ceiling.
 
 ---
 
@@ -145,6 +164,14 @@ cache's memory ceiling is in *entries*, and a 256px thumbnail is sixteen times a
 
 Three features, one mechanism: the palette, which already fuzzy-matched.
 
+- **The right-click menu is a menu again.** Flattening every verb into one
+  typeable list made the common case — point at Copy — worse to reach than
+  the rare one, so the menu went back to `ThemedMenu`: our commands with their
+  separators, the shell's items below with the shell's own submenus intact,
+  pinned verbs hoisted above everything. The flat searchable list is still
+  there as *Search actions…* and Ctrl+Shift+A, and it now opens where the
+  pointer is rather than in the middle of the window. A real menu also
+  dismisses on a click past it, which the picker had to be taught.
 - **Type-to-run in the context menu.** `shellmenu::list` walks the HMENU with
   `GetMenuStringW` and returns `(label, id)` for everything the shell offered,
   submenus flattened as "7-Zip › Extract here". Ctrl+Shift+A, or *Search
@@ -324,8 +351,8 @@ Things the document does not list, in the order I would take them.
 |---|---|
 | **Recycle Bin restore** | Browsing a bin you cannot restore from is a tease. Needs the listing to carry PIDLs instead of parsing names — a model change, described below |
 | **UIA for the rest of the window** | Phase 7 covered the listing. The sidebar, tabs and breadcrumb are still invisible; the palette is the only way round it |
-| **Persist per-folder view** | It is session-only today, and the map is already there |
-| **Transfer queue** | Sequential queued copies with a progress list, instead of N parallel `IFileOperation`s fighting over one disk. A real dual-pane feature neither app has |
+| ~~**Persist per-folder view**~~ | Done: `folderview=<path>=<key>,<asc>,<icons>`, most recently changed first and capped at 200. The session map became a list, because the file is written in an order and a map has none |
+| ~~**Transfer queue**~~ | Done as a lock rather than a list: copies and moves take one turn at a time, everything else runs straight away, and a queued transfer says so in the footer. A queue you can look at and reorder is the upgrade, and needs somewhere to show it |
 | **Verify after copy** | Hash both sides on request. `files_differ` already exists for compare |
 | **Duplicate finder** | Content compare across a tree, not just two panes. Reuses `files_differ` and the search walker |
 | **Dual-pane sync** | "Make right look like left", with a preview of what it would do |

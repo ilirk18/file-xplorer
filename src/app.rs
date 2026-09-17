@@ -24,7 +24,7 @@ use crate::ops;
 use crate::pane::{LoadRequest, Pane};
 use crate::renderer::Renderer;
 use crate::search;
-use crate::theme::{Rgb, Theme};
+use crate::theme::{colorref, Theme};
 use crate::watch::Watcher;
 use crate::dnd;
 
@@ -125,9 +125,7 @@ pub const TYPE_AHEAD_RESET_MS: u128 = 900;
 /// irrefutable pattern that swallows every message after it.
 pub const WM_MOUSELEAVE: u32 = 0x02A3;
 
-pub fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+pub use crate::fs::wide;
 
 pub fn loword(v: u32) -> i32 {
     (v & 0xFFFF) as u16 as i16 as i32
@@ -226,6 +224,24 @@ pub enum Drag {
     },
 }
 
+/// A tab being dragged. Held from the press, but nothing happens until the
+/// cursor has travelled far enough to mean it: a tab is switched by clicking
+/// it, and every click starts here.
+#[derive(Clone, Copy)]
+pub struct TabDrag {
+    pub from: PaneId,
+    pub index: usize,
+    pub origin: (i32, i32),
+    pub cursor: (i32, i32),
+}
+
+impl TabDrag {
+    pub fn moved(&self) -> bool {
+        (self.cursor.0 - self.origin.0).abs() >= DRAG_THRESHOLD
+            || (self.cursor.1 - self.origin.1).abs() >= DRAG_THRESHOLD
+    }
+}
+
 pub struct AppState {
     pub renderer: Renderer,
     pub metrics: Metrics,
@@ -258,6 +274,8 @@ pub struct AppState {
     pub pins: Vec<String>,
     /// Shell verbs hoisted to the top of the context menu, by menu text.
     pub pin_actions: Vec<String>,
+    /// Named pane trees, as (name, tree text), most recently saved last.
+    pub saved_layouts: Vec<(String, String)>,
     /// UI font family and size, and row density, as the config stores them.
     /// Held here because the metrics and the text formats are built from them
     /// and both have to be rebuilt together.
@@ -273,7 +291,11 @@ pub struct AppState {
     /// The settings as last written, so the autosave only writes on a change.
     pub last_saved: Config,
     /// A tab being dragged: which pane, which index, and where it started.
-    pub tab_drag: Option<(PaneId, usize, i32, i32)>,
+    pub tab_drag: Option<TabDrag>,
+    /// Several names being typed over at once. Exclusive with `rename`, which
+    /// is the one-row editor: one is a Win32 EDIT and the other is drawn here,
+    /// and two carets would be one too many.
+    pub multi_rename: Option<crate::multi_rename::MultiRename>,
     /// The sidebar's folder tree.
     pub tree: crate::tree::Tree,
     /// Its rows, rebuilt whenever the tree changes rather than on every
@@ -320,13 +342,14 @@ pub struct AppState {
     pub rename: Option<crate::rename::InlineRename>,
     /// Folders visited, most recent first, offered by "Recent folders".
     pub recent: Vec<String>,
-    /// How each folder was last looked at — its sort and whether it was in the
-    /// icon view — for this session only. Keyed by lowercased path, because
-    /// Windows paths are case-insensitive.
+    /// How each folder was last looked at — its sort and its view — most
+    /// recently changed first. Lowercased paths, because Windows paths are
+    /// case-insensitive, and bounded like the recent list: only a deliberate
+    /// change writes one, and the oldest is the one worth losing.
     ///
-    /// ponytail: not persisted. Add `folderview=` lines to the config if
-    /// wanting it across restarts; the session map is where the value is.
-    pub folder_view: std::collections::HashMap<String, (SortKey, SortOrder, i32)>,
+    /// A list rather than a map because it is written to the settings file in
+    /// this order, and a map has none to write.
+    pub folder_view: Vec<(String, (SortKey, SortOrder, i32))>,
 
     pub hover: Option<Hit>,
     pub drag: Drag,
@@ -394,6 +417,7 @@ impl AppState {
             sidebar_scroll: 0,
             pins: cfg.pins.clone(),
             pin_actions: cfg.pin_actions.clone(),
+            saved_layouts: cfg.saved_layouts.clone(),
             font: cfg.font.clone(),
             font_size: cfg.font_size,
             density: cfg.density,
@@ -401,6 +425,7 @@ impl AppState {
             col_widths: cfg.col_widths,
             last_saved: cfg.clone(),
             tab_drag: None,
+            multi_rename: None,
             tree: crate::tree::Tree::default(),
             tree_rows: Vec::new(),
             filter_focus: None,
@@ -435,7 +460,14 @@ impl AppState {
             size_pending: None,
             rename: None,
             recent: cfg.recent.clone(),
-            folder_view: std::collections::HashMap::new(),
+            folder_view: cfg
+                .folder_views
+                .iter()
+                .map(|(path, key, asc, icons)| {
+                    let order = if *asc { SortOrder::Asc } else { SortOrder::Desc };
+                    (path.clone(), (sort_key_from_id(*key), order, *icons))
+                })
+                .collect(),
             hover: None,
             drag: Drag::None,
             mouse_tracking: false,
@@ -624,22 +656,27 @@ impl AppState {
 
     /// Recompute the frame. Cheap: the renderer memoises text measurement.
     pub fn layout(&self) -> Layout {
+        // In leaf order, and indexed by position in that order \u2014 never by
+        // pane id. The two agree only while the visible panes happen to be
+        // 0..n, which closing the first pane is exactly the thing that ends.
+        let ids: Vec<PaneId> = self.visible().collect();
         // Labels and crumbs have to outlive the PaneInputs that borrow them.
-        let tabs: Vec<Vec<String>> = self
-            .visible()
-            .map(|p| self.pane(p).tabs.iter().map(|t| t.label()).collect())
+        let tabs: Vec<Vec<String>> = ids
+            .iter()
+            .map(|p| self.pane(*p).tabs.iter().map(|t| t.label()).collect())
             .collect();
-        let crumbs: Vec<Vec<String>> = self
-            .visible()
-            .map(|p| fs::path_segments(self.pane(p).current_path()))
+        let crumbs: Vec<Vec<String>> = ids
+            .iter()
+            .map(|p| fs::path_segments(self.pane(*p).current_path()))
             .collect();
-        let inputs: Vec<PaneInput> = self
-            .visible()
-            .map(|p| PaneInput {
-                tab_labels: &tabs[p.0],
-                crumbs: &crumbs[p.0],
-                total_lines: self.pane(p).list().total_lines(),
-                scroll_offset: self.pane(p).list().scroll_offset,
+        let inputs: Vec<PaneInput> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, p)| PaneInput {
+                tab_labels: &tabs[i],
+                crumbs: &crumbs[i],
+                total_lines: self.pane(*p).list().total_lines(),
+                scroll_offset: self.pane(*p).list().scroll_offset,
                 icons: self.icons,
             })
             .collect();
@@ -691,7 +728,7 @@ impl AppState {
         /// again next frame for whatever is still missing.
         const PER_FRAME: usize = 16;
 
-        let edge = self.metrics.cell(self.icons).2.max(32);
+        let edge = self.metrics.cell(self.icons.abs()).2.max(32);
         let mut wanted: Vec<(String, Option<String>)> = Vec::new();
         for pid in self.visible().collect::<Vec<_>>() {
             let h = self.list_height(pid);
@@ -888,6 +925,35 @@ impl AppState {
         self.layout_tree = crate::layout::Node::columns(n);
     }
 
+    /// Where the tab being dragged would land, and the rectangle to light up.
+    ///
+    /// One answer for both the painting and the drop: a highlight that
+    /// promised a split the drop then refused would be worse than no
+    /// highlight at all. A split needs a free pane, so with none left every
+    /// zone collapses back to dropping into the pane under the cursor.
+    pub fn tab_drop_target(&self) -> Option<(PaneId, crate::layout::DropZone, Rect)> {
+        let drag = self.tab_drag?;
+        if !drag.moved() {
+            return None;
+        }
+        let (x, y) = drag.cursor;
+        let (pid, zone, rect) = self.layout().drop_zone(x, y)?;
+        if zone != crate::layout::DropZone::Into && self.layout_tree.unused().is_empty() {
+            let whole = self.layout().pane(pid).bounds;
+            return Some((pid, crate::layout::DropZone::Into, whole));
+        }
+        Some((pid, zone, rect))
+    }
+
+    /// Split `target` and return the new pane, leaving focus alone.
+    pub fn split_pane(&mut self, target: PaneId, vertical: bool, before: bool) -> Option<PaneId> {
+        let fresh = *self.layout_tree.unused().first()?;
+        if !self.layout_tree.split_at(target, fresh, vertical, before) {
+            return None;
+        }
+        Some(fresh)
+    }
+
     /// Split the focused pane, and move into the new one.
     ///
     /// `vertical` puts it to the right, otherwise underneath. Fails only when
@@ -905,14 +971,37 @@ impl AppState {
 
     /// Close the focused pane, unless it is the only one.
     pub fn close_focused(&mut self) -> bool {
-        let going = self.focused;
+        self.close_pane(self.focused)
+    }
+
+    /// Take a pane out of the layout. Its tabs stay in the slot, which is what
+    /// makes Ctrl+1 after Ctrl+2 come back to what was there.
+    pub fn close_pane(&mut self, going: PaneId) -> bool {
         if !self.layout_tree.close(going) {
             return false;
         }
         self.watchers[going.0] = None;
         self.searches[going.0] = None;
-        self.focused = *self.layout_tree.leaves().first().unwrap_or(&PaneId(0));
+        if self.focused == going {
+            self.focused = *self.layout_tree.leaves().first().unwrap_or(&PaneId(0));
+        }
         true
+    }
+
+    /// Show a whole layout at once. Panes it leaves out keep their tabs, the
+    /// way closing one does, so switching back brings them straight back.
+    pub fn set_layout(&mut self, tree: crate::layout::Node) {
+        self.layout_tree = tree;
+        let leaves = self.layout_tree.leaves();
+        for pid in (0..MAX_PANES).map(PaneId) {
+            if !leaves.contains(&pid) {
+                self.watchers[pid.0] = None;
+                self.searches[pid.0] = None;
+            }
+        }
+        if !leaves.contains(&self.focused) {
+            self.focused = *leaves.first().unwrap_or(&PaneId(0));
+        }
     }
 
     /// What the inspector should be showing: the focused pane's cursor entry,
@@ -1028,10 +1117,13 @@ impl AppState {
     /// Unbounded for the session: one small entry per folder actually sorted by
     /// hand, which is a number of folders a person can produce, not a machine.
     pub fn remember_view(&mut self, path: &str, key: SortKey, order: SortOrder, icons: i32) {
-        if !path.is_empty() {
-            self.folder_view
-                .insert(path.to_lowercase(), (key, order, icons));
+        if path.is_empty() {
+            return;
         }
+        let path = path.to_lowercase();
+        self.folder_view.retain(|(p, _)| *p != path);
+        self.folder_view.insert(0, (path, (key, order, icons)));
+        self.folder_view.truncate(crate::config::MAX_FOLDER_VIEWS);
     }
 
     /// Record how the focused folder is being looked at right now.
@@ -1049,7 +1141,11 @@ impl AppState {
     }
 
     pub fn view_for(&self, path: &str) -> Option<(SortKey, SortOrder, i32)> {
-        self.folder_view.get(&path.to_lowercase()).copied()
+        let path = path.to_lowercase();
+        self.folder_view
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, view)| *view)
     }
 
     pub fn config(&self, hwnd: HWND) -> Config {
@@ -1068,6 +1164,14 @@ impl AppState {
             active_tab: self.panes.iter().map(|p| p.active_tab_index).collect(),
             pins: self.pins.clone(),
             pin_actions: self.pin_actions.clone(),
+            saved_layouts: self.saved_layouts.clone(),
+            folder_views: self
+                .folder_view
+                .iter()
+                .map(|(path, (key, order, icons))| {
+                    (path.clone(), sort_key_id(*key), *order == SortOrder::Asc, *icons)
+                })
+                .collect(),
             recent: self.recent.clone(),
             inspector: self.inspector,
             command_bar: self.command_bar,
@@ -1175,10 +1279,6 @@ impl AppState {
 // Chrome
 // ---------------------------------------------------------------------------
 
-fn colorref(c: Rgb) -> COLORREF {
-    let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xFF;
-    COLORREF(q(c.0) | (q(c.1) << 8) | (q(c.2) << 16))
-}
 
 fn set_dwm_attr<T>(hwnd: HWND, attr: DWMWINDOWATTRIBUTE, value: &T) {
     unsafe {
@@ -1279,6 +1379,18 @@ pub fn spawn_op(hwnd: HWND, op: ops::Op) {
 /// `tag` rides back on the completion message. `OP_WAS_UNDO` marks an
 /// operation that came off the undo stack, which must not push its own
 /// inverse back on: that would make Ctrl+Z a toggle.
+/// Start a transfer and say which of the two things happened: it started, or
+/// it is waiting for the one already running. A copy that queues silently is
+/// a paste that did nothing, as far as anyone watching can tell.
+pub fn spawn_transfer(state: &mut AppState, hwnd: HWND, op: ops::Op) {
+    state.status_override = Some(if ops::transfer_running() {
+        "Waiting for the transfer already running\u{2026}".to_string()
+    } else {
+        op.progress_text().to_string()
+    });
+    spawn_op(hwnd, op);
+}
+
 pub fn spawn_op_tagged(hwnd: HWND, op: ops::Op, tag: usize) {
     // One guard for every destructive path in the app, drops included: nothing
     // writes inside an archive. Refusing here rather than in each command is

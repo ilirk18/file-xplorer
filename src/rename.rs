@@ -31,9 +31,7 @@ pub const WM_APP_RENAME_DONE: u32 = WM_APP + 20;
 /// EM_SETSEL, as in `prompt.rs`: one constant is not worth another feature.
 const EM_SETSEL: u32 = 0x00B1;
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::fs::wide;
 
 pub struct InlineRename {
     edit: HWND,

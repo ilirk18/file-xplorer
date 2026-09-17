@@ -4,32 +4,27 @@
 // gets a light menu hanging off it, and vice versa. Our own items are
 // MF_OWNERDRAW and painted here.
 //
-// The shell's items are deliberately left alone: they belong to the handlers
-// that added them, some of them owner-draw their own icons, and repainting
-// another component's menu entries is how you lose the icons. Only the
-// background is set for the whole popup, via MIM_BACKGROUND, so the two halves
-// at least sit on the same colour.
+// The shell's items are adopted: every entry that is plain text becomes one of
+// ours, so the whole menu is one colour. Half a menu in the system's palette is
+// the black-text-on-dark that a background brush alone cannot fix. The price is
+// the small bitmap Windows drew beside a handler's entry, which is a price a
+// menu that reads gets to charge. Entries another component *owner-draws* are
+// still left alone: those paint themselves, and we would paint over them.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED, ODS_GRAYED, ODS_SELECTED, ODT_MENU};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::dialog::UiFont;
-use crate::theme::{Palette, Rgb, Theme};
+use crate::theme::{colorref, Palette, Rgb, Theme};
 
-fn colorref(c: Rgb) -> COLORREF {
-    let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xFF;
-    COLORREF(q(c.0) | (q(c.1) << 8) | (q(c.2) << 16))
-}
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::fs::wide;
 
 /// One owner-drawn entry. Boxed and handed to Win32 as `dwItemData`, so it has
 /// to outlive `TrackPopupMenu` — `ThemedMenu` owns them all until it drops.
@@ -47,6 +42,11 @@ struct Ctx {
     palette: Palette,
     row_h: i32,
     pad: i32,
+    /// Entries taken over from a menu somebody else filled. Owned here rather
+    /// than by `ThemedMenu` because the shell fills a submenu when it opens,
+    /// long after the menu was built, and the handler that sees that has only
+    /// this.
+    adopted: Vec<Box<MenuItem>>,
     /// Exactly which `dwItemData` values are ours. A pointer check rather than
     /// an id range, because the shell's items can be owner-drawn too and a
     /// wrong guess means drawing over somebody else's entry.
@@ -79,6 +79,7 @@ impl ThemedMenu {
                 row_h: (26.0 * scale).round() as i32,
                 pad: (10.0 * scale).round() as i32,
                 ours: HashSet::new(),
+                adopted: Vec::new(),
             });
         });
         ThemedMenu {
@@ -134,6 +135,7 @@ impl ThemedMenu {
             },
         );
     }
+
 
     /// Put an entry at a position rather than at the end. Used to hoist
     /// pinned shell verbs above everything else, which is the whole point of
@@ -243,6 +245,98 @@ impl ThemedMenu {
             let _ = SetMenuInfo(menu, &info);
         }
     }
+}
+
+/// Nested deeper than any shell menu goes, and a stop if one ever loops.
+const MAX_DEPTH: u32 = 3;
+
+/// Draw a menu somebody else filled in our palette too.
+///
+/// Called once when the shell's items are appended, and again for each submenu
+/// as it opens: a handler fills "Send to" only when it is about to be shown,
+/// so anything adopted before that would have been an empty menu.
+pub fn adopt(menu: HMENU) {
+    unsafe { adopt_inner(menu, 0) }
+}
+
+unsafe fn adopt_inner(menu: HMENU, depth: u32) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    for i in 0..GetMenuItemCount(Some(menu)).max(0) as u32 {
+        let sub = GetSubMenu(menu, i as i32);
+        if !sub.is_invalid() {
+            adopt_inner(sub, depth + 1);
+        }
+        let mut info = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE,
+            ..Default::default()
+        };
+        if GetMenuItemInfoW(menu, i, true, &mut info).is_err() {
+            continue;
+        }
+        // Somebody else's owner-drawn entry, or one of ours already.
+        if info.fType.0 & MFT_OWNERDRAW.0 != 0 {
+            continue;
+        }
+        let separator = info.fType.0 & MFT_SEPARATOR.0 != 0;
+        let mut buf = [0u16; 256];
+        let n = GetMenuStringW(menu, i, Some(&mut buf), MF_BYPOSITION);
+        if !separator && n <= 0 {
+            continue;
+        }
+        let (text, accel) = split_label(&String::from_utf16_lossy(&buf[..n.max(0) as usize]));
+        let item = Box::new(MenuItem {
+            text: if separator { Vec::new() } else { wide(&text) },
+            accel: if separator { Vec::new() } else { wide(&accel) },
+            separator,
+            popup: !sub.is_invalid(),
+        });
+        let ptr = &*item as *const MenuItem as usize;
+        let taken = CTX.with(|c| match c.borrow_mut().as_mut() {
+            Some(ctx) => {
+                ctx.ours.insert(ptr);
+                ctx.adopted.push(item);
+                true
+            }
+            // No themed menu is up, so there is nothing to match colours with.
+            None => false,
+        });
+        if !taken {
+            return;
+        }
+        let mut set = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE | MIIM_DATA,
+            fType: MENU_ITEM_TYPE(info.fType.0 | MFT_OWNERDRAW.0),
+            dwItemData: ptr,
+            ..Default::default()
+        };
+        let _ = SetMenuItemInfoW(menu, i, true, &mut set);
+    }
+}
+
+/// A menu string is "&Label\tCtrl+X". The ampersand marks the mnemonic and
+/// the tab starts the shortcut: both are drawn, neither is text.
+fn split_label(raw: &str) -> (String, String) {
+    let mut parts = raw.split(['\t', '\u{8}']);
+    let label = parts.next().unwrap_or("");
+    let accel = parts.next().unwrap_or("").trim().to_string();
+    let mut out = String::with_capacity(label.len());
+    let mut chars = label.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            // "&&" is a literal ampersand; a lone one marks the next letter.
+            if chars.peek() == Some(&'&') {
+                chars.next();
+                out.push('&');
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    (out.trim().to_string(), accel)
 }
 
 impl Drop for ThemedMenu {
@@ -415,23 +509,4 @@ unsafe fn fill(hdc: HDC, r: RECT, c: Rgb) {
     let brush = CreateSolidBrush(colorref(c));
     FillRect(hdc, &r, brush);
     let _ = DeleteObject(HGDIOBJ(brush.0));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn colours_convert_to_the_bgr_order_gdi_wants() {
-        // COLORREF is 0x00BBGGRR, which is the opposite of every other API
-        // here; getting it backwards turns the accent blue into orange.
-        assert_eq!(colorref((1.0, 0.0, 0.0)).0, 0x0000FF);
-        assert_eq!(colorref((0.0, 1.0, 0.0)).0, 0x00FF00);
-        assert_eq!(colorref((0.0, 0.0, 1.0)).0, 0xFF0000);
-    }
-
-    #[test]
-    fn colour_channels_are_clamped_not_wrapped() {
-        assert_eq!(colorref((2.0, -1.0, 0.5)).0, 0x008000FF);
-    }
 }

@@ -326,3 +326,11 @@ hit-tests back to itself.**
 ```
 
 Currently ~0.50 MB against a 3 MB budget.
+
+---
+
+## License
+
+[GNU GPL v3](LICENSE). Free to use, read, change and share; a fork has to stay
+free the same way. That is the point rather than a formality — a file manager
+you cannot be charged for later is the reason this exists.

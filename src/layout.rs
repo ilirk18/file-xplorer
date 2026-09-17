@@ -334,18 +334,27 @@ impl Node {
     /// Replace the leaf for `id` with a split holding it and `with`.
     /// `vertical` puts the new pane to the right, otherwise underneath.
     pub fn split(&mut self, id: PaneId, with: PaneId, vertical: bool) -> bool {
+        self.split_at(id, with, vertical, false)
+    }
+
+    /// Split `id` in two and put `with` in the new half. `before` puts it on
+    /// the left, or on top: which side a dropped tab landed on.
+    pub fn split_at(&mut self, id: PaneId, with: PaneId, vertical: bool, before: bool) -> bool {
         match self {
             Node::Leaf(mine) if *mine == id => {
+                let (a, b) = if before { (with, id) } else { (id, with) };
                 *self = Node::Split {
                     vertical,
                     ratio: 0.5,
-                    a: Box::new(Node::Leaf(id)),
-                    b: Box::new(Node::Leaf(with)),
+                    a: Box::new(Node::Leaf(a)),
+                    b: Box::new(Node::Leaf(b)),
                 };
                 true
             }
             Node::Leaf(_) => false,
-            Node::Split { a, b, .. } => a.split(id, with, vertical) || b.split(id, with, vertical),
+            Node::Split { a, b, .. } => {
+                a.split_at(id, with, vertical, before) || b.split_at(id, with, vertical, before)
+            }
         }
     }
 
@@ -469,8 +478,8 @@ fn place_into(
     }
 }
 
-/// Which pane, by position from the left. The window holds up to `MAX_PANES`
-/// of them; `pane_count` says how many are on screen.
+/// Which pane, not where it is: the layout tree says where. Stable across a
+/// close, so closing the leftmost pane does not renumber the rest.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct PaneId(pub usize);
 
@@ -568,6 +577,8 @@ pub struct PaneLayout {
     pub line_h: i32,
     /// Icon edge inside a cell, already in physical pixels.
     pub cell_icon: i32,
+    /// Is a cell's label beside its icon rather than under it?
+    pub side_label: bool,
 
     pub footer: Rect,
     pub filter: Rect,
@@ -610,6 +621,23 @@ impl PaneLayout {
     /// box hanging out of its panel is not usable — checks what it gets back.
     pub fn cell_parts(&self, index: u32, scroll_px: i32, m: Metrics) -> Option<(Rect, Rect)> {
         let cell = self.cell(index, scroll_px)?;
+        if self.side_label && self.columns_per_line > 1 {
+            // Tiles and List: the icon at the left of the cell, the name on
+            // one line beside it, both centred against the cell's height.
+            let icon = Rect::new(
+                cell.x + m.pad / 2,
+                cell.y + (cell.h - self.cell_icon) / 2,
+                self.cell_icon,
+                self.cell_icon,
+            );
+            let label = Rect::new(
+                icon.right() + m.pad / 2,
+                cell.y + (cell.h - m.row_h) / 2,
+                (cell.right() - icon.right() - m.pad).max(0),
+                m.row_h,
+            );
+            return Some((icon, label));
+        }
         if self.columns_per_line > 1 {
             // Icon view: a big icon over a two-line name, both centred.
             let icon = Rect::new(
@@ -772,6 +800,38 @@ pub enum Hit {
     Bar(usize),
 }
 
+/// Where a dragged tab would land if it were dropped now.
+///
+/// `Into` is the pane itself — another tab in its strip. The rest each make
+/// a new pane on that side of the one under the cursor, which is what the tree
+/// has been able to do since panes stopped being a row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DropZone {
+    Into,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DropZone {
+    /// `(vertical, before)` for `Node::split_at`. None for `Into`, which is
+    /// not a split at all.
+    pub fn split(self) -> Option<(bool, bool)> {
+        match self {
+            DropZone::Into => None,
+            DropZone::Left => Some((true, true)),
+            DropZone::Right => Some((true, false)),
+            DropZone::Top => Some((false, true)),
+            DropZone::Bottom => Some((false, false)),
+        }
+    }
+}
+
+/// How much of a pane's span, from each edge, drops as a split rather than in.
+/// A third is enough to aim at without making the middle hard to hit.
+const DROP_EDGE: f32 = 0.33;
+
 /// Everything the layout needs to know about one pane to size it.
 /// From a thumbnail you can just about tell a photo apart, to one you can read
 /// a screenshot in. Doubling roughly each step, so a wheel notch is a visible
@@ -795,6 +855,19 @@ pub const DENSITY_STEPS: &[(&str, i32)] =
 /// "one scalar decides the view" work: no separate flag to keep in step.
 pub const ICONS_OFF: i32 = 0;
 
+/// A negative size is the same grid with the label *beside* the icon rather
+/// than under it: Tiles when the icon is big, List when it is small. Still one
+/// scalar, because everything that remembers a view — the settings file, the
+/// per-folder map, the layout's input — already carries exactly one, and a
+/// second flag beside it is a second thing to keep in step.
+pub const TILES: i32 = -72;
+pub const LIST: i32 = -32;
+
+/// Is the label beside the icon, and how big is that icon?
+pub fn beside(icons: i32) -> bool {
+    icons < 0
+}
+
 impl Metrics {
     /// Cell width, height and icon edge for an icon view at `icon_dip`.
     ///
@@ -807,18 +880,29 @@ impl Metrics {
         (icon + px(46), icon + px(52), icon)
     }
 
+    /// The same, with the label beside the icon: a row of icon-then-name,
+    /// wide enough for a name at any icon size, and never shorter than a
+    /// details row.
+    pub fn cell_beside(&self, icon_dip: i32) -> (i32, i32, i32) {
+        let px = |v: i32| (v as f32 * self.scale).round() as i32;
+        let icon = px(icon_dip);
+        (icon + px(200), (icon + px(12)).max(self.row_h), icon)
+    }
+
     /// The next size up or down, or `ICONS_OFF` when stepping below the
     /// smallest. Stepping up from the details list enters at the default.
+    /// Where the label sits is not a size, so the step keeps it.
     pub fn step_icons(&self, current: i32, up: bool) -> i32 {
         let steps = self.icon_steps;
         if current == ICONS_OFF {
             return if up { DEFAULT_ICONS } else { ICONS_OFF };
         }
-        let i = steps.iter().position(|s| *s == current).unwrap_or(0);
+        let sign = if beside(current) { -1 } else { 1 };
+        let i = steps.iter().position(|s| *s == current.abs()).unwrap_or(0);
         match up {
-            true => steps[(i + 1).min(steps.len() - 1)],
+            true => steps[(i + 1).min(steps.len() - 1)] * sign,
             false if i == 0 => ICONS_OFF,
-            false => steps[i - 1],
+            false => steps[i - 1] * sign,
         }
     }
 }
@@ -855,8 +939,7 @@ pub struct PaneInput<'a> {
 impl Layout {
     /// Compute the whole frame.
     ///
-    /// `splits` holds one fraction of the body width per divider, already
-    /// clamped by `clamp_splits`. Fractions rather than pixels, so resizing the
+    /// `tree` carries a fraction per split rather than pixels, so resizing the
     /// window keeps the panes in proportion instead of squeezing the last one.
     pub fn compute(
         client: Rect,
@@ -920,11 +1003,6 @@ impl Layout {
         }
     }
 
-    /// Clamp proposed divider fractions so every pane keeps a usable width.
-    /// A count that does not match the fractions, or a window too narrow to
-    /// honour the minimums, falls back to equal shares.
-
-    /// The fraction that puts divider `index` at client x `x`.
     /// Where a divider dragged to (`x`, `y`) falls within the space its own
     /// split node owns, as a fraction.
     ///
@@ -1012,9 +1090,50 @@ impl Layout {
             .position(|p| p.bounds.contains(x, y))
             .map(PaneId)
     }
-}
 
-/// Carve the body into `count` pane rectangles with a divider between each.
+    /// Which pane a tab dropped at `(x, y)` would land in, where in it, and
+    /// the rectangle that half would occupy.
+    ///
+    /// The nearest edge wins, so a corner goes to whichever side it is closer
+    /// to rather than to whichever test ran first. Past a third of the way in
+    /// from every edge there is no nearest edge worth having, and the drop is
+    /// into the pane itself.
+    pub fn drop_zone(&self, x: i32, y: i32) -> Option<(PaneId, DropZone, Rect)> {
+        let pid = self.pane_at(x, y)?;
+        let r = self.pane(pid).bounds;
+        if r.w <= 0 || r.h <= 0 {
+            return None;
+        }
+        // A tab bar is not an edge to split against: it sits inside the
+        // pane's top third, so without this a five-pixel twitch while
+        // clicking a tab drops it there and splits the pane in two.
+        if self.pane(pid).tab_bar.contains(x, y) {
+            return Some((pid, DropZone::Into, r));
+        }
+        let (w, h) = (r.w as f32, r.h as f32);
+        let near = [
+            (DropZone::Left, (x - r.x) as f32 / w),
+            (DropZone::Right, (r.right() - x) as f32 / w),
+            (DropZone::Top, (y - r.y) as f32 / h),
+            (DropZone::Bottom, (r.bottom() - y) as f32 / h),
+        ];
+        let (zone, d) = near
+            .iter()
+            .copied()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((DropZone::Into, 1.0));
+        let zone = if d < DROP_EDGE { zone } else { DropZone::Into };
+
+        let half = match zone {
+            DropZone::Into => r,
+            DropZone::Left => Rect::new(r.x, r.y, r.w / 2, r.h),
+            DropZone::Right => Rect::new(r.x + r.w / 2, r.y, r.w - r.w / 2, r.h),
+            DropZone::Top => Rect::new(r.x, r.y, r.w, r.h / 2),
+            DropZone::Bottom => Rect::new(r.x, r.y + r.h / 2, r.w, r.h - r.h / 2),
+        };
+        Some((pid, zone, half))
+    }
+}
 
 fn hit_pane(p: &PaneLayout, pid: PaneId, x: i32, y: i32) -> Option<Hit> {
     if !p.bounds.contains(x, y) {
@@ -1274,7 +1393,12 @@ fn pane_layout(
 
     // Details is the grid with one column: everything below works off these
     // two numbers, so neither the painter nor hit-testing needs a view branch.
-    let (cell_w, cell_h, cell_icon) = m.cell(input.icons);
+    let side_label = beside(input.icons);
+    let (cell_w, cell_h, cell_icon) = if side_label {
+        m.cell_beside(-input.icons)
+    } else {
+        m.cell(input.icons)
+    };
     let (columns_per_line, line_h, cell_icon) = if grid {
         ((list.w / cell_w.max(1)).max(1) as u32, cell_h, cell_icon)
     } else {
@@ -1317,6 +1441,7 @@ fn pane_layout(
         columns_per_line,
         line_h,
         cell_icon,
+        side_label,
         footer,
         filter: filter.inset(m.pad / 2, m.pad / 4),
         counts,
@@ -2347,6 +2472,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_tile_puts_its_name_beside_the_icon_and_list_fits_more_of_them() {
+        let m = Metrics::for_dpi(96);
+        let tiles = grid_pane_sized(1000, TILES);
+        let tp = tiles.pane(PaneId(0));
+        assert!(tp.side_label);
+        let (icon, label) = tp.cell_parts(0, 0, m).unwrap();
+        assert!(label.x >= icon.right(), "the name starts after the icon");
+        assert!(
+            label.y < icon.bottom() && label.bottom() > icon.y,
+            "and on the same line as it"
+        );
+
+        // The same icon size with the label under it is the icon view.
+        let under = grid_pane_sized(1000, -TILES);
+        let up = under.pane(PaneId(0));
+        assert!(!up.side_label);
+        let (icon, label) = up.cell_parts(0, 0, m).unwrap();
+        assert!(label.y >= icon.bottom(), "under it, not beside it");
+
+        // List is the same shape at a smaller icon, so more cells fit a line.
+        let list = grid_pane_sized(1000, LIST);
+        assert!(list.pane(PaneId(0)).columns_per_line > tp.columns_per_line);
+
+        // Stepping the wheel changes the size and leaves the side alone.
+        assert!(beside(m.step_icons(TILES, true)));
+        assert_eq!(m.step_icons(TILES, true).abs(), m.step_icons(-TILES, true));
+    }
+
     fn grid_pane(w: i32) -> Layout {
         grid_pane_sized(w, DEFAULT_ICONS)
     }
@@ -2610,6 +2764,73 @@ mod tests {
         for left in r.iter().take(overflow).filter(|r| !r.is_empty()) {
             assert!(left.right() <= r[overflow].x, "no overlap with it either");
         }
+    }
+
+    #[test]
+    fn a_tab_dropped_in_the_middle_goes_in_and_near_an_edge_splits() {
+        let l = build_n(1, 1000, 800, &[]);
+        let r = l.pane(PaneId(0)).bounds;
+        let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
+        assert_eq!(l.drop_zone(cx, cy).unwrap().1, DropZone::Into);
+
+        // Each edge, and the half it lights up is the half that edge would
+        // become \u2014 the highlight is a promise about the drop.
+        let (_, z, half) = l.drop_zone(r.x + 2, cy).unwrap();
+        assert_eq!(z, DropZone::Left);
+        assert_eq!((half.x, half.w), (r.x, r.w / 2));
+
+        let (_, z, half) = l.drop_zone(r.right() - 2, cy).unwrap();
+        assert_eq!(z, DropZone::Right);
+        assert_eq!(half.right(), r.right());
+
+        // Below the tab bar, because the bar itself never splits: a click on
+        // a tab that twitches five pixels is a reorder, not a new pane.
+        let bar = l.pane(PaneId(0)).tab_bar;
+        let (_, z, half) = l.drop_zone(cx, bar.bottom() + 2).unwrap();
+        assert_eq!(z, DropZone::Top);
+        assert_eq!((half.y, half.h), (r.y, r.h / 2));
+
+        assert_eq!(
+            l.drop_zone(cx, bar.y + bar.h / 2).unwrap().1,
+            DropZone::Into,
+            "a drop on the tab bar moves or reorders"
+        );
+
+        let (_, z, half) = l.drop_zone(cx, r.bottom() - 2).unwrap();
+        assert_eq!(z, DropZone::Bottom);
+        assert_eq!(half.bottom(), r.bottom());
+
+        // Nothing is under a point outside every pane.
+        assert!(l.drop_zone(-10, -10).is_none());
+    }
+
+    #[test]
+    fn a_corner_belongs_to_the_edge_it_is_nearer_in_proportion() {
+        // A short wide pane. Forty pixels from the left is a twentieth of the
+        // way in; thirty from the top is a fifth. Fewer pixels is not nearer
+        // when the pane is not square, and aiming is done by eye.
+        let l = build_n(1, 1000, 200, &[]);
+        let r = l.pane(PaneId(0)).bounds;
+        let (_, zone, _) = l.drop_zone(r.x + 40, r.y + 30).unwrap();
+        assert_eq!(zone, DropZone::Left);
+    }
+
+    #[test]
+    fn a_zone_names_the_split_it_makes() {
+        // Left and Top put the new pane first, which is what `before` means,
+        // and Into is not a split at all.
+        assert_eq!(DropZone::Into.split(), None);
+        assert_eq!(DropZone::Left.split(), Some((true, true)));
+        assert_eq!(DropZone::Right.split(), Some((true, false)));
+        assert_eq!(DropZone::Top.split(), Some((false, true)));
+        assert_eq!(DropZone::Bottom.split(), Some((false, false)));
+
+        // And the tree puts it where the zone said.
+        let mut tree = Node::columns(1);
+        assert!(tree.split_at(PaneId(0), PaneId(1), true, true));
+        assert_eq!(tree.leaves(), vec![PaneId(1), PaneId(0)], "new pane on the left");
+        let l = build_tree(&tree, 1000, 600, &[]);
+        assert!(l.pane(PaneId(1)).bounds.x < l.pane(PaneId(0)).bounds.x);
     }
 
     #[test]

@@ -67,9 +67,7 @@ pub fn is_shell_path(path: &str) -> bool {
     p.len() > 6 && p[..6].eq_ignore_ascii_case("shell:") || p.starts_with("::{") || p.contains("\\::{")
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::fs::wide;
 
 fn item(path: &str) -> Option<IShellItem> {
     let w = wide(path);

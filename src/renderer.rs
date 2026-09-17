@@ -69,9 +69,7 @@ pub mod glyph {
     pub const SETTINGS: &str = "\u{E713}";
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::fs::wide;
 
 fn d2d_rect(r: Rect) -> D2D_RECT_F {
     D2D_RECT_F {
@@ -113,6 +111,8 @@ pub struct PaneView<'a> {
     pub band: Option<Rect>,
     /// The row whose name is being edited in place, if it is in this pane.
     pub renaming: Option<u32>,
+    /// Rows being typed over together, if this is the pane holding them.
+    pub multi: Option<&'a crate::multi_rename::MultiRename>,
     /// Shell images for the icon view, and this pane's folder, which together
     /// give each entry its cache key. Empty in the details view.
     pub thumbs: Option<(&'a crate::preview::ThumbCache, &'a str)>,
@@ -225,7 +225,7 @@ impl Renderer {
             theme,
             dpi,
             font: (font.to_string(), font_pct),
-            icons: IconCache::new(),
+            icons: IconCache::default(),
             icon_bitmaps: HashMap::new(),
             preview_bitmap: None,
             cell_bitmaps: HashMap::new(),
@@ -951,6 +951,76 @@ impl Renderer {
         self.cell_bitmaps.retain(|k, _| cache.has(k));
     }
 
+    /// Where a dragged tab would land: the half of the pane it would take,
+    /// washed in the accent colour with a line around it.
+    ///
+    /// Drawn last, over the panes, because it is about to cover one of them.
+    pub fn draw_drop_target(&mut self, r: Rect, m: Metrics) {
+        if r.is_empty() {
+            return;
+        }
+        let accent = self.palette().accent;
+        self.fill_alpha(r, accent, 0.18);
+        let t = 2.max(m.scale as i32 * 2);
+        for edge in [
+            Rect::new(r.x, r.y, r.w, t),
+            Rect::new(r.x, r.bottom() - t, r.w, t),
+            Rect::new(r.x, r.y, t, r.h),
+            Rect::new(r.right() - t, r.y, t, r.h),
+        ] {
+            self.fill_alpha(edge, accent, 0.9);
+        }
+    }
+
+    fn fill_alpha(&mut self, r: Rect, c: Rgb, alpha: f32) {
+        let Some(brush) = self.brush.clone() else { return };
+        let mut colour = color(c);
+        colour.a = alpha;
+        unsafe { brush.SetColor(&colour) };
+        if let Some(rt) = self.rt() {
+            unsafe { rt.FillRectangle(&d2d_rect(r), &brush) };
+        }
+        // Left as found: every other fill assumes the brush is opaque.
+        unsafe { brush.SetOpacity(1.0) };
+    }
+
+    /// One name being typed over, with the shared selection and caret.
+    ///
+    /// The caret is a filled sliver rather than a blinking one: it is drawn in
+    /// every edited row at once, and twenty blinking carets is a light show.
+    fn draw_edited_name(
+        &mut self,
+        m: &crate::multi_rename::MultiRename,
+        index: usize,
+        area: Rect,
+        selected: bool,
+        p: &Palette,
+    ) {
+        let text = m.text(index);
+        let chars: Vec<char> = text.chars().collect();
+        let upto = |n: usize| -> String { chars[..n.min(chars.len())].iter().collect() };
+        let fmt = self.formats.body.clone();
+
+        let (a, b) = m.selection_in(index);
+        if a < b {
+            let x0 = self.measure(&upto(a), false);
+            let x1 = self.measure(&upto(b), false);
+            let sel = Rect::new(
+                area.x + x0 as i32,
+                area.y + 2,
+                (x1 - x0).max(1.0) as i32,
+                (area.h - 4).max(1),
+            );
+            self.fill(sel, p.selection);
+        }
+        let fg = if selected { p.text_on_selection } else { p.text };
+        self.text(&text, area, fg, &fmt);
+
+        let caret_x = self.measure(&upto(m.caret_in(index)), false);
+        let caret = Rect::new(area.x + caret_x as i32, area.y + 2, 2, (area.h - 4).max(1));
+        self.fill(caret, p.accent);
+    }
+
     fn draw_icon(&mut self, key: &str, r: Rect) {
         let dest = d2d_rect(r);
         let Some(bmp) = self.icon_bitmap(key).cloned() else {
@@ -1550,9 +1620,22 @@ impl Renderer {
             };
             let y = r.y;
 
-            let selected = v.list.is_selected(row);
+            // A row being typed over shows the text selection instead of the
+            // row selection: two blues on top of each other is one blue, and
+            // the one that matters is the one around the characters.
+            let editing = v.multi.is_some_and(|m| m.index_of(row).is_some());
+            let selected = v.list.is_selected(row) && !editing;
             let hovered = v.hover == Some(Hit::Row(v.pid, row));
 
+            if editing {
+                // Still marked as a row that is in the edit, just quietly.
+                self.stroke_rounded(
+                    Rect::new(r.x + 2, r.y, r.w - 4, r.h),
+                    m.radius,
+                    p.accent,
+                    1.0,
+                );
+            }
             if selected {
                 let c = if v.focused {
                     p.selection
@@ -1565,7 +1648,7 @@ impl Renderer {
             } else if hovered {
                 self.fill_rounded(Rect::new(r.x + 2, r.y, r.w - 4, r.h), m.radius, p.row_hover);
             }
-            if Some(row) == cursor && v.focused && !selected {
+            if Some(row) == cursor && v.focused && !selected && !editing {
                 self.stroke_rounded(
                     Rect::new(r.x + 2, r.y, r.w - 4, r.h),
                     m.radius,
@@ -1619,11 +1702,16 @@ impl Renderer {
                     self.draw_icon(&key, small);
                 }
 
-                // The row being renamed shows the edit box instead of its name.
-                if v.renaming != Some(row) {
-                    let fmt = if grid {
+                // The row being renamed shows the edit box instead of its
+                // name, and one of several being renamed shows what is being
+                // typed into all of them.
+                if let Some((m, i)) = v.multi.and_then(|m| Some((m, m.index_of(row)?))) {
+                    self.draw_edited_name(m, i, name, selected, p);
+                } else if v.renaming != Some(row) {
+                    let fmt = if grid && !v.layout.side_label {
                         // Two centred lines under the icon; a longer name is
-                        // trimmed rather than pushed into the next cell.
+                        // trimmed rather than pushed into the next cell. A
+                        // label beside its icon is one line, like a row.
                         self.formats.cell_label.clone()
                     } else {
                         self.formats.body.clone()

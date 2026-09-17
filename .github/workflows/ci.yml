@@ -1,0 +1,55 @@
+# The project's standing claim is "303 tests, zero warnings". This runs both,
+# on the only OS the app builds for.
+#
+# Not gated on `cargo fmt` or `cargo clippy`: neither is clean today, and a
+# red-on-arrival check is one nobody reads. Adding them is its own commit.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The zero-warnings half of the claim. Applies to both steps below.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - run: rustup show active-toolchain || rustup toolchain install stable
+
+      # The archive tests skip themselves when 7-Zip is absent; it ships on the
+      # windows runner, so they run.
+      - name: Test
+        run: cargo test
+
+      # The release profile is not the one the tests use: lto, panic=abort and
+      # opt-level="z" have broken a build that `cargo test` was happy with.
+      - name: Build release
+        run: cargo build --release
+
+      - name: Size
+        run: |
+          $exe = Get-Item target\release\file-xplorer.exe
+          "{0:N0} bytes ({1:N2} MB)" -f $exe.Length, ($exe.Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: file-xplorer
+          path: target/release/file-xplorer.exe

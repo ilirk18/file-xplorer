@@ -75,6 +75,14 @@ impl Default for Theme {
 
 pub type Rgb = (f32, f32, f32);
 
+/// An `Rgb` as GDI wants it: eight bits a channel, blue highest. Every module
+/// that draws with GDI needs this, so it lives with the colours rather than
+/// three times over.
+pub fn colorref(c: Rgb) -> windows::Win32::Foundation::COLORREF {
+    let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xFF;
+    windows::Win32::Foundation::COLORREF(q(c.0) | (q(c.1) << 8) | (q(c.2) << 16))
+}
+
 /// Convert an 0xRRGGBB literal to linear-ish sRGB floats.
 /// `const` so the palettes below stay readable as hex.
 const fn hex(v: u32) -> Rgb {
@@ -312,6 +320,20 @@ impl Theme {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn colours_convert_to_the_bgr_order_gdi_wants() {
+        // COLORREF is 0x00BBGGRR, which is the opposite of every other API
+        // here; getting it backwards turns the accent blue into orange.
+        assert_eq!(colorref((1.0, 0.0, 0.0)).0, 0x0000FF);
+        assert_eq!(colorref((0.0, 1.0, 0.0)).0, 0x00FF00);
+        assert_eq!(colorref((0.0, 0.0, 1.0)).0, 0xFF0000);
+    }
+
+    #[test]
+    fn colour_channels_are_clamped_not_wrapped() {
+        assert_eq!(colorref((2.0, -1.0, 0.5)).0, 0x008000FF);
+    }
+
     use super::*;
 
     fn luminance(c: Rgb) -> f32 {

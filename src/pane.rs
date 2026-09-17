@@ -298,6 +298,23 @@ impl Pane {
         self.navigate(path)
     }
 
+    /// Take the pane's only tab, leaving it holding `fallback` instead.
+    ///
+    /// A swap, not a removal: a pane is never without a tab, because `active`
+    /// would have nothing to return. For the caller that is about to close the
+    /// pane \u2014 what stays behind is what the slot holds if it is ever used
+    /// again.
+    pub fn take_only_tab(&mut self, fallback: &str) -> Option<Tab> {
+        if self.tabs.len() != 1 {
+            return None;
+        }
+        // The replacement first, so there is never a moment with no tabs.
+        let _ = self.new_tab(fallback);
+        let tab = self.tabs.remove(0);
+        self.active_tab_index = 0;
+        Some(tab)
+    }
+
     /// Rebuild the tab strip from a saved session.
     ///
     /// Only the active tab is loaded. The others get their path and history
@@ -429,21 +446,15 @@ impl Pane {
         self.switch_tab(i)
     }
 
-    /// Close a tab. The last tab is never destroyed — it is reset to the
-    /// fallback path instead, so the pane always has something to show.
-    /// (The old `close_tab` silently did nothing in this case.)
-    pub fn close_tab(&mut self, index: usize, fallback: &str) -> Option<LoadRequest> {
-        if index >= self.tabs.len() {
+    /// Close a tab, of a pane that has more than one.
+    ///
+    /// A pane's last tab is not this function's to close: the pane goes, or
+    /// with no other pane the window does, and neither is a pane's decision.
+    /// See `input::close_tab`.
+    pub fn close_tab(&mut self, index: usize) -> Option<LoadRequest> {
+        if index >= self.tabs.len() || self.tabs.len() == 1 {
             return None;
         }
-        if self.tabs.len() == 1 {
-            let already_there = paths_equal(&self.tabs[0].path, fallback);
-            if already_there {
-                return None;
-            }
-            return Some(self.navigate(fallback));
-        }
-
         self.tabs.remove(index);
         if self.active_tab_index >= self.tabs.len() {
             self.active_tab_index = self.tabs.len() - 1;
@@ -457,10 +468,6 @@ impl Pane {
             return Some(self.begin_load(path, LoadKind::Refresh, None));
         }
         None
-    }
-
-    pub fn close_active_tab(&mut self, fallback: &str) -> Option<LoadRequest> {
-        self.close_tab(self.active_tab_index, fallback)
     }
 
     /// Select `name` once the next load lands. Used after a rename or a new
@@ -637,15 +644,15 @@ mod tests {
     }
 
     #[test]
-    fn test_close_last_tab_resets_it_rather_than_no_op() {
-        // Regression: the old close_tab on the final tab did nothing at all.
+    fn test_a_panes_last_tab_stays_put() {
+        // The pane keeps showing what it was showing. Closing it is the
+        // caller's call: the pane goes, or the window does.
         let mut pane = Pane::new();
         let req = pane.navigate("C:\\Users\\Foo");
         load(&mut pane, &req, &[("a", false)]);
-        let reset = pane.close_tab(0, "C:\\");
-        assert!(reset.is_some(), "closing the last tab should navigate home");
-        assert_eq!(reset.unwrap().path, "C:\\");
+        assert!(pane.close_tab(0).is_none());
         assert_eq!(pane.tabs.len(), 1);
+        assert_eq!(pane.current_path(), "C:\\Users\\Foo");
     }
 
     #[test]
@@ -654,7 +661,7 @@ mod tests {
         pane.new_tab("C:\\b");
         pane.new_tab("C:\\c");
         pane.switch_tab(2);
-        pane.close_tab(0, "C:\\");
+        pane.close_tab(0);
         assert_eq!(pane.tabs.len(), 2);
         assert_eq!(pane.active_tab_index, 1, "still on the tab that was active");
     }
