@@ -203,16 +203,6 @@ impl Pane {
         Some(self.begin_load(path, LoadKind::Refresh, None))
     }
 
-    /// Refresh only if this pane is showing `dir` — used after a file operation
-    /// so unrelated panes are left alone.
-    pub fn refresh_if_showing(&mut self, dir: &str) -> Option<LoadRequest> {
-        if paths_equal(self.current_path(), dir) {
-            self.refresh()
-        } else {
-            None
-        }
-    }
-
     fn begin_load(
         &mut self,
         path: String,
@@ -362,6 +352,20 @@ impl Pane {
         self.close_tab(self.active_tab_index, fallback)
     }
 
+    /// Select `name` once the next load lands. Used after a rename or a new
+            /// folder so the thing just created is the thing now highlighted.
+    pub fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
+    pub fn active_tab_id(&self) -> u64 {
+        self.active().id
+    }
+
+    pub fn select_after_next_load(&mut self, name: &str) {
+        self.active_mut().pending_select = Some(name.to_string());
+    }
+
     pub fn set_show_hidden(&mut self, show: bool) {
         self.show_hidden = show;
         for tab in &mut self.tabs {
@@ -403,6 +407,7 @@ mod tests {
             is_dir,
             is_reparse: false,
             is_hidden: false,
+            dir_size_known: false,
             extension: None,
         }
     }
@@ -568,15 +573,6 @@ mod tests {
         assert_eq!(rr.kind, LoadKind::Refresh);
         load(&mut pane, &rr, &[("one.txt", false), ("two.txt", false), ("new.txt", false)]);
         assert_eq!(pane.list().selected_entries()[0].name, "two.txt");
-    }
-
-    #[test]
-    fn test_refresh_if_showing_ignores_other_directories() {
-        let mut pane = Pane::new();
-        let r = pane.navigate("C:\\a");
-        load(&mut pane, &r, &[]);
-        assert!(pane.refresh_if_showing("C:\\b").is_none());
-        assert!(pane.refresh_if_showing("c:\\a\\").is_some());
     }
 
     #[test]

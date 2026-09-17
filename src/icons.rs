@@ -29,6 +29,16 @@ pub fn icon_key(extension: Option<&str>, is_dir: bool) -> String {
     }
 }
 
+/// Cache key for one specific path, used by the sidebar so Downloads, Pictures
+/// and each drive get their real shell icon instead of a generic folder.
+/// Only ever applied to the handful of sidebar entries, and cached, so the
+/// disk access it implies happens once per location.
+pub fn icon_key_for_path(path: &str) -> String {
+    format!("{}{}", PATH_PREFIX, path.to_lowercase())
+}
+
+const PATH_PREFIX: &str = "path:";
+
 #[derive(Default)]
 pub struct IconCache {
     by_key: HashMap<String, Option<HICON>>,
@@ -60,12 +70,33 @@ impl IconCache {
 }
 
 unsafe fn lookup(key: &str) -> Option<HICON> {
-    let (path, attrs) = if key == "<dir>" {
-        ("C:\\folder".to_string(), FILE_ATTRIBUTE_DIRECTORY)
+    // A "path:" key asks for the icon of a real location, so the shell is
+    // allowed to touch it. Everything else is resolved from attributes alone
+    // and never hits the disk.
+    let (path, attrs, flags) = if let Some(real) = key.strip_prefix(PATH_PREFIX) {
+        (
+            real.to_string(),
+            FILE_ATTRIBUTE_NORMAL,
+            SHGFI_ICON | SHGFI_SMALLICON,
+        )
+    } else if key == "<dir>" {
+        (
+            "C:\\folder".to_string(),
+            FILE_ATTRIBUTE_DIRECTORY,
+            SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+        )
     } else if key == "<file>" {
-        ("C:\\file".to_string(), FILE_ATTRIBUTE_NORMAL)
+        (
+            "C:\\file".to_string(),
+            FILE_ATTRIBUTE_NORMAL,
+            SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+        )
     } else {
-        (format!("C:\\file{}", key), FILE_ATTRIBUTE_NORMAL)
+        (
+            format!("C:\\file{}", key),
+            FILE_ATTRIBUTE_NORMAL,
+            SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+        )
     };
 
     let w = wide(&path);
@@ -75,7 +106,7 @@ unsafe fn lookup(key: &str) -> Option<HICON> {
         attrs,
         Some(&mut info),
         std::mem::size_of::<SHFILEINFOW>() as u32,
-        SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+        flags,
     );
     if ok == 0 || info.hIcon.is_invalid() {
         None
@@ -112,6 +143,15 @@ mod tests {
     fn extensionless_files_share_a_key() {
         assert_eq!(icon_key(None, false), "<file>");
         assert_eq!(icon_key(Some(""), false), "<file>");
+    }
+
+    #[test]
+    fn path_keys_are_distinct_and_case_folded() {
+        assert_ne!(icon_key_for_path("C:\\Users"), icon_key(None, true));
+        assert_eq!(
+            icon_key_for_path("C:\\Users"),
+            icon_key_for_path("c:\\users")
+        );
     }
 
     #[test]

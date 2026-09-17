@@ -8,6 +8,16 @@
 // same rectangles, which makes that whole class of bug impossible.
 //
 // No Win32 types appear here, so all of it is testable without a window.
+//
+// A pane is five stacked bands:
+//
+//   +------------------------------+
+//   | tab bar        [tabs]     [+]|
+//   | toolbar   < > ^  breadcrumb  |
+//   | header    Name | Size | Date |
+//   | list                      |# |  <- scrollbar gutter on the right
+//   | footer    filter...  12 items|
+//   +------------------------------+
 
 use crate::file_list::SortKey;
 
@@ -30,12 +40,16 @@ impl Rect {
         self.y + self.h
     }
     pub fn contains(&self, px: i32, py: i32) -> bool {
-        self.w > 0 && self.h > 0 && px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
+        self.w > 0
+            && self.h > 0
+            && px >= self.x
+            && px < self.right()
+            && py >= self.y
+            && py < self.bottom()
     }
     pub fn is_empty(&self) -> bool {
         self.w <= 0 || self.h <= 0
     }
-    /// Shrink on all sides.
     pub fn inset(&self, dx: i32, dy: i32) -> Rect {
         Rect::new(self.x + dx, self.y + dy, self.w - dx * 2, self.h - dy * 2)
     }
@@ -87,28 +101,39 @@ pub trait TextMeasurer {
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
     pub scale: f32,
+
     pub tab_bar_h: i32,
     pub tab_min_w: i32,
     pub tab_max_w: i32,
     pub tab_close_w: i32,
     pub new_tab_w: i32,
-    pub breadcrumb_h: i32,
+
+    pub toolbar_h: i32,
+    pub nav_btn_w: i32,
     pub header_h: i32,
-    pub status_h: i32,
+    pub footer_h: i32,
     pub row_h: i32,
+
     pub sidebar_w: i32,
-    /// Band above the drive rows holding the "DRIVES" caption.
-    pub sidebar_header_h: i32,
+    pub sidebar_section_h: i32,
+    pub sidebar_row_h: i32,
+    /// A drive row is taller than a place row: it carries a capacity bar.
+    pub sidebar_drive_h: i32,
+    pub capacity_bar_h: i32,
+
     pub divider_w: i32,
     pub scrollbar_w: i32,
     pub scrollbar_min_thumb: i32,
     pub min_pane_w: i32,
     pub icon_size: i32,
     pub pad: i32,
+    pub radius: f32,
+
     pub col_size_w: i32,
     pub col_date_w: i32,
     pub col_min_name_w: i32,
     pub crumb_sep_w: i32,
+    pub filter_max_w: i32,
 }
 
 impl Metrics {
@@ -117,27 +142,39 @@ impl Metrics {
         let s = |v: f32| (v * scale).round() as i32;
         Self {
             scale,
+
             tab_bar_h: s(30.0),
-            tab_min_w: s(90.0),
-            tab_max_w: s(200.0),
-            tab_close_w: s(20.0),
-            new_tab_w: s(28.0),
-            breadcrumb_h: s(28.0),
-            header_h: s(26.0),
-            status_h: s(24.0),
-            row_h: s(24.0),
-            sidebar_w: s(180.0),
-            sidebar_header_h: s(26.0),
+            tab_min_w: s(96.0),
+            tab_max_w: s(190.0),
+            tab_close_w: s(18.0),
+            new_tab_w: s(26.0),
+
+            toolbar_h: s(30.0),
+            nav_btn_w: s(26.0),
+            header_h: s(24.0),
+            footer_h: s(24.0),
+            // Dense by design: this is a list you scan, not a form you read.
+            row_h: s(22.0),
+
+            sidebar_w: s(196.0),
+            sidebar_section_h: s(26.0),
+            sidebar_row_h: s(24.0),
+            sidebar_drive_h: s(46.0),
+            capacity_bar_h: s(3.0),
+
             divider_w: s(6.0),
-            scrollbar_w: s(12.0),
+            scrollbar_w: s(11.0),
             scrollbar_min_thumb: s(28.0),
-            min_pane_w: s(220.0),
+            min_pane_w: s(240.0),
             icon_size: s(16.0),
             pad: s(8.0),
-            col_size_w: s(90.0),
-            col_date_w: s(130.0),
+            radius: 4.0 * scale,
+
+            col_size_w: s(84.0),
+            col_date_w: s(124.0),
             col_min_name_w: s(120.0),
-            crumb_sep_w: s(14.0),
+            crumb_sep_w: s(13.0),
+            filter_max_w: s(220.0),
         }
     }
 }
@@ -152,6 +189,13 @@ impl Default for Metrics {
 pub enum Side {
     Left,
     Right,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NavButton {
+    Back,
+    Forward,
+    Up,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -177,35 +221,62 @@ pub struct ColumnRect {
     pub rect: Rect,
 }
 
+/// What a sidebar row represents. The caller builds the list; the layout only
+/// assigns rectangles, so adding a new kind of shortcut needs no change here.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SidebarEntry {
+    Section { label: String, collapsed: bool },
+    /// Index into the caller's drive list. `used` in 0..=1 draws the capacity bar.
+    Drive { index: usize, used: Option<f32> },
+    /// Index into the caller's shortcut list.
+    Place { index: usize },
+}
+
+#[derive(Clone, Debug)]
+pub struct SidebarRow {
+    pub rect: Rect,
+    /// Thin capacity bar under a drive's label. Empty for everything else.
+    pub capacity: Rect,
+    /// Chevron target for a section header. Empty for everything else.
+    pub chevron: Rect,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PaneLayout {
     pub bounds: Rect,
     pub tab_bar: Rect,
     pub tabs: Vec<TabRect>,
     pub new_tab: Rect,
+
+    pub toolbar: Rect,
+    pub nav_back: Rect,
+    pub nav_forward: Rect,
+    pub nav_up: Rect,
     pub breadcrumb: Rect,
     pub crumbs: Vec<CrumbRect>,
+
     pub header: Rect,
     pub columns: Vec<ColumnRect>,
+
     /// The rows area, excluding the scrollbar gutter.
     pub list: Rect,
     pub scrollbar: Rect,
     pub thumb: Rect,
     /// Rows fully visible in `list`.
     pub visible_rows: u32,
+
+    pub footer: Rect,
+    pub filter: Rect,
+    pub counts: Rect,
 }
 
 impl PaneLayout {
     /// Absolute row index under a point, if the point is over a real row.
     pub fn row_at(&self, py: i32, scroll_offset: u32, row_h: i32, total_rows: u32) -> Option<u32> {
-        if row_h <= 0 || !self.list.contains(self.list.x, py) {
+        if row_h <= 0 || py < self.list.y || py >= self.list.bottom() {
             return None;
         }
-        let rel = py - self.list.y;
-        if rel < 0 {
-            return None;
-        }
-        let row = scroll_offset as i64 + (rel / row_h) as i64;
+        let row = scroll_offset as i64 + ((py - self.list.y) / row_h) as i64;
         if row >= 0 && (row as u64) < total_rows as u64 {
             Some(row as u32)
         } else {
@@ -219,22 +290,24 @@ pub struct Layout {
     pub metrics: Metrics,
     pub client: Rect,
     pub sidebar: Rect,
-    pub drives: Vec<Rect>,
+    pub sidebar_rows: Vec<SidebarRow>,
     pub left: PaneLayout,
     pub right: PaneLayout,
     pub divider: Rect,
-    pub status: Rect,
 }
 
 /// What is under the cursor.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Hit {
     Nothing,
-    Drive(usize),
+    /// Index into `Layout::sidebar_rows`.
+    Sidebar(usize),
+    SidebarChevron(usize),
     Divider,
     Tab(Side, usize),
     TabClose(Side, usize),
     NewTab(Side),
+    Nav(Side, NavButton),
     Crumb(Side, usize),
     Column(Side, SortKey),
     /// Absolute row index within the pane's list.
@@ -243,6 +316,7 @@ pub enum Hit {
     ScrollbarThumb(Side),
     /// Click on the track above or below the thumb; the f32 is 0..1 along the track.
     ScrollbarTrack(Side, f32),
+    Filter(Side),
 }
 
 /// Everything the layout needs to know about one pane to size it.
@@ -261,13 +335,15 @@ impl Layout {
         metrics: Metrics,
         split_x: i32,
         sidebar_visible: bool,
-        drive_count: usize,
+        sidebar_entries: &[SidebarEntry],
         left: &PaneInput,
-        right: &PaneInput,
+        // `right: None` collapses the window to a single pane: no divider,
+        // no right side.
+        right: Option<&PaneInput>,
         measurer: &dyn TextMeasurer,
     ) -> Layout {
         let m = metrics;
-        let (body, status) = client.split_bottom(m.status_h);
+        let body = client;
 
         let (sidebar, body) = if sidebar_visible {
             body.split_left(m.sidebar_w)
@@ -275,40 +351,40 @@ impl Layout {
             (Rect::default(), body)
         };
 
-        // Drive rows start below the caption band so the two never overlap.
-        let drives = (0..drive_count)
-            .map(|i| {
-                Rect::new(
-                    sidebar.x,
-                    sidebar.y + m.sidebar_header_h + i as i32 * m.row_h,
-                    sidebar.w,
-                    m.row_h,
-                )
-            })
-            .filter(|r| r.bottom() <= sidebar.bottom())
-            .collect();
+        let sidebar_rows = sidebar_rows(sidebar, m, sidebar_entries);
 
-        // split_x is measured from the left edge of the pane area.
-        let split_local = split_x - body.x;
-        let left_w = split_local.clamp(0, body.w.max(0));
-        let left_bounds = Rect::new(body.x, body.y, left_w, body.h);
-        let divider = Rect::new(body.x + left_w, body.y, m.divider_w, body.h);
-        let right_bounds = Rect::new(
-            divider.right(),
-            body.y,
-            (body.right() - divider.right()).max(0),
-            body.h,
-        );
+        let (left_bounds, divider, right_bounds) = match right {
+            Some(_) => {
+                let split_local = split_x - body.x;
+                let left_w = split_local.clamp(0, body.w.max(0));
+                let divider = Rect::new(body.x + left_w, body.y, m.divider_w, body.h);
+                let right_bounds = Rect::new(
+                    divider.right(),
+                    body.y,
+                    (body.right() - divider.right()).max(0),
+                    body.h,
+                );
+                (
+                    Rect::new(body.x, body.y, left_w, body.h),
+                    divider,
+                    right_bounds,
+                )
+            }
+            // Empty rects draw nothing and can never be hit, so the rest of the
+            // app needs no single-pane special cases.
+            None => (body, Rect::default(), Rect::default()),
+        };
 
         Layout {
             metrics: m,
             client,
             sidebar,
-            drives,
+            sidebar_rows,
             left: pane_layout(left_bounds, m, left, measurer),
-            right: pane_layout(right_bounds, m, right, measurer),
+            right: right
+                .map(|r| pane_layout(right_bounds, m, r, measurer))
+                .unwrap_or_default(),
             divider,
-            status,
         }
     }
 
@@ -330,10 +406,16 @@ impl Layout {
         if self.divider.contains(x, y) {
             return Hit::Divider;
         }
-        for (i, r) in self.drives.iter().enumerate() {
-            if r.contains(x, y) {
-                return Hit::Drive(i);
+        if self.sidebar.contains(x, y) {
+            for (i, r) in self.sidebar_rows.iter().enumerate() {
+                if r.chevron.contains(x, y) {
+                    return Hit::SidebarChevron(i);
+                }
+                if r.rect.contains(x, y) {
+                    return Hit::Sidebar(i);
+                }
             }
+            return Hit::Nothing;
         }
         if let Some(h) = hit_pane(&self.left, Side::Left, x, y) {
             return h;
@@ -370,7 +452,16 @@ fn hit_pane(p: &PaneLayout, side: Side, x: i32, y: i32) -> Option<Hit> {
         }
         return Some(Hit::Nothing);
     }
-    if p.breadcrumb.contains(x, y) {
+    if p.toolbar.contains(x, y) {
+        if p.nav_back.contains(x, y) {
+            return Some(Hit::Nav(side, NavButton::Back));
+        }
+        if p.nav_forward.contains(x, y) {
+            return Some(Hit::Nav(side, NavButton::Forward));
+        }
+        if p.nav_up.contains(x, y) {
+            return Some(Hit::Nav(side, NavButton::Up));
+        }
         for c in &p.crumbs {
             if c.rect.contains(x, y) {
                 return Some(Hit::Crumb(side, c.segment_index));
@@ -383,6 +474,12 @@ fn hit_pane(p: &PaneLayout, side: Side, x: i32, y: i32) -> Option<Hit> {
             if c.rect.contains(x, y) {
                 return Some(Hit::Column(side, c.key));
             }
+        }
+        return Some(Hit::Nothing);
+    }
+    if p.footer.contains(x, y) {
+        if p.filter.contains(x, y) {
+            return Some(Hit::Filter(side));
         }
         return Some(Hit::Nothing);
     }
@@ -403,6 +500,67 @@ fn hit_pane(p: &PaneLayout, side: Side, x: i32, y: i32) -> Option<Hit> {
     Some(Hit::Nothing)
 }
 
+/// Distance from a sidebar row's left edge to where its text starts.
+/// The renderer places the icon using the same arithmetic, so the capacity bar
+/// always sits flush under the label rather than under the icon.
+pub fn sidebar_text_offset(m: Metrics) -> i32 {
+    m.pad + m.pad / 2 + m.icon_size + m.pad
+}
+
+fn sidebar_rows(sidebar: Rect, m: Metrics, entries: &[SidebarEntry]) -> Vec<SidebarRow> {
+    if sidebar.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    let mut y = sidebar.y + m.pad / 2;
+    for e in entries {
+        let h = match e {
+            SidebarEntry::Section { .. } => m.sidebar_section_h,
+            SidebarEntry::Drive { used: Some(_), .. } => m.sidebar_drive_h,
+            SidebarEntry::Drive { .. } => m.sidebar_row_h,
+            SidebarEntry::Place { .. } => m.sidebar_row_h,
+        };
+        let rect = Rect::new(sidebar.x, y, sidebar.w, h);
+        // Rows past the bottom get an empty rect so indices still line up with
+        // the caller's list; an empty rect can never be hit or drawn.
+        let rect = if rect.bottom() > sidebar.bottom() {
+            Rect::default()
+        } else {
+            rect
+        };
+
+        let capacity = match e {
+            SidebarEntry::Drive { used: Some(_), .. } if !rect.is_empty() => {
+                let text_x = rect.x + sidebar_text_offset(m);
+                Rect::new(
+                    text_x,
+                    rect.bottom() - m.pad / 2 - m.capacity_bar_h,
+                    (rect.right() - text_x - m.pad).max(0),
+                    m.capacity_bar_h,
+                )
+            }
+            _ => Rect::default(),
+        };
+        let chevron = match e {
+            SidebarEntry::Section { .. } if !rect.is_empty() => Rect::new(
+                rect.right() - m.pad - m.icon_size,
+                rect.y,
+                m.icon_size,
+                rect.h,
+            ),
+            _ => Rect::default(),
+        };
+
+        out.push(SidebarRow {
+            rect,
+            capacity,
+            chevron,
+        });
+        y += h;
+    }
+    out
+}
+
 fn pane_layout(
     bounds: Rect,
     m: Metrics,
@@ -417,8 +575,9 @@ fn pane_layout(
     }
 
     let (tab_bar, rest) = bounds.split_top(m.tab_bar_h);
-    let (breadcrumb, rest) = rest.split_top(m.breadcrumb_h);
-    let (header, list_area) = rest.split_top(m.header_h);
+    let (toolbar, rest) = rest.split_top(m.toolbar_h);
+    let (header, rest) = rest.split_top(m.header_h);
+    let (list_area, footer) = rest.split_bottom(m.footer_h);
     let (list, scrollbar) = list_area.split_right(m.scrollbar_w);
 
     let tabs = tab_rects(tab_bar, m, input.tab_labels, measurer);
@@ -432,7 +591,12 @@ fn pane_layout(
         }
     };
 
+    // Toolbar: three nav buttons, then the breadcrumb fills what is left.
+    let (nav_back, r) = toolbar.split_left(m.nav_btn_w);
+    let (nav_forward, r) = r.split_left(m.nav_btn_w);
+    let (nav_up, breadcrumb) = r.split_left(m.nav_btn_w);
     let crumbs = crumb_rects(breadcrumb, m, input.crumbs, measurer);
+
     let columns = column_rects(header, m);
 
     let visible_rows = if m.row_h > 0 {
@@ -440,13 +604,27 @@ fn pane_layout(
     } else {
         0
     };
-    let thumb = thumb_rect(scrollbar, m, input.total_rows, visible_rows, input.scroll_offset);
+    let thumb = thumb_rect(
+        scrollbar,
+        m,
+        input.total_rows,
+        visible_rows,
+        input.scroll_offset,
+    );
+
+    // Footer: filter field on the left, counts right-aligned.
+    let filter_w = m.filter_max_w.min((footer.w / 2).max(0));
+    let (filter, counts) = footer.split_left(filter_w);
 
     PaneLayout {
         bounds,
         tab_bar,
         tabs,
         new_tab,
+        toolbar,
+        nav_back,
+        nav_forward,
+        nav_up,
         breadcrumb,
         crumbs,
         header,
@@ -455,6 +633,9 @@ fn pane_layout(
         scrollbar,
         thumb,
         visible_rows,
+        footer,
+        filter: filter.inset(m.pad / 2, m.pad / 4),
+        counts,
     }
 }
 
@@ -467,7 +648,8 @@ fn tab_rects(bar: Rect, m: Metrics, labels: &[String], measurer: &dyn TextMeasur
         .iter()
         .map(|l| {
             let text = measurer.measure(l, true).ceil() as i32;
-            (text + m.pad * 2 + m.tab_close_w).clamp(m.tab_min_w, m.tab_max_w)
+            // icon + text + close
+            (text + m.icon_size + m.pad * 3 + m.tab_close_w).clamp(m.tab_min_w, m.tab_max_w)
         })
         .collect();
 
@@ -489,11 +671,9 @@ fn tab_rects(bar: Rect, m: Metrics, labels: &[String], measurer: &dyn TextMeasur
     let mut x = bar.x;
     for w in widths {
         let full = Rect::new(x, bar.y, w.min((bar.right() - x).max(0)), bar.h);
-        // Only offer a close target if there is room for one that is not
-        // covering the whole tab.
-        let close = if full.w > m.tab_close_w * 2 {
+        let close = if full.w > m.tab_close_w * 3 {
             Rect::new(
-                full.right() - m.tab_close_w,
+                full.right() - m.tab_close_w - m.pad / 2,
                 full.y + (full.h - m.tab_close_w) / 2,
                 m.tab_close_w,
                 m.tab_close_w,
@@ -555,9 +735,6 @@ fn crumb_rects(
     }
 
     for i in first..segments.len() {
-        if i > first || first > 0 {
-            // Separator already accounted for above.
-        }
         let w = widths[i].min((bar.right() - x).max(0));
         if w <= 0 {
             break;
@@ -621,7 +798,9 @@ fn thumb_rect(track: Rect, m: Metrics, total: u32, visible: u32, offset: u32) ->
         return Rect::default();
     }
     let frac = visible as f32 / total as f32;
-    let h = ((track.h as f32 * frac) as i32).max(m.scrollbar_min_thumb).min(track.h);
+    let h = ((track.h as f32 * frac) as i32)
+        .max(m.scrollbar_min_thumb)
+        .min(track.h);
     let max_off = total.saturating_sub(visible).max(1);
     let t = (offset as f32 / max_off as f32).clamp(0.0, 1.0);
     let y = track.y + ((track.h - h) as f32 * t) as i32;
@@ -629,18 +808,14 @@ fn thumb_rect(track: Rect, m: Metrics, total: u32, visible: u32, offset: u32) ->
 }
 
 /// Invert `thumb_rect`: where should scroll_offset land for a drag to `py`?
-pub fn scroll_offset_for_thumb_y(
-    track: Rect,
-    m: Metrics,
-    total: u32,
-    visible: u32,
-    py: i32,
-) -> u32 {
+pub fn scroll_offset_for_thumb_y(track: Rect, m: Metrics, total: u32, visible: u32, py: i32) -> u32 {
     if total == 0 || visible >= total || track.h <= 0 {
         return 0;
     }
     let frac = visible as f32 / total as f32;
-    let h = ((track.h as f32 * frac) as i32).max(m.scrollbar_min_thumb).min(track.h);
+    let h = ((track.h as f32 * frac) as i32)
+        .max(m.scrollbar_min_thumb)
+        .min(track.h);
     let span = (track.h - h).max(1);
     let t = ((py - track.y) as f32 / span as f32).clamp(0.0, 1.0);
     let max_off = total.saturating_sub(visible);
@@ -672,6 +847,25 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    fn sidebar_of(n_drives: usize) -> Vec<SidebarEntry> {
+        let mut v = vec![SidebarEntry::Section {
+            label: "Drives".into(),
+            collapsed: false,
+        }];
+        for i in 0..n_drives {
+            v.push(SidebarEntry::Drive {
+                index: i,
+                used: Some(0.5),
+            });
+        }
+        v.push(SidebarEntry::Section {
+            label: "Places".into(),
+            collapsed: false,
+        });
+        v.push(SidebarEntry::Place { index: 0 });
+        v
+    }
+
     fn build(w: i32, h: i32, crumbs: &[String]) -> Layout {
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, w, h);
@@ -682,9 +876,9 @@ mod tests {
             m,
             split,
             true,
-            3,
+            &sidebar_of(2),
             &input(&tabs, crumbs, 100, 0),
-            &input(&tabs, crumbs, 100, 0),
+            Some(&input(&tabs, crumbs, 100, 0)),
             &FixedWidth,
         )
     }
@@ -713,6 +907,44 @@ mod tests {
     }
 
     #[test]
+    fn single_pane_fills_the_body_and_has_no_divider() {
+        let m = Metrics::for_dpi(96);
+        let client = Rect::new(0, 0, 1400, 800);
+        let tabs = strs(&["Foo"]);
+        let crumbs = strs(&["C:\\"]);
+        let l = Layout::compute(
+            client,
+            m,
+            700,
+            true,
+            &sidebar_of(2),
+            &input(&tabs, &crumbs, 10, 0),
+            None,
+            &FixedWidth,
+        );
+        assert!(l.divider.is_empty());
+        assert!(l.right.bounds.is_empty());
+        assert_eq!(l.left.bounds.x, l.sidebar.right());
+        assert_eq!(l.left.bounds.right(), client.right());
+        // Nothing on the right half can be hit.
+        assert_eq!(l.hit_test(1300, 400), Hit::ListBackground(Side::Left));
+    }
+
+    #[test]
+    fn pane_bands_tile_the_pane_exactly() {
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let p = &l.left;
+        assert_eq!(p.tab_bar.y, p.bounds.y);
+        assert_eq!(p.tab_bar.bottom(), p.toolbar.y);
+        assert_eq!(p.toolbar.bottom(), p.header.y);
+        assert_eq!(p.header.bottom(), p.list.y);
+        assert_eq!(p.list.bottom(), p.footer.y);
+        assert_eq!(p.footer.bottom(), p.bounds.bottom());
+        assert_eq!(p.list.right(), p.scrollbar.x);
+        assert_eq!(p.scrollbar.right(), p.bounds.right());
+    }
+
+    #[test]
     fn clamp_split_keeps_both_panes_usable() {
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, 1000, 600);
@@ -727,8 +959,7 @@ mod tests {
     fn clamp_split_centres_when_the_window_is_too_narrow() {
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, 200, 600);
-        let s = Layout::clamp_split(client, m, false, 10);
-        assert_eq!(s, 100);
+        assert_eq!(Layout::clamp_split(client, m, false, 10), 100);
     }
 
     // -- the bug this module was written to kill ---------------------------
@@ -738,8 +969,6 @@ mod tests {
         let crumbs = strs(&["C:\\", "Users", "Sindroma", "Desktop"]);
         let l = build(1600, 800, &crumbs);
         assert_eq!(l.left.crumbs.len(), 4, "all four should fit at this width");
-
-        // Click the centre of each drawn crumb; it must resolve to that crumb.
         for c in &l.left.crumbs {
             let cx = c.rect.x + c.rect.w / 2;
             let cy = c.rect.y + c.rect.h / 2;
@@ -767,7 +996,6 @@ mod tests {
 
     #[test]
     fn crumbs_never_escape_the_breadcrumb_bar() {
-        // The old renderer walked a fixed stride and spilled into the next pane.
         let crumbs = strs(&[
             "C:\\", "Users", "Sindroma", "Documents", "Projects", "file-xplorer", "src", "deep",
         ]);
@@ -783,11 +1011,24 @@ mod tests {
     }
 
     #[test]
+    fn crumbs_never_overlap_the_nav_buttons() {
+        let l = build(900, 800, &strs(&["C:\\", "Users", "Sindroma"]));
+        for c in &l.left.crumbs {
+            assert!(
+                c.rect.x >= l.left.nav_up.right(),
+                "crumb {:?} overlaps the Up button {:?}",
+                c.rect,
+                l.left.nav_up
+            );
+        }
+    }
+
+    #[test]
     fn overflowing_crumbs_elide_from_the_left_and_keep_the_leaf() {
         let crumbs = strs(&[
             "C:\\", "Users", "Sindroma", "Documents", "Projects", "file-xplorer", "src",
         ]);
-        let l = build(760, 800, &crumbs);
+        let l = build(820, 800, &crumbs);
         let last = l.left.crumbs.last().unwrap();
         assert_eq!(
             last.segment_index,
@@ -795,6 +1036,22 @@ mod tests {
             "the current folder must always be shown"
         );
         assert!(l.left.crumbs[0].is_ellipsis, "hidden parents get an ellipsis");
+    }
+
+    #[test]
+    fn nav_buttons_are_distinct_and_ordered() {
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let p = &l.left;
+        assert_eq!(p.nav_back.right(), p.nav_forward.x);
+        assert_eq!(p.nav_forward.right(), p.nav_up.x);
+        assert_eq!(
+            l.hit_test(p.nav_back.x + 2, p.nav_back.y + 2),
+            Hit::Nav(Side::Left, NavButton::Back)
+        );
+        assert_eq!(
+            l.hit_test(p.nav_up.x + 2, p.nav_up.y + 2),
+            Hit::Nav(Side::Left, NavButton::Up)
+        );
     }
 
     #[test]
@@ -808,9 +1065,9 @@ mod tests {
             m,
             Layout::clamp_split(client, m, false, 700),
             false,
-            0,
+            &[],
             &input(&tabs, &crumbs, 0, 0),
-            &input(&tabs, &crumbs, 0, 0),
+            Some(&input(&tabs, &crumbs, 0, 0)),
             &FixedWidth,
         );
         let t = l.left.tabs[1];
@@ -818,7 +1075,6 @@ mod tests {
         let cx = t.close.x + t.close.w / 2;
         let cy = t.close.y + t.close.h / 2;
         assert_eq!(l.hit_test(cx, cy), Hit::TabClose(Side::Left, 1));
-        // The body of the same tab still selects it.
         assert_eq!(l.hit_test(t.full.x + 2, t.full.y + 2), Hit::Tab(Side::Left, 1));
     }
 
@@ -833,9 +1089,9 @@ mod tests {
             m,
             Layout::clamp_split(client, m, false, 500),
             false,
-            0,
+            &[],
             &input(&tabs, &crumbs, 0, 0),
-            &input(&tabs, &crumbs, 0, 0),
+            Some(&input(&tabs, &crumbs, 0, 0)),
             &FixedWidth,
         );
         for t in &l.left.tabs {
@@ -852,13 +1108,8 @@ mod tests {
     fn columns_drop_off_before_squeezing_the_name_column() {
         let wide = build(1600, 800, &strs(&["C:\\"]));
         assert_eq!(wide.left.columns.len(), 3);
-
-        let narrow = build(700, 800, &strs(&["C:\\"]));
-        assert!(
-            narrow.left.columns.len() < 3,
-            "narrow pane should shed columns, got {:?}",
-            narrow.left.columns.len()
-        );
+        let narrow = build(760, 800, &strs(&["C:\\"]));
+        assert!(narrow.left.columns.len() < 3);
         assert_eq!(narrow.left.columns[0].key, SortKey::Name);
     }
 
@@ -878,11 +1129,11 @@ mod tests {
         let l = build(1400, 800, &strs(&["C:\\"]));
         let m = l.metrics;
         let p = &l.left;
-        // Third visible row while scrolled down 10.
         let y = p.list.y + m.row_h * 2 + 1;
         assert_eq!(p.row_at(y, 10, m.row_h, 100), Some(12));
-        // Past the end of the data.
         assert_eq!(p.row_at(y, 10, m.row_h, 5), None);
+        // Below the list is not a row, even with plenty of data.
+        assert_eq!(p.row_at(p.list.bottom() + 1, 0, m.row_h, 10_000), None);
     }
 
     #[test]
@@ -897,24 +1148,18 @@ mod tests {
                 m,
                 Layout::clamp_split(client, m, false, 700),
                 false,
-                0,
+                &[],
                 &input(&tabs, &crumbs, 1000, offset),
-                &input(&tabs, &crumbs, 1000, offset),
+                Some(&input(&tabs, &crumbs, 1000, offset)),
                 &FixedWidth,
             )
         };
         let top = mk(0);
         assert_eq!(top.left.thumb.y, top.left.scrollbar.y);
-
         let visible = top.left.visible_rows;
         let bottom = mk(1000 - visible);
-        assert_eq!(
-            bottom.left.thumb.bottom(),
-            bottom.left.scrollbar.bottom(),
-            "thumb should sit flush at the end of the track"
-        );
+        assert_eq!(bottom.left.thumb.bottom(), bottom.left.scrollbar.bottom());
 
-        // Dragging the thumb back to the top yields offset 0.
         let track = top.left.scrollbar;
         assert_eq!(scroll_offset_for_thumb_y(track, m, 1000, visible, track.y), 0);
         assert_eq!(
@@ -934,9 +1179,9 @@ mod tests {
             m,
             Layout::clamp_split(client, m, false, 700),
             false,
-            0,
+            &[],
             &input(&tabs, &crumbs, 3, 0),
-            &input(&tabs, &crumbs, 3, 0),
+            Some(&input(&tabs, &crumbs, 3, 0)),
             &FixedWidth,
         );
         assert!(l.left.thumb.is_empty());
@@ -949,12 +1194,88 @@ mod tests {
         assert_eq!(l.hit_test(cx, 400), Hit::Divider);
     }
 
+    // -- sidebar -----------------------------------------------------------
+
     #[test]
-    fn drive_rows_hit_test() {
+    fn sidebar_rows_stack_without_overlapping() {
         let l = build(1400, 800, &strs(&["C:\\"]));
-        assert_eq!(l.drives.len(), 3);
-        let r = l.drives[1];
-        assert_eq!(l.hit_test(r.x + 5, r.y + 2), Hit::Drive(1));
+        let rows: Vec<&SidebarRow> = l.sidebar_rows.iter().filter(|r| !r.rect.is_empty()).collect();
+        assert_eq!(rows.len(), 5); // section, 2 drives, section, place
+        for pair in rows.windows(2) {
+            assert_eq!(pair[0].rect.bottom(), pair[1].rect.y);
+        }
+    }
+
+    #[test]
+    fn drive_rows_are_taller_and_carry_a_capacity_bar() {
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let drive = &l.sidebar_rows[1];
+        let place = l.sidebar_rows.last().unwrap();
+        assert!(drive.rect.h > place.rect.h);
+        assert!(!drive.capacity.is_empty());
+        assert!(place.capacity.is_empty());
+        assert!(
+            drive.capacity.bottom() <= drive.rect.bottom(),
+            "capacity bar escaped its row"
+        );
+    }
+
+    #[test]
+    fn capacity_bar_sits_below_the_label_not_across_it() {
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let m = l.metrics;
+        let drive = &l.sidebar_rows[1];
+        // Two text lines stack above the bar; the bar must clear both.
+        let two_lines = drive.rect.y + m.pad / 2 + m.sidebar_row_h;
+        assert!(
+            drive.capacity.y >= two_lines,
+            "bar at y={} runs through the text ending at y={}",
+            drive.capacity.y,
+            two_lines
+        );
+        assert!(drive.capacity.bottom() <= drive.rect.bottom());
+        assert_eq!(drive.capacity.x, drive.rect.x + sidebar_text_offset(m));
+    }
+
+    #[test]
+    fn section_chevron_hit_tests_before_the_row() {
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let s = &l.sidebar_rows[0];
+        assert!(!s.chevron.is_empty());
+        let cx = s.chevron.x + s.chevron.w / 2;
+        let cy = s.chevron.y + s.chevron.h / 2;
+        assert_eq!(l.hit_test(cx, cy), Hit::SidebarChevron(0));
+        assert_eq!(l.hit_test(s.rect.x + 2, s.rect.y + 2), Hit::Sidebar(0));
+    }
+
+    #[test]
+    fn sidebar_rows_past_the_bottom_are_empty_but_keep_their_index() {
+        let m = Metrics::for_dpi(96);
+        let client = Rect::new(0, 0, 1400, 140);
+        let tabs = strs(&["Foo"]);
+        let crumbs = strs(&["C:\\"]);
+        let entries: Vec<SidebarEntry> =
+            (0..40).map(|i| SidebarEntry::Place { index: i }).collect();
+        let l = Layout::compute(
+            client,
+            m,
+            Layout::clamp_split(client, m, true, 700),
+            true,
+            &entries,
+            &input(&tabs, &crumbs, 0, 0),
+            Some(&input(&tabs, &crumbs, 0, 0)),
+            &FixedWidth,
+        );
+        assert_eq!(l.sidebar_rows.len(), 40, "indices must still line up");
+        assert!(l.sidebar_rows.last().unwrap().rect.is_empty());
+    }
+
+    #[test]
+    fn footer_filter_hit_tests() {
+        let l = build(1400, 800, &strs(&["C:\\"]));
+        let f = l.left.filter;
+        assert!(!f.is_empty());
+        assert_eq!(l.hit_test(f.x + 2, f.y + 2), Hit::Filter(Side::Left));
     }
 
     #[test]
@@ -963,10 +1284,11 @@ mod tests {
         let hi = Metrics::for_dpi(192);
         assert_eq!(hi.row_h, lo.row_h * 2);
         assert_eq!(hi.sidebar_w, lo.sidebar_w * 2);
+        assert_eq!(hi.sidebar_drive_h, lo.sidebar_drive_h * 2);
     }
 
     #[test]
-    fn zero_sized_pane_does_not_panic() {
+    fn zero_sized_window_does_not_panic() {
         let m = Metrics::for_dpi(96);
         let client = Rect::new(0, 0, 0, 0);
         let tabs = strs(&["Foo"]);
@@ -976,24 +1298,11 @@ mod tests {
             m,
             0,
             true,
-            2,
+            &sidebar_of(2),
             &input(&tabs, &crumbs, 0, 0),
-            &input(&tabs, &crumbs, 0, 0),
+            Some(&input(&tabs, &crumbs, 0, 0)),
             &FixedWidth,
         );
         assert_eq!(l.hit_test(0, 0), Hit::Nothing);
-    }
-
-
-    #[test]
-    fn drive_rows_start_below_the_sidebar_caption() {
-        let l = build(1400, 800, &strs(&["C:\\"]));
-        let caption_bottom = l.sidebar.y + l.metrics.sidebar_header_h;
-        assert!(
-            l.drives[0].y >= caption_bottom,
-            "first drive row at {} overlaps the caption band ending at {}",
-            l.drives[0].y,
-            caption_bottom
-        );
     }
 }

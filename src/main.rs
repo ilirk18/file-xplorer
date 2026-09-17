@@ -15,6 +15,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod config;
 mod file_list;
 mod fs;
 mod icons;
@@ -23,7 +24,9 @@ mod ops;
 mod pane;
 mod renderer;
 mod theme;
+mod watch;
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use windows::core::{Result, BOOL, PCWSTR};
@@ -36,16 +39,28 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use config::{Config, UNSET};
 use file_list::SelectMode;
-use layout::{Hit, Layout, Metrics, PaneInput, Rect, Side};
+use layout::{Hit, Layout, Metrics, NavButton, PaneInput, Rect, SidebarEntry, Side};
 use pane::{LoadRequest, Pane};
-use renderer::{PaneView, Renderer};
+use renderer::{PaneView, Renderer, SidebarView};
 use theme::Theme;
+use watch::Watcher;
 
 /// A finished directory read, posted back from a worker thread.
 const WM_APP_DIR_LOADED: u32 = WM_APP + 1;
 /// A finished file operation, posted back from a worker thread.
 const WM_APP_OP_DONE: u32 = WM_APP + 2;
+/// Calculated folder sizes, posted back from a worker thread.
+const WM_APP_SIZES_DONE: u32 = WM_APP + 3;
+/// A watched directory changed on disk. wParam is the pane index.
+const WM_APP_DIR_CHANGED: u32 = WM_APP + 4;
+
+/// Timer ids for coalescing change notifications, one per pane.
+const TIMER_WATCH_LEFT: usize = 1;
+const TIMER_WATCH_RIGHT: usize = 2;
+/// A burst of writes (an unzip, a build) should cost one reload, not hundreds.
+const WATCH_DEBOUNCE_MS: u32 = 250;
 
 const FALLBACK_PATH: &str = "C:\\";
 /// How long a type-to-select prefix stays alive between keystrokes.
@@ -69,6 +84,9 @@ const CMD_PROPERTIES: usize = 108;
 const CMD_COPY_TO_OTHER: usize = 109;
 const CMD_MOVE_TO_OTHER: usize = 110;
 const CMD_REFRESH: usize = 111;
+const CMD_CALC_SIZES: usize = 112;
+const CMD_SYNC_SCROLL: usize = 113;
+const CMD_COMPARE: usize = 114;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -103,6 +121,21 @@ fn alt_down() -> bool {
     key_down(VK_MENU)
 }
 
+fn side_index(side: Side) -> usize {
+    match side {
+        Side::Left => 0,
+        Side::Right => 1,
+    }
+}
+
+fn side_from_index(i: usize) -> Side {
+    if i == 0 {
+        Side::Left
+    } else {
+        Side::Right
+    }
+}
+
 fn select_mode() -> SelectMode {
     if shift_down() {
         SelectMode::Range
@@ -113,10 +146,33 @@ fn select_mode() -> SelectMode {
     }
 }
 
+struct SizesDone {
+    side: Side,
+    tab_id: u64,
+    sizes: Vec<(String, u64)>,
+}
+
 struct DirLoaded {
     side: Side,
     req: LoadRequest,
     result: std::result::Result<Vec<fs::FileEntry>, String>,
+}
+
+/// A named location in the sidebar's Places section.
+struct Shortcut {
+    label: String,
+    path: String,
+}
+
+/// Which sidebar section a header row belongs to.
+const SECTION_DRIVES: usize = 0;
+const SECTION_PLACES: usize = 1;
+
+/// What clicking a sidebar row should do. Built alongside the entries so the
+/// two lists share indices with `Layout::sidebar_rows`.
+enum SidebarAction {
+    ToggleSection(usize),
+    Go(String),
 }
 
 /// What the left mouse button is currently doing.
@@ -139,8 +195,15 @@ struct AppState {
 
     /// Divider position in client coordinates.
     split_x: i32,
+    /// False shows one pane. The second pane keeps its state while hidden.
+    dual: bool,
     sidebar_visible: bool,
     drives: Vec<fs::Drive>,
+    places: Vec<Shortcut>,
+    /// Collapsed state per sidebar section, indexed by SECTION_*.
+    sections_collapsed: [bool; 2],
+    /// Which pane's footer filter box is taking keystrokes, if any.
+    filter_focus: Option<Side>,
 
     hover: Option<Hit>,
     drag: Drag,
@@ -148,6 +211,12 @@ struct AppState {
 
     theme: Theme,
     show_hidden: bool,
+    /// Scrolling one pane scrolls the other to the same row.
+    sync_scroll: bool,
+    /// Mark entries that the other pane does not have.
+    compare: bool,
+    /// One directory watcher per pane, dropped (and cancelled) on navigation.
+    watchers: [Option<Watcher>; 2],
 
     type_ahead: String,
     type_ahead_at: Option<Instant>,
@@ -155,35 +224,53 @@ struct AppState {
     /// Set while a modal dialog owns input, so stray messages are ignored.
     modal: bool,
     status_override: Option<String>,
+    /// Last title pushed to the window, so we only call SetWindowText on change.
+    last_title: String,
 }
 
 impl AppState {
     fn new(dpi: u32) -> Result<Self> {
+        let cfg = Config::load();
+        let theme = if cfg.theme_dark {
+            Theme::Dark
+        } else {
+            Theme::Light
+        };
         let metrics = Metrics::for_dpi(dpi);
         let mut left = Pane::new();
         let mut right = Pane::new();
         left.set_row_height(metrics.row_h as u32);
         right.set_row_height(metrics.row_h as u32);
+        left.set_show_hidden(cfg.show_hidden);
+        right.set_show_hidden(cfg.show_hidden);
         Ok(Self {
-            renderer: Renderer::new(Theme::Dark, dpi)?,
+            renderer: Renderer::new(theme, dpi)?,
             metrics,
             dpi,
             client: Rect::default(),
             left,
             right,
             focused: Side::Left,
-            split_x: 0,
-            sidebar_visible: true,
+            split_x: cfg.split_x,
+            dual: cfg.dual,
+            sidebar_visible: cfg.sidebar_visible,
             drives: fs::drives(),
+            places: default_places(),
+            sections_collapsed: [false, false],
+            filter_focus: None,
             hover: None,
             drag: Drag::None,
             mouse_tracking: false,
-            theme: Theme::Dark,
-            show_hidden: false,
+            theme,
+            show_hidden: cfg.show_hidden,
+            sync_scroll: cfg.sync_scroll,
+            compare: cfg.compare,
+            watchers: [None, None],
             type_ahead: String::new(),
             type_ahead_at: None,
             modal: false,
             status_override: None,
+            last_title: String::new(),
         })
     }
 
@@ -209,6 +296,43 @@ impl AppState {
         }
     }
 
+    /// Build the sidebar's rows and, in lockstep, what clicking each one does.
+    /// Returning both from one place keeps the indices in sync with the
+    /// rectangles the layout produces from the same list.
+    fn sidebar_model(&self) -> (Vec<SidebarEntry>, Vec<SidebarAction>) {
+        let mut entries = Vec::new();
+        let mut actions = Vec::new();
+
+        entries.push(SidebarEntry::Section {
+            label: "Drives".into(),
+            collapsed: self.sections_collapsed[SECTION_DRIVES],
+        });
+        actions.push(SidebarAction::ToggleSection(SECTION_DRIVES));
+        if !self.sections_collapsed[SECTION_DRIVES] {
+            for (i, d) in self.drives.iter().enumerate() {
+                entries.push(SidebarEntry::Drive {
+                    index: i,
+                    used: d.used_fraction(),
+                });
+                actions.push(SidebarAction::Go(d.root.clone()));
+            }
+        }
+
+        entries.push(SidebarEntry::Section {
+            label: "Places".into(),
+            collapsed: self.sections_collapsed[SECTION_PLACES],
+        });
+        actions.push(SidebarAction::ToggleSection(SECTION_PLACES));
+        if !self.sections_collapsed[SECTION_PLACES] {
+            for (i, sc) in self.places.iter().enumerate() {
+                entries.push(SidebarEntry::Place { index: i });
+                actions.push(SidebarAction::Go(sc.path.clone()));
+            }
+        }
+
+        (entries, actions)
+    }
+
     /// Recompute the frame. Cheap: the renderer memoises text measurement.
     fn layout(&self) -> Layout {
         let left_tabs: Vec<String> = self.left.tabs.iter().map(|t| t.label()).collect();
@@ -228,14 +352,15 @@ impl AppState {
             total_rows: self.right.list().total_rows(),
             scroll_offset: self.right.list().scroll_offset,
         };
+        let (entries, _) = self.sidebar_model();
         Layout::compute(
             self.client,
             self.metrics,
             self.split_x,
             self.sidebar_visible,
-            self.drives.len(),
+            &entries,
             &li,
-            &ri,
+            if self.dual { Some(&ri) } else { None },
             &self.renderer,
         )
     }
@@ -249,30 +374,83 @@ impl AppState {
             Layout::clamp_split(self.client, self.metrics, self.sidebar_visible, self.split_x);
     }
 
-    fn status_text(&self) -> (String, String) {
-        if let Some(s) = &self.status_override {
-            return (s.clone(), String::new());
+    fn config(&self, hwnd: HWND) -> Config {
+        let mut c = Config {
+            dual: self.dual,
+            theme_dark: self.theme.is_dark(),
+            sidebar_visible: self.sidebar_visible,
+            show_hidden: self.show_hidden,
+            split_x: self.split_x,
+            sync_scroll: self.sync_scroll,
+            compare: self.compare,
+            ..Config::default()
+        };
+        // rcNormalPosition is the restored box even while maximised, which is
+        // what we want to come back to after un-maximising.
+        let mut wp = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetWindowPlacement(hwnd, &mut wp) }.is_ok() {
+            let r = wp.rcNormalPosition;
+            c.win_x = r.left;
+            c.win_y = r.top;
+            c.win_w = (r.right - r.left).max(400);
+            c.win_h = (r.bottom - r.top).max(300);
+            c.maximized = wp.showCmd == SW_SHOWMAXIMIZED.0 as u32;
         }
-        let p = self.focused_pane();
-        let list = p.list();
-        let total = list.total_rows();
+        c
+    }
+
+    /// Point this pane's watcher at whatever it is now showing. Dropping the
+    /// old watcher cancels its blocking read, so there is never more than one
+    /// thread per pane.
+    fn rewatch(&mut self, side: Side, hwnd: HWND) {
+        let i = side_index(side);
+        let path = self.pane(side).current_path().to_string();
+        self.watchers[i] = None;
+        self.watchers[i] = Watcher::start(hwnd, side, WM_APP_DIR_CHANGED, &path);
+    }
+
+    /// Keep both panes on the same row when sync scrolling is on.
+    fn mirror_scroll(&mut self, from: Side) {
+        if !self.sync_scroll || !self.dual {
+            return;
+        }
+        let offset = self.pane(from).list().scroll_offset;
+        let to = match from {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        };
+        let h = self.list_height(to);
+        self.pane_mut(to).list_mut().scroll_to(offset, h);
+    }
+
+    /// The right-hand text in a pane's footer.
+    fn counts_text(&self, side: Side) -> String {
+        let pane = self.pane(side);
+        if side == self.focused {
+            if let Some(s) = &self.status_override {
+                return s.clone();
+            }
+        }
+        let list = pane.list();
+        if pane.active().loading && list.entries.is_empty() {
+            return "Loading\u{2026}".to_string();
+        }
+        let shown = list.total_rows() as usize;
         let sel = list.selection_count();
-        let left = if sel == 0 {
-            format!("{} item{}", total, if total == 1 { "" } else { "s" })
-        } else {
-            format!(
-                "{} of {} selected  \u{2022}  {}",
+        if sel > 0 {
+            return format!(
+                "{} selected  \u{00B7}  {}",
                 sel,
-                total,
                 fs::format_size(list.selected_size())
-            )
-        };
-        let right = if p.active().loading {
-            "Loading\u{2026}".to_string()
-        } else {
-            p.current_path().to_string()
-        };
-        (left, right)
+            );
+        }
+        if list.is_filtered() {
+            return format!("{} of {}", shown, list.unfiltered_count());
+        }
+        format!("{} item{}", shown, if shown == 1 { "" } else { "s" })
     }
 }
 
@@ -305,23 +483,50 @@ fn main() -> Result<()> {
             return Err(windows::core::Error::from_thread());
         }
 
+        // Restore the saved box, but only if it still lands on a monitor:
+        // a window restored onto a display that has since been unplugged is
+        // unreachable.
+        let cfg = Config::load();
+        let (x, y, w, h) = if cfg.win_x == UNSET {
+            (CW_USEDEFAULT, CW_USEDEFAULT, 1200, 760)
+        } else {
+            let r = RECT {
+                left: cfg.win_x,
+                top: cfg.win_y,
+                right: cfg.win_x + cfg.win_w,
+                bottom: cfg.win_y + cfg.win_h,
+            };
+            if MonitorFromRect(&r, MONITOR_DEFAULTTONULL).is_invalid() {
+                (CW_USEDEFAULT, CW_USEDEFAULT, cfg.win_w, cfg.win_h)
+            } else {
+                (cfg.win_x, cfg.win_y, cfg.win_w, cfg.win_h)
+            }
+        };
+
         let title = wide("File Xplorer");
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             PCWSTR::from_raw(class_name.as_ptr()),
             PCWSTR::from_raw(title.as_ptr()),
             WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1200,
-            760,
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(instance.into()),
             None,
         )?;
 
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(
+            hwnd,
+            if cfg.maximized {
+                SW_SHOWMAXIMIZED
+            } else {
+                SW_SHOW
+            },
+        );
         let _ = UpdateWindow(hwnd);
 
         let mut msg = MSG::default();
@@ -408,6 +613,69 @@ fn spawn_op(hwnd: HWND, op: ops::Op) {
     });
 }
 
+/// Walk each named folder on a worker thread and post the totals back.
+fn spawn_dir_sizes(hwnd: HWND, side: Side, tab_id: u64, dir: String, names: Vec<String>) {
+    let owner = ops::OwnerWindow(hwnd);
+    std::thread::spawn(move || {
+        let sizes = names
+            .into_iter()
+            .map(|n| {
+                let size = fs::dir_size(&fs::path_join(&dir, &n));
+                (n, size)
+            })
+            .collect();
+        let raw = Box::into_raw(Box::new(SizesDone {
+            side,
+            tab_id,
+            sizes,
+        }));
+        let posted = unsafe {
+            PostMessageW(
+                Some(owner.hwnd()),
+                WM_APP_SIZES_DONE,
+                WPARAM(0),
+                LPARAM(raw as isize),
+            )
+        };
+        if posted.is_err() {
+            unsafe { drop(Box::from_raw(raw)) };
+        }
+    });
+}
+
+/// Size the selected folders, or every folder in view when nothing is selected.
+fn calculate_folder_sizes(state: &mut AppState, hwnd: HWND) {
+    let side = state.focused;
+    let pane = state.pane(side);
+    let dir = pane.current_path().to_string();
+    if dir.is_empty() {
+        return;
+    }
+    let selected: Vec<String> = pane
+        .list()
+        .selected_entries()
+        .iter()
+        .filter(|e| e.is_dir)
+        .map(|e| e.name.clone())
+        .collect();
+    let names = if selected.is_empty() {
+        pane.list()
+            .entries
+            .iter()
+            .filter(|e| e.is_dir && !e.is_reparse)
+            .map(|e| e.name.clone())
+            .collect()
+    } else {
+        selected
+    };
+    if names.is_empty() {
+        return;
+    }
+    state.status_override = Some(format!("Sizing {} folders\u{2026}", names.len()));
+    let tab_id = state.pane(side).active_tab_id();
+    spawn_dir_sizes(hwnd, side, tab_id, dir, names);
+}
+
 fn report_error(hwnd: HWND, title: &str, message: &str) {
     let t = wide(title);
     let m = wide(message);
@@ -478,6 +746,9 @@ fn handle(
         }
 
         WM_DESTROY => {
+            // Drop the watchers first: their threads post to this window.
+            state.watchers = [None, None];
+            state.config(hwnd).save();
             unsafe { PostQuitMessage(0) };
             Some(LRESULT(0))
         }
@@ -488,7 +759,8 @@ fn handle(
         WM_SIZE => {
             let w = loword(lparam.0 as u32).max(0);
             let h = hiword(lparam.0 as u32).max(0);
-            let first = state.client.w == 0;
+            // Only centre the divider when nothing was restored for it.
+            let first = state.client.w == 0 && state.split_x == 0;
             state.client = Rect::new(0, 0, w, h);
             if first {
                 // Start with the panes even.
@@ -655,6 +927,7 @@ fn handle(
             let lines = if delta > 0 { -3 } else { 3 };
             let h = layout.pane(side).list.h.max(0) as u32;
             state.pane_mut(side).list_mut().scroll_by(lines, h);
+            state.mirror_scroll(side);
             invalidate(hwnd);
             Some(LRESULT(0))
         }
@@ -696,6 +969,46 @@ fn handle(
                 h,
             );
             if changed {
+                state.rewatch(side, hwnd);
+                invalidate(hwnd);
+            }
+            Some(LRESULT(0))
+        }
+
+        WM_APP_DIR_CHANGED => {
+            // Coalesce: restart the timer so a burst of writes collapses into
+            // a single reload once things settle.
+            let side = side_from_index(wparam.0);
+            let id = match side {
+                Side::Left => TIMER_WATCH_LEFT,
+                Side::Right => TIMER_WATCH_RIGHT,
+            };
+            unsafe { SetTimer(Some(hwnd), id, WATCH_DEBOUNCE_MS, None) };
+            Some(LRESULT(0))
+        }
+
+        WM_TIMER => {
+            let id = wparam.0;
+            if id == TIMER_WATCH_LEFT || id == TIMER_WATCH_RIGHT {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), id);
+                }
+                let side = if id == TIMER_WATCH_LEFT {
+                    Side::Left
+                } else {
+                    Side::Right
+                };
+                let req = state.pane_mut(side).refresh();
+                start_load(hwnd, side, req);
+                return Some(LRESULT(0));
+            }
+            None
+        }
+
+        WM_APP_SIZES_DONE => {
+            let done = unsafe { Box::from_raw(lparam.0 as *mut SizesDone) };
+            if let Some(tab) = state.pane_mut(done.side).tab_mut(done.tab_id) {
+                tab.file_list.set_dir_sizes(done.sizes);
                 invalidate(hwnd);
             }
             Some(LRESULT(0))
@@ -708,10 +1021,24 @@ fn handle(
             } else if result.aborted {
                 state.status_override = Some("Cancelled".into());
             }
+            // Whatever the operation just created is what the user wants
+            // selected when the listing comes back.
+            let created = match &result.op {
+                ops::Op::Rename { new_name, .. } => Some(new_name.clone()),
+                ops::Op::NewFolder { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+
             // Refresh only the panes actually showing an affected directory.
             for dir in result.op.affected_dirs() {
                 for side in [Side::Left, Side::Right] {
-                    let req = state.pane_mut(side).refresh_if_showing(&dir);
+                    if !pane::paths_equal(state.pane(side).current_path(), &dir) {
+                        continue;
+                    }
+                    if let Some(name) = &created {
+                        state.pane_mut(side).select_after_next_load(name);
+                    }
+                    let req = state.pane_mut(side).refresh();
                     start_load(hwnd, side, req);
                 }
             }
@@ -737,12 +1064,34 @@ fn paint(state: &mut AppState, hwnd: HWND) {
             .resize(hwnd, state.client.w.max(0) as u32, state.client.h.max(0) as u32);
     }
     let layout = state.layout();
-    let (status_left, status_right) = state.status_text();
+    let (sidebar_entries, _) = state.sidebar_model();
     let current = state.focused_pane().current_path().to_string();
     let dragging = matches!(state.drag, Drag::Divider { .. });
     let hover = state.hover;
     let focused_side = state.focused;
+    let filter_focus = state.filter_focus;
     let drives = state.drives.clone();
+    let places: Vec<(String, String)> = state
+        .places
+        .iter()
+        .map(|p| (p.label.clone(), p.path.clone()))
+        .collect();
+    let counts = [
+        state.counts_text(Side::Left),
+        state.counts_text(Side::Right),
+    ];
+    let sides: &[Side] = if state.dual {
+        &[Side::Left, Side::Right]
+    } else {
+        &[Side::Left]
+    };
+    let comparing = state.compare && state.dual;
+    let (left_names, right_names) = if comparing {
+        (state.left.list().names(), state.right.list().names())
+    } else {
+        (HashSet::new(), HashSet::new())
+    };
+    update_title(state, hwnd);
 
     // Destructure so the renderer can be borrowed mutably while the panes are
     // borrowed immutably. Borrowing through `state` would conflict.
@@ -754,9 +1103,18 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     } = state;
 
     renderer.begin();
-    renderer.draw_sidebar(&layout, &drives, &current, hover);
+    renderer.draw_sidebar(
+        &layout,
+        &SidebarView {
+            entries: &sidebar_entries,
+            drives: &drives,
+            places: &places,
+            current_path: &current,
+            hover,
+        },
+    );
 
-    for side in [Side::Left, Side::Right] {
+    for &side in sides {
         let pane: &Pane = match side {
             Side::Left => left,
             Side::Right => right,
@@ -774,18 +1132,55 @@ fn paint(state: &mut AppState, hwnd: HWND) {
             loading: pane.active().loading,
             error: pane.active().error.as_deref(),
             hover,
+            can_back: pane.active().can_go_back(),
+            can_forward: pane.active().can_go_forward(),
+            can_up: fs::path_parent(pane.current_path()).is_some(),
+            filter_focused: filter_focus == Some(side),
+            counts: &counts[if side == Side::Left { 0 } else { 1 }],
+            other_names: comparing.then(|| match side {
+                Side::Left => &right_names,
+                Side::Right => &left_names,
+            }),
         };
         renderer.draw_pane(layout.metrics, &view);
     }
 
     renderer.draw_divider(&layout, hover == Some(Hit::Divider), dragging);
-    renderer.draw_status(&layout, &status_left, &status_right);
 
     if renderer.end().is_err() {
         // Device lost: drop everything and come back next frame.
         renderer.discard_target();
         invalidate(hwnd);
     }
+}
+
+/// The user's standard folders, for the sidebar's Places section.
+/// Entries whose folder does not exist are dropped rather than shown broken.
+fn default_places() -> Vec<Shortcut> {
+    let Ok(home) = std::env::var("USERPROFILE") else {
+        return Vec::new();
+    };
+    let mut out = vec![Shortcut {
+        label: "Home".to_string(),
+        path: home.clone(),
+    }];
+    for name in [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Pictures",
+        "Music",
+        "Videos",
+    ] {
+        let path = fs::path_join(&home, name);
+        if std::path::Path::new(&path).is_dir() {
+            out.push(Shortcut {
+                label: name.to_string(),
+                path,
+            });
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -845,8 +1240,16 @@ fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
     unsafe {
         let _ = SetFocus(Some(hwnd));
     }
+    // Any new action retires the previous one-shot message ("3 items copied"),
+    // which otherwise sat in the footer until some later operation finished.
+    state.status_override = None;
     let layout = state.layout();
     let hit = layout.hit_test(x, y);
+
+    // Clicking anything other than the filter box returns keystrokes to the list.
+    if !matches!(hit, Hit::Filter(_)) {
+        state.filter_focus = None;
+    }
 
     match hit {
         Hit::Divider => {
@@ -856,12 +1259,42 @@ fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             unsafe { SetCapture(hwnd) };
         }
 
-        Hit::Drive(i) => {
-            if let Some(d) = state.drives.get(i).cloned() {
-                let side = state.focused;
-                let req = state.pane_mut(side).navigate(&d.root);
-                spawn_dir_load(hwnd, side, req);
+        Hit::Sidebar(i) => {
+            let (_, actions) = state.sidebar_model();
+            match actions.get(i) {
+                Some(SidebarAction::ToggleSection(sec)) => {
+                    state.sections_collapsed[*sec] = !state.sections_collapsed[*sec];
+                }
+                Some(SidebarAction::Go(path)) => {
+                    let path = path.clone();
+                    let side = state.focused;
+                    let req = state.pane_mut(side).navigate(&path);
+                    spawn_dir_load(hwnd, side, req);
+                }
+                None => {}
             }
+        }
+
+        Hit::SidebarChevron(i) => {
+            let (_, actions) = state.sidebar_model();
+            if let Some(SidebarAction::ToggleSection(sec)) = actions.get(i) {
+                state.sections_collapsed[*sec] = !state.sections_collapsed[*sec];
+            }
+        }
+
+        Hit::Nav(side, which) => {
+            state.focused = side;
+            let req = match which {
+                NavButton::Back => state.pane_mut(side).go_back(),
+                NavButton::Forward => state.pane_mut(side).go_forward(),
+                NavButton::Up => state.pane_mut(side).navigate_up(),
+            };
+            start_load(hwnd, side, req);
+        }
+
+        Hit::Filter(side) => {
+            state.focused = side;
+            state.filter_focus = Some(side);
         }
 
         Hit::Tab(side, i) => {
@@ -1006,6 +1439,34 @@ fn activate_selection(state: &mut AppState, hwnd: HWND, side: Side) {
 // ---------------------------------------------------------------------------
 
 fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
+    // While the footer filter has focus it owns editing keys; everything else
+    // still falls through to the normal bindings.
+    if let Some(fside) = state.filter_focus {
+        match vk {
+            VK_BACK => {
+                state.pane_mut(fside).list_mut().pop_filter_char();
+                invalidate(hwnd);
+                return true;
+            }
+            VK_ESCAPE => {
+                state.pane_mut(fside).list_mut().clear_filter();
+                state.filter_focus = None;
+                invalidate(hwnd);
+                return true;
+            }
+            VK_RETURN | VK_DOWN | VK_UP => {
+                // Commit the filter and hand the arrows back to the list.
+                state.filter_focus = None;
+                invalidate(hwnd);
+                if vk == VK_RETURN {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    state.status_override = None;
     let side = state.focused;
     let list_h = state.list_height(side);
     let ctrl = ctrl_down();
@@ -1089,7 +1550,12 @@ fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
         VK_DELETE => do_delete(state, hwnd, shift),
 
         VK_ESCAPE => {
-            state.pane_mut(side).list_mut().clear_selection();
+            let list = state.pane_mut(side).list_mut();
+            if list.is_filtered() {
+                list.clear_filter();
+            } else {
+                list.clear_selection();
+            }
             state.type_ahead.clear();
         }
 
@@ -1113,10 +1579,16 @@ fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
                     start_load(hwnd, side, req);
                 }
                 (true, false, 'H') => toggle_hidden(state, hwnd),
+                (true, false, 'F') => {
+                    // Ctrl+F focuses the pane filter, as it does everywhere else.
+                    state.filter_focus = Some(side);
+                }
                 (true, false, 'B') => {
                     state.sidebar_visible = !state.sidebar_visible;
                     state.clamp_split();
                 }
+                (true, false, '1') => set_dual(state, false),
+                (true, false, '2') => set_dual(state, true),
                 (true, false, 'R') => {
                     let req = state.pane_mut(side).refresh();
                     start_load(hwnd, side, req);
@@ -1137,6 +1609,14 @@ fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
 }
 
 fn on_type_ahead(state: &mut AppState, hwnd: HWND, c: char) {
+    // With the filter focused, typing edits the filter rather than jumping the
+    // selection.
+    if let Some(fside) = state.filter_focus {
+        state.pane_mut(fside).list_mut().push_filter_char(c);
+        invalidate(hwnd);
+        return;
+    }
+
     let now = Instant::now();
     let expired = state
         .type_ahead_at
@@ -1170,12 +1650,43 @@ fn on_type_ahead(state: &mut AppState, hwnd: HWND, c: char) {
 
 fn toggle_hidden(state: &mut AppState, hwnd: HWND) {
     state.show_hidden = !state.show_hidden;
+    // FileList keeps the unfiltered entries, so this is instant: no reload.
     state.left.set_show_hidden(state.show_hidden);
     state.right.set_show_hidden(state.show_hidden);
-    for side in [Side::Left, Side::Right] {
-        let req = state.pane_mut(side).refresh();
-        start_load(hwnd, side, req);
+    invalidate(hwnd);
+}
+
+/// Show one pane or two. Collapsing while the right pane is focused swaps the
+/// panes first, so the folder you were looking at is the one that stays on screen.
+fn set_dual(state: &mut AppState, dual: bool) {
+    if state.dual == dual {
+        return;
     }
+    if !dual && state.focused == Side::Right {
+        std::mem::swap(&mut state.left, &mut state.right);
+    }
+    state.dual = dual;
+    state.focused = Side::Left;
+    state.clamp_split();
+}
+
+/// Keep the title bar showing the focused folder. Called from paint, which is
+/// the one place that always runs after anything that could change it.
+fn update_title(state: &mut AppState, hwnd: HWND) {
+    let path = state.focused_pane().current_path();
+    let title = if path.is_empty() {
+        "File Xplorer".to_string()
+    } else {
+        format!("{} - File Xplorer", fs::path_leaf(path))
+    };
+    if title == state.last_title {
+        return;
+    }
+    let w = wide(&title);
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR::from_raw(w.as_ptr()));
+    }
+    state.last_title = title;
 }
 
 fn toggle_theme(state: &mut AppState, hwnd: HWND) {
@@ -1229,6 +1740,10 @@ fn do_paste(state: &mut AppState, hwnd: HWND) {
 }
 
 fn copy_or_move_to_other(state: &mut AppState, hwnd: HWND, move_it: bool) {
+    if !state.dual {
+        state.status_override = Some("Press Ctrl+2 for a second pane".into());
+        return;
+    }
     let sources = state.focused_pane().selected_paths();
     if sources.is_empty() {
         return;
@@ -1375,6 +1890,7 @@ fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen_y: 
         sep();
         add(CMD_NEW_FOLDER, "New folder\tCtrl+Shift+N", true);
         add(CMD_REFRESH, "Refresh\tF5", true);
+        add(CMD_CALC_SIZES, "Calculate folder sizes", true);
         sep();
         add(CMD_PROPERTIES, "Properties", single);
 
@@ -1418,6 +1934,12 @@ fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
             let req = state.pane_mut(side).refresh();
             start_load(hwnd, side, req);
         }
+        CMD_CALC_SIZES => calculate_folder_sizes(state, hwnd),
+        CMD_SYNC_SCROLL => {
+            state.sync_scroll = !state.sync_scroll;
+            state.mirror_scroll(side);
+        }
+        CMD_COMPARE => state.compare = !state.compare,
         CMD_PROPERTIES => {
             let paths = state.pane(side).selected_paths();
             if let Some(p) = paths.first() {
