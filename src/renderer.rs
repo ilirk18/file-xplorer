@@ -32,7 +32,7 @@ use crate::file_list::{FileList, SortKey, SortOrder};
 use crate::fs::Drive;
 use crate::icons::{icon_key, icon_key_for_path, IconCache};
 use crate::layout::{
-    sidebar_text_offset, Hit, Layout, Metrics, NavButton, PaneLayout, Rect, SidebarEntry, Side,
+    sidebar_text_offset, Hit, Layout, Metrics, NavButton, PaneLayout, Rect, SidebarEntry, PaneId,
     TextMeasurer,
 };
 use crate::theme::{Palette, Rgb, Theme};
@@ -74,7 +74,7 @@ fn color(c: Rgb) -> D2D1_COLOR_F {
 
 /// Everything the renderer needs to paint one pane.
 pub struct PaneView<'a> {
-    pub side: Side,
+    pub pid: PaneId,
     pub layout: &'a PaneLayout,
     pub tab_labels: &'a [String],
     pub active_tab: usize,
@@ -311,7 +311,7 @@ impl Renderer {
         let (Some(rt), Some(brush)) = (self.rt(), self.brush.as_ref()) else {
             return;
         };
-        // Never round more than half the shorter side, or the shape inverts.
+        // Never round more than half the shorter pid, or the shape inverts.
         let radius = radius.min(r.w as f32 / 2.0).min(r.h as f32 / 2.0).max(0.0);
         let rr = D2D1_ROUNDED_RECT {
             rect: d2d_rect(r),
@@ -609,23 +609,19 @@ impl Renderer {
 
     // -- divider -----------------------------------------------------------
 
-    pub fn draw_divider(&mut self, layout: &Layout, hovered: bool, dragging: bool) {
+    /// `active` names the divider under the cursor or being dragged, if any.
+    pub fn draw_dividers(&mut self, layout: &Layout, active: Option<(usize, bool)>) {
         let p = self.palette();
-        self.fill(layout.divider, p.window_bg);
-        let c = if dragging {
-            p.accent
-        } else if hovered {
-            p.scrollbar_thumb_hover
-        } else {
-            p.divider
-        };
-        let mid = Rect::new(
-            layout.divider.x + layout.divider.w / 2,
-            layout.divider.y,
-            1.max(layout.divider.w / 6),
-            layout.divider.h,
-        );
-        self.fill(mid, c);
+        for (i, d) in layout.dividers.clone().iter().enumerate() {
+            self.fill(*d, p.window_bg);
+            let c = match active {
+                Some((n, true)) if n == i => p.accent,
+                Some((n, false)) if n == i => p.scrollbar_thumb_hover,
+                _ => p.divider,
+            };
+            let mid = Rect::new(d.x + d.w / 2, d.y, 1.max(d.w / 6), d.h);
+            self.fill(mid, c);
+        }
     }
 
     // -- pane --------------------------------------------------------------
@@ -663,7 +659,7 @@ impl Renderer {
 
         for (i, t) in v.layout.tabs.clone().iter().enumerate() {
             let active = i == v.active_tab;
-            let hovered = matches!(v.hover, Some(Hit::Tab(s, h)) | Some(Hit::TabClose(s, h)) if s == v.side && h == i);
+            let hovered = matches!(v.hover, Some(Hit::Tab(s, h)) | Some(Hit::TabClose(s, h)) if s == v.pid && h == i);
 
             if active {
                 self.fill(t.full, p.tab_active);
@@ -693,7 +689,7 @@ impl Renderer {
             self.text(&text, label, fg, &self.formats.small.clone());
 
             if !t.close.is_empty() {
-                let hovered_close = v.hover == Some(Hit::TabClose(v.side, i));
+                let hovered_close = v.hover == Some(Hit::TabClose(v.pid, i));
                 if hovered_close {
                     self.fill_rounded(t.close, m.radius, p.row_hover);
                 }
@@ -708,7 +704,7 @@ impl Renderer {
         }
 
         if !v.layout.new_tab.is_empty() {
-            let hovered = v.hover == Some(Hit::NewTab(v.side));
+            let hovered = v.hover == Some(Hit::NewTab(v.pid));
             if hovered {
                 self.fill_rounded(v.layout.new_tab.inset(3, 5), m.radius, p.tab_hover);
             }
@@ -732,7 +728,7 @@ impl Renderer {
             (v.layout.nav_up, NavButton::Up, glyph::UP, v.can_up),
         ];
         for (rect, which, g, enabled) in buttons {
-            let hovered = v.hover == Some(Hit::Nav(v.side, which));
+            let hovered = v.hover == Some(Hit::Nav(v.pid, which));
             if hovered && enabled {
                 self.fill_rounded(rect.inset(2, 4), m.radius, p.row_hover);
             }
@@ -753,7 +749,7 @@ impl Renderer {
         let crumbs = v.layout.crumbs.clone();
         let last = crumbs.len().saturating_sub(1);
         for (i, c) in crumbs.iter().enumerate() {
-            let hovered = v.hover == Some(Hit::Crumb(v.side, c.segment_index));
+            let hovered = v.hover == Some(Hit::Crumb(v.pid, c.segment_index));
             if hovered {
                 self.fill_rounded(c.rect.inset(0, 4), m.radius, p.row_hover);
             }
@@ -790,13 +786,14 @@ impl Renderer {
         self.fill(v.layout.header, p.header_bg);
 
         for c in v.layout.columns.clone() {
-            let hovered = v.hover == Some(Hit::Column(v.side, c.key));
+            let hovered = v.hover == Some(Hit::Column(v.pid, c.key));
             if hovered {
                 self.fill(c.rect, p.row_hover);
             }
             let sorted = v.list.sort_key == c.key;
             let title = match c.key {
                 SortKey::Name => "Name",
+                SortKey::Type => "Type",
                 SortKey::Size => "Size",
                 SortKey::Date => "Date modified",
             };
@@ -893,6 +890,7 @@ impl Renderer {
         // cells line up with their titles by construction.
         let cols = v.layout.columns.clone();
         let name_col = cols.iter().find(|c| c.key == SortKey::Name).map(|c| c.rect);
+        let type_col = cols.iter().find(|c| c.key == SortKey::Type).map(|c| c.rect);
         let size_col = cols.iter().find(|c| c.key == SortKey::Size).map(|c| c.rect);
         let date_col = cols.iter().find(|c| c.key == SortKey::Date).map(|c| c.rect);
 
@@ -907,7 +905,7 @@ impl Renderer {
             let r = Rect::new(list_rect.x, y, list_rect.w, row_h);
 
             let selected = v.list.is_selected(row);
-            let hovered = v.hover == Some(Hit::Row(v.side, row));
+            let hovered = v.hover == Some(Hit::Row(v.pid, row));
 
             if selected {
                 let c = if v.focused {
@@ -971,6 +969,15 @@ impl Renderer {
                 }
             }
 
+            if let Some(tc) = type_col {
+                let cell = Rect::new(tc.x + m.pad, y, tc.w - m.pad * 2, row_h);
+                self.text(
+                    &entry.type_display(),
+                    cell,
+                    muted,
+                    &self.formats.body.clone(),
+                );
+            }
             if let Some(sc) = size_col {
                 let cell = Rect::new(sc.x, y, sc.w - m.pad, row_h);
                 self.text(
@@ -1001,7 +1008,7 @@ impl Renderer {
         if v.layout.scrollbar.is_empty() || v.layout.thumb.is_empty() {
             return;
         }
-        let hovered = matches!(v.hover, Some(Hit::ScrollbarThumb(s)) if s == v.side);
+        let hovered = matches!(v.hover, Some(Hit::ScrollbarThumb(s)) if s == v.pid);
         let c = if hovered {
             p.scrollbar_thumb_hover
         } else {
@@ -1020,7 +1027,7 @@ impl Renderer {
         // Filter field.
         let f = v.layout.filter;
         if !f.is_empty() {
-            let hovered = v.hover == Some(Hit::Filter(v.side));
+            let hovered = v.hover == Some(Hit::Filter(v.pid));
             self.fill_rounded(f, m.radius, p.field_bg);
             if v.filter_focused {
                 self.stroke_rounded(f, m.radius, p.accent, 1.0);

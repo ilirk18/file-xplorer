@@ -10,15 +10,19 @@
 
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+use crate::layout::MAX_PANES;
+
+#[derive(Clone, PartialEq, Debug)]
 pub struct Config {
-    pub dual: bool,
+    /// Panes on screen, 1..=MAX_PANES.
+    pub pane_count: usize,
     pub theme_dark: bool,
     pub sidebar_visible: bool,
     pub show_hidden: bool,
-    /// Divider position in physical pixels. 0 means "never set, centre it".
-    /// Clamped on load anyway, so a value from a different monitor is harmless.
-    pub split_x: i32,
+    /// One fraction of the body width per divider. Fractions rather than
+    /// pixels so a window resize keeps the panes in proportion; an empty or
+    /// wrong-length list means "share the width evenly".
+    pub splits: Vec<f32>,
 
     /// Restored window box. `win_x == UNSET` means "let Windows place it".
     pub win_x: i32,
@@ -29,6 +33,12 @@ pub struct Config {
 
     pub sync_scroll: bool,
     pub compare: bool,
+
+    /// Open tabs per pane, and which of them was active. One entry per pane,
+    /// always `MAX_PANES` long; an empty list means "start at the working
+    /// directory".
+    pub tabs: Vec<Vec<String>>,
+    pub active_tab: Vec<usize>,
 }
 
 /// Sentinel for "no saved position". A real window can legitimately sit at a
@@ -38,11 +48,11 @@ pub const UNSET: i32 = i32::MIN;
 impl Default for Config {
     fn default() -> Self {
         Self {
-            dual: false,
+            pane_count: 1,
             theme_dark: true,
             sidebar_visible: true,
             show_hidden: false,
-            split_x: 0,
+            splits: Vec::new(),
             win_x: UNSET,
             win_y: UNSET,
             win_w: 1200,
@@ -50,8 +60,40 @@ impl Default for Config {
             maximized: false,
             sync_scroll: false,
             compare: false,
+            tabs: vec![Vec::new(); MAX_PANES],
+            active_tab: vec![0; MAX_PANES],
         }
     }
+}
+
+/// Fractions as plain text: "0.33,0.66". Anything unparseable yields an empty
+/// list, which the layout reads as "share the width evenly".
+fn join_splits(splits: &[f32]) -> String {
+    splits
+        .iter()
+        .map(|f| format!("{:.4}", f))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_splits(value: &str) -> Vec<f32> {
+    if value.trim().is_empty() {
+        return Vec::new();
+    }
+    let parsed: Option<Vec<f32>> = value.split(',').map(|p| p.trim().parse().ok()).collect();
+    // A fraction outside 0..1 would put a divider off screen; drop the lot and
+    // let the layout even things out rather than restoring something unusable.
+    match parsed {
+        Some(v) if v.iter().all(|f| (0.0..=1.0).contains(f)) => v,
+        _ => Vec::new(),
+    }
+}
+
+/// `tab2` -> Some(2), for a key in range. Anything else is an unknown key and
+/// is ignored, which is what lets an older build read a newer file.
+fn pane_index(key: &str, prefix: &str) -> Option<usize> {
+    let i: usize = key.strip_prefix(prefix)?.parse().ok()?;
+    (i < MAX_PANES).then_some(i)
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -79,31 +121,50 @@ impl Config {
     pub fn to_text(&self) -> String {
         format!(
             "# File Xplorer settings\n\
-             dual={}\n\
+             pane_count={}\n\
              theme_dark={}\n\
              sidebar_visible={}\n\
              show_hidden={}\n\
-             split_x={}\n\
+             splits={}\n\
              win_x={}\n\
              win_y={}\n\
              win_w={}\n\
              win_h={}\n\
              maximized={}\n\
              sync_scroll={}\n\
-             compare={}\n",
-            self.dual,
+             compare={}\n{}",
+            self.pane_count,
             self.theme_dark,
             self.sidebar_visible,
             self.show_hidden,
-            self.split_x,
+            join_splits(&self.splits),
             self.win_x,
             self.win_y,
             self.win_w,
             self.win_h,
             self.maximized,
             self.sync_scroll,
-            self.compare
+            self.compare,
+            self.session_text()
         )
+    }
+
+    /// One `tab<n>=` line per open tab, in order, plus the active index.
+    /// Repeated keys rather than a delimiter, because a path can contain very
+    /// nearly any character and inventing an escape would be the third format
+    /// in this file.
+    fn session_text(&self) -> String {
+        let mut out = String::new();
+        for (i, paths) in self.tabs.iter().enumerate() {
+            if paths.is_empty() {
+                continue;
+            }
+            for p in paths {
+                out.push_str(&format!("tab{}={}\n", i, p));
+            }
+            out.push_str(&format!("active{}={}\n", i, self.active_tab[i]));
+        }
+        out
     }
 
     pub fn from_text(text: &str) -> Self {
@@ -120,13 +181,19 @@ impl Config {
             // A bad value keeps the default; an unknown key is ignored, so an
             // older build can read a newer file.
             match key.trim() {
-                "dual" => c.dual = value.parse().unwrap_or(c.dual),
+                "pane_count" => c.pane_count = value.parse().unwrap_or(c.pane_count),
+                // Files written before multi-pane only knew one flag.
+                "dual" => {
+                    if value.parse().unwrap_or(false) {
+                        c.pane_count = 2;
+                    }
+                }
                 "theme_dark" => c.theme_dark = value.parse().unwrap_or(c.theme_dark),
                 "sidebar_visible" => {
                     c.sidebar_visible = value.parse().unwrap_or(c.sidebar_visible)
                 }
                 "show_hidden" => c.show_hidden = value.parse().unwrap_or(c.show_hidden),
-                "split_x" => c.split_x = value.parse().unwrap_or(c.split_x),
+                "splits" => c.splits = parse_splits(value),
                 "win_x" => c.win_x = value.parse().unwrap_or(c.win_x),
                 "win_y" => c.win_y = value.parse().unwrap_or(c.win_y),
                 "win_w" => c.win_w = value.parse().unwrap_or(c.win_w),
@@ -134,7 +201,15 @@ impl Config {
                 "maximized" => c.maximized = value.parse().unwrap_or(c.maximized),
                 "sync_scroll" => c.sync_scroll = value.parse().unwrap_or(c.sync_scroll),
                 "compare" => c.compare = value.parse().unwrap_or(c.compare),
-                _ => {}
+                k => {
+                    if let Some(i) = pane_index(k, "tab") {
+                        if !value.is_empty() {
+                            c.tabs[i].push(value.to_string());
+                        }
+                    } else if let Some(i) = pane_index(k, "active") {
+                        c.active_tab[i] = value.parse().unwrap_or(0);
+                    }
+                }
             }
         }
         c
@@ -148,11 +223,11 @@ mod tests {
     #[test]
     fn round_trips() {
         let c = Config {
-            dual: true,
+            pane_count: 3,
             theme_dark: false,
             sidebar_visible: false,
             show_hidden: true,
-            split_x: 812,
+            splits: vec![0.25, 0.75],
             win_x: -1400,
             win_y: 20,
             win_w: 900,
@@ -160,6 +235,13 @@ mod tests {
             maximized: true,
             sync_scroll: true,
             compare: true,
+            tabs: vec![
+                vec!["C:\\a".into(), "C:\\b c\\d=e".into()],
+                Vec::new(),
+                vec!["D:\\x".into()],
+                Vec::new(),
+            ],
+            active_tab: vec![1, 0, 0, 0],
         };
         assert_eq!(Config::from_text(&c.to_text()), c);
     }
@@ -171,7 +253,7 @@ mod tests {
 
     #[test]
     fn garbage_keeps_defaults_rather_than_failing() {
-        let c = Config::from_text("dual=yes please\nsplit_x=abc\nnonsense\n=\n");
+        let c = Config::from_text("pane_count=lots\nsplits=abc\nnonsense\n=\n");
         assert_eq!(c, Config::default());
     }
 
@@ -185,8 +267,35 @@ mod tests {
     #[test]
     fn unknown_keys_are_ignored() {
         // An older build must survive a file written by a newer one.
-        let c = Config::from_text("dual=true\nfuture_option=42\n");
-        assert!(c.dual);
+        let c = Config::from_text("pane_count=2\nfuture_option=42\n");
+        assert_eq!(c.pane_count, 2);
+    }
+
+    #[test]
+    fn a_split_outside_the_window_is_rejected_whole() {
+        // 1.4 would put a divider past the right edge; the pair goes with it.
+        assert!(Config::from_text("splits=0.5,1.4\n").splits.is_empty());
+        assert_eq!(Config::from_text("splits=0.5\n").splits, vec![0.5]);
+    }
+
+    #[test]
+    fn the_old_dual_flag_still_opens_two_panes() {
+        assert_eq!(Config::from_text("dual=true\n").pane_count, 2);
+        assert_eq!(Config::from_text("dual=false\n").pane_count, 1);
+    }
+
+    #[test]
+    fn a_session_with_no_tabs_writes_nothing_for_it() {
+        let c = Config::default();
+        assert!(!c.to_text().contains("tab0="));
+        assert_eq!(Config::from_text(&c.to_text()).tabs, c.tabs);
+    }
+
+    #[test]
+    fn a_tab_line_for_a_pane_that_does_not_exist_is_ignored() {
+        // MAX_PANES could shrink; a stale file must not index out of range.
+        let c = Config::from_text("tab9=C:\\nope\ntab0=C:\\yes\n");
+        assert_eq!(c.tabs[0], vec!["C:\\yes".to_string()]);
     }
 
     #[test]

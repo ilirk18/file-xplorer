@@ -298,6 +298,42 @@ impl Pane {
         self.navigate(path)
     }
 
+    /// Rebuild the tab strip from a saved session.
+    ///
+    /// Only the active tab is loaded. The others get their path and history
+    /// but no listing, so `switch_tab` reads them the first time they are
+    /// shown — restoring twenty tabs must not mean twenty directory reads at
+    /// startup.
+    pub fn restore(&mut self, paths: &[String], active: usize) -> Option<LoadRequest> {
+        if paths.is_empty() {
+            return None;
+        }
+        self.tabs.clear();
+        for path in paths {
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            let mut tab = Tab::new(id);
+            tab.file_list.row_height = self.row_height;
+            tab.file_list.set_show_hidden(self.show_hidden);
+            tab.path = path.clone();
+            tab.history.push(path.clone());
+            tab.history_pos = 0;
+            self.tabs.push(tab);
+        }
+        self.active_tab_index = active.min(self.tabs.len() - 1);
+        let path = self.current_path().to_string();
+        Some(self.begin_load(path, LoadKind::Navigate, None))
+    }
+
+    /// The paths of every open tab, for saving the session.
+    pub fn tab_paths(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .map(|t| t.path.clone())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
     /// Duplicate the active tab, which is what Ctrl+T should do from a folder.
     pub fn duplicate_tab(&mut self) -> LoadRequest {
         let path = self.current_path().to_string();
@@ -524,6 +560,34 @@ mod tests {
         // Switching back must not need a reload.
         assert!(pane.switch_tab(0).is_none());
         assert_eq!(pane.list().entries.len(), 2);
+    }
+
+    #[test]
+    fn a_restored_session_loads_only_the_active_tab() {
+        let mut pane = Pane::new();
+        let req = pane
+            .restore(&["C:\\a".into(), "C:\\b".into(), "C:\\c".into()], 1)
+            .expect("three tabs is a session");
+        assert_eq!(pane.tabs.len(), 3);
+        assert_eq!(req.path, "C:\\b", "the active tab is the one that loads");
+        assert_eq!(pane.tab_paths(), vec!["C:\\a", "C:\\b", "C:\\c"]);
+        // The rest keep their path but no listing, so they read on first show.
+        assert!(pane.switch_tab(2).is_some());
+    }
+
+    #[test]
+    fn a_restored_active_index_past_the_end_lands_on_the_last_tab() {
+        let mut pane = Pane::new();
+        let req = pane.restore(&["C:\\a".into()], 7).unwrap();
+        assert_eq!(req.path, "C:\\a");
+        assert_eq!(pane.active_tab_index, 0);
+    }
+
+    #[test]
+    fn an_empty_session_leaves_the_pane_alone() {
+        let mut pane = Pane::new();
+        assert!(pane.restore(&[], 0).is_none());
+        assert_eq!(pane.tabs.len(), 1);
     }
 
     #[test]
