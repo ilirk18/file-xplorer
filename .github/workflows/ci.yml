@@ -46,10 +46,10 @@ jobs:
 
       - name: Size
         run: |
-          $exe = Get-Item target\release\file-xplorer.exe
+          $exe = Get-Item target\release\jamb.exe
           "{0:N0} bytes ({1:N2} MB)" -f $exe.Length, ($exe.Length / 1MB)
 
       - uses: actions/upload-artifact@v4
         with:
-          name: file-xplorer
-          path: target/release/file-xplorer.exe
+          name: jamb
+          path: target/release/jamb.exe

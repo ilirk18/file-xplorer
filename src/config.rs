@@ -23,6 +23,51 @@ pub fn push_recent(history: &mut Vec<String>, path: &str) {
     history.truncate(MAX_RECENT);
 }
 
+/// A pinned place: a path, and optionally an icon to draw beside it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Pin {
+    pub path: String,
+    /// `file,index` naming an icon resource — `shell32.dll,4` — which is how
+    /// Windows itself has always described one. None means the location's own.
+    pub icon: Option<String>,
+}
+
+impl Pin {
+    /// `shell32.dll,4|C:\work`, or a bare path.
+    ///
+    /// `|` separates them because Windows forbids it in a path, so there is
+    /// nothing to escape and no `pin=` line written before today can be
+    /// misread as carrying one.
+    pub fn parse(text: &str) -> Pin {
+        match text.split_once('|') {
+            Some((icon, path)) if !icon.trim().is_empty() && !path.trim().is_empty() => Pin {
+                path: path.trim().to_string(),
+                icon: Some(icon.trim().to_string()),
+            },
+            _ => Pin {
+                path: text.trim().to_string(),
+                icon: None,
+            },
+        }
+    }
+
+    /// What goes back in the file. The inverse of `parse`.
+    pub fn text(&self) -> String {
+        match &self.icon {
+            Some(icon) => format!("{}|{}", icon, self.path),
+            None => self.path.clone(),
+        }
+    }
+
+    /// Which icon the sidebar draws: this pin's own, or the location's.
+    pub fn icon_key(&self) -> String {
+        match &self.icon {
+            Some(icon) => crate::icons::custom_icon_key(icon),
+            None => crate::icons::icon_key_for_path(&self.path),
+        }
+    }
+}
+
 /// How many folders keep their own sort and view. Only a deliberate change
 /// writes one, so this is a few years of them.
 pub const MAX_FOLDER_VIEWS: usize = 200;
@@ -53,7 +98,9 @@ pub struct Config {
     pub folder_sizes: bool,
     pub sidebar_visible: bool,
     pub inspector: bool,
-    pub command_bar: bool,
+    /// Dragged widths of the two side panels, in DIPs. 0 means "as measured".
+    pub sidebar_w: i32,
+    pub inspector_w: i32,
     /// Icon edge in DIPs, or 0 for the details list.
     pub icons: i32,
     pub show_hidden: bool,
@@ -74,7 +121,7 @@ pub struct Config {
     pub active_tab: Vec<usize>,
 
     /// Folders pinned into the sidebar's Places, in the order they were added.
-    pub pins: Vec<String>,
+    pub pins: Vec<Pin>,
     /// Shell context-menu verbs hoisted to the top of the menu, by the text
     /// the menu showed. Matching on text is approximate once the machine
     /// changes language, which is honest for a convenience feature.
@@ -116,7 +163,8 @@ impl Default for Config {
             folder_sizes: false,
             sidebar_visible: true,
             inspector: false,
-            command_bar: true,
+            sidebar_w: 0,
+            inspector_w: 0,
             icons: 0,
             show_hidden: false,
             win_x: UNSET,
@@ -158,14 +206,28 @@ fn pane_index(key: &str, prefix: &str) -> Option<usize> {
 }
 
 fn config_path() -> Option<PathBuf> {
+    settings_under("Jamb")
+}
+
+/// Where the settings lived when the app was called File Xplorer.
+///
+/// Read, never written. Someone who upgrades keeps their tabs and their theme;
+/// the first save after that lands in the new place and the old file is simply
+/// left behind.
+fn legacy_config_path() -> Option<PathBuf> {
+    settings_under("FileXplorer")
+}
+
+fn settings_under(folder: &str) -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(appdata).join("FileXplorer").join("settings.txt"))
+    Some(PathBuf::from(appdata).join(folder).join("settings.txt"))
 }
 
 impl Config {
     pub fn load() -> Self {
         config_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
+            .or_else(|| legacy_config_path().and_then(|p| std::fs::read_to_string(p).ok()))
             .map(|s| Self::from_text(&s))
             .unwrap_or_default()
     }
@@ -181,7 +243,7 @@ impl Config {
 
     pub fn to_text(&self) -> String {
         format!(
-            "# File Xplorer settings\n\
+            "# Jamb settings\n\
              layout={}\n\
              theme={}\n\
              font={}\n\
@@ -190,7 +252,8 @@ impl Config {
              folder_sizes={}\n\
              sidebar_visible={}\n\
              inspector={}\n\
-             command_bar={}\n\
+             sidebar_w={}\n\
+             inspector_w={}\n\
              icons={}\n\
              show_hidden={}\n\
              win_x={}\n\
@@ -209,7 +272,8 @@ impl Config {
             self.folder_sizes,
             self.sidebar_visible,
             self.inspector,
-            self.command_bar,
+            self.sidebar_w,
+            self.inspector_w,
             self.icons,
             self.show_hidden,
             self.win_x,
@@ -233,7 +297,7 @@ impl Config {
     fn session_text(&self) -> String {
         let mut out = String::new();
         for p in &self.pins {
-            out.push_str(&format!("pin={}\n", p));
+            out.push_str(&format!("pin={}\n", p.text()));
         }
         for a in &self.pin_actions {
             out.push_str(&format!("pinaction={}\n", a));
@@ -330,7 +394,8 @@ impl Config {
                     c.sidebar_visible = value.parse().unwrap_or(c.sidebar_visible)
                 }
                 "inspector" => c.inspector = value.parse().unwrap_or(c.inspector),
-                "command_bar" => c.command_bar = value.parse().unwrap_or(c.command_bar),
+                "sidebar_w" => c.sidebar_w = value.parse().unwrap_or(c.sidebar_w),
+                "inspector_w" => c.inspector_w = value.parse().unwrap_or(c.inspector_w),
                 "icons" => c.icons = value.parse().unwrap_or(c.icons),
                 // What the icon view used to be called, when it was on or off
                 // rather than a size. Read so an older settings file still
@@ -349,8 +414,9 @@ impl Config {
                 "sync_scroll" => c.sync_scroll = value.parse().unwrap_or(c.sync_scroll),
                 "compare" => c.compare = value.parse().unwrap_or(c.compare),
                 "pin" => {
-                    if !value.is_empty() {
-                        c.pins.push(value.to_string());
+                    let pin = Pin::parse(value);
+                    if !pin.path.is_empty() {
+                        c.pins.push(pin);
                     }
                 }
                 "pinaction" => {
@@ -517,6 +583,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pin_carries_an_optional_icon_and_survives_the_round_trip() {
+        // A bare path is what every pin written before today looks like, and
+        // it has to keep meaning exactly itself.
+        let plain = Pin::parse(r"C:\work");
+        assert_eq!(plain.path, r"C:\work");
+        assert_eq!(plain.icon, None);
+
+        let fancy = Pin::parse(r"shell32.dll,4|\nas\media");
+        assert_eq!(fancy.path, r"\nas\media");
+        assert_eq!(fancy.icon.as_deref(), Some("shell32.dll,4"));
+
+        // Half a spec is not a spec: an empty side leaves the whole string as
+        // the path rather than inventing an icon or losing the text.
+        assert_eq!(Pin::parse("|").path, "|");
+        assert_eq!(Pin::parse(r"|C:\x").icon, None);
+
+        for pin in [plain, fancy] {
+            assert_eq!(Pin::parse(&pin.text()), pin, "{}", pin.text());
+        }
+    }
+
+    #[test]
+    fn pins_come_back_out_of_the_settings_file_as_they_went_in() {
+        let mut c = Config::default();
+        c.pins = vec![Pin::parse(r"C:\work"), Pin::parse(r"imageres.dll,3|D:\media")];
+        let back = Config::from_text(&c.session_text());
+        assert_eq!(back.pins, c.pins);
+    }
+
+    #[test]
     fn a_folder_view_is_lowercased_and_a_malformed_one_is_dropped() {
         let c = Config::from_text(
             "folderview=C:\\Users=2,false,-72\nfolderview=C:\\bad=2,false\nfolderview=C:\\x=zz,true,0\n",
@@ -617,7 +713,8 @@ mod tests {
             folder_sizes: true,
             sidebar_visible: false,
             inspector: true,
-            command_bar: false,
+            sidebar_w: 0,
+            inspector_w: 0,
             icons: 96,
             show_hidden: true,
             win_x: -1400,
@@ -636,7 +733,7 @@ mod tests {
             active_tab: vec![1, 0, 0, 0],
             folder_views: vec![("c:\\users\\foo".into(), 2, false, -72)],
             saved_layouts: vec![("Two up".into(), "V(0,0.500,1)".into())],
-            pins: vec!["C:\\pinned".into()],
+            pins: vec![Pin::parse("C:\\pinned")],
             // A label with a space and an ampersand: menu text has both.
             pin_actions: vec!["Open with".into(), "Scan && clean".into()],
             recent: vec![r"C:\Users".into(), r"D:\work".into()],

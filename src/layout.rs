@@ -132,10 +132,9 @@ pub struct Metrics {
     pub new_tab_w: i32,
 
     pub toolbar_h: i32,
-    /// The command bar across the top of the window.
-    pub bar_h: i32,
-    pub bar_btn_w: i32,
-    pub bar_gap: i32,
+    /// One of the three window buttons at the right end of the caption. The
+    /// size Windows draws its own at, so the target is where the hand expects.
+    pub win_btn_w: i32,
     pub nav_btn_w: i32,
     pub header_h: i32,
     pub footer_h: i32,
@@ -204,16 +203,14 @@ impl Metrics {
         Self {
             scale,
 
-            tab_bar_h: s(30.0),
+            tab_bar_h: s(29.0),
             tab_min_w: s(96.0),
             tab_max_w: s(190.0),
             tab_close_w: f(18.0),
             new_tab_w: f(26.0),
 
-            toolbar_h: s(30.0),
-            bar_h: s(38.0),
-            bar_btn_w: f(34.0),
-            bar_gap: g(3.0),
+            toolbar_h: s(29.0),
+            win_btn_w: f(46.0),
             nav_btn_w: f(26.0),
             header_h: s(24.0),
             footer_h: s(24.0),
@@ -332,13 +329,9 @@ impl Node {
     }
 
     /// Replace the leaf for `id` with a split holding it and `with`.
-    /// `vertical` puts the new pane to the right, otherwise underneath.
-    pub fn split(&mut self, id: PaneId, with: PaneId, vertical: bool) -> bool {
-        self.split_at(id, with, vertical, false)
-    }
-
-    /// Split `id` in two and put `with` in the new half. `before` puts it on
-    /// the left, or on top: which side a dropped tab landed on.
+    /// `vertical` puts the new pane to the right, otherwise underneath;
+    /// `before` puts it on the left, or on top: which side a dropped tab
+    /// landed on.
     pub fn split_at(&mut self, id: PaneId, with: PaneId, vertical: bool, before: bool) -> bool {
         match self {
             Node::Leaf(mine) if *mine == id => {
@@ -492,6 +485,12 @@ pub enum NavButton {
     Back,
     Forward,
     Up,
+    /// The user's own folder. One click for the place every other one hangs
+    /// off, which the sidebar has but a hidden sidebar does not.
+    Home,
+    /// Pin or unpin the folder showing. A toggle, so it also says whether
+    /// this folder is already pinned.
+    Pin,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -556,6 +555,10 @@ pub struct PaneLayout {
     pub nav_back: Rect,
     pub nav_forward: Rect,
     pub nav_up: Rect,
+    pub nav_home: Rect,
+    pub nav_pin: Rect,
+    /// The menu button at the right end of the breadcrumb row.
+    pub overflow: Rect,
     pub breadcrumb: Rect,
     pub crumbs: Vec<CrumbRect>,
 
@@ -755,11 +758,22 @@ pub struct Layout {
     /// taken off the body before the panes are laid out, so nothing else has
     /// to know it exists.
     pub inspector: Rect,
-    /// The command bar, or empty when hidden.
-    pub bar: Rect,
-    /// One rectangle per item the caller passed, in the same order. An item
-    /// that did not fit gets an empty one and is neither drawn nor clickable.
-    pub bar_items: Vec<Rect>,
+    /// The strip across the top of the window that used to be the system
+    /// caption. The panes on the top row put their tab bars in it, which is
+    /// what makes the chrome two rows instead of four.
+    pub caption: Rect,
+    /// The app icon at the caption's left end. Not a button: it is there to
+    /// say which window this is, and to be dragged by.
+    pub caption_logo: Rect,
+    /// The sidebar toggle, beside the logo.
+    pub caption_sidebar: Rect,
+    pub win_min: Rect,
+    pub win_max: Rect,
+    pub win_close: Rect,
+    /// Grab strips on the sidebar's right edge and the inspector's left one.
+    /// Empty when that panel is hidden; there is no edge to pull then.
+    pub sidebar_edge: Rect,
+    pub inspector_edge: Rect,
     /// Indexed by `PaneId`, always `MAX_PANES` long. A pane not in the tree
               /// gets an empty layout, which draws nothing and hit-tests to nothing.
     pub panes: Vec<PaneLayout>,
@@ -796,8 +810,16 @@ pub enum Hit {
     /// Click on the track above or below the thumb; the f32 is 0..1 along the track.
     ScrollbarTrack(PaneId, f32),
     Filter(PaneId),
-    /// Index into the command-bar items the caller supplied.
-    Bar(usize),
+    /// The sidebar toggle in the caption.
+    SidebarToggle,
+    /// The draggable edge of the sidebar (true) or the inspector (false).
+    PanelEdge { sidebar: bool },
+    /// Anywhere in the inspector panel. It has nothing to click, but a
+    /// right-click there is a question about whatever it is describing.
+    Inspector,
+    /// The menu at the right end of a pane's breadcrumb row: everything the
+    /// command bar used to hold, for the pane it sits on.
+    Overflow(PaneId),
 }
 
 /// Where a dragged tab would land if it were dropped now.
@@ -911,22 +933,10 @@ impl Metrics {
 /// that a folder of them still fits on a screen.
 pub const DEFAULT_ICONS: i32 = 72;
 
-/// One command-bar button, as far as the layout is concerned.
-///
-/// The same bargain as `SidebarEntry`: the caller decides what a button means
-/// and the layout only decides where it goes, so adding a button needs no
-/// change here.
-pub struct BarItemInput<'a> {
-    /// Text beside the glyph. Empty for an icon-only button.
-    pub label: &'a str,
-    /// Drawn with a chevron, because it opens a menu rather than acting.
-    pub menu: bool,
-    /// Sits at the right-hand end instead of flowing from the left.
-    pub right: bool,
-}
-
 pub struct PaneInput<'a> {
     pub tab_labels: &'a [String],
+    /// Which tab is showing. The strip scrolls to keep it on screen.
+    pub active_tab: usize,
     pub crumbs: &'a [String],
     /// Lines of cells, not entries: in the icon view one line holds several.
     /// It is what the scrollbar measures against.
@@ -950,31 +960,57 @@ impl Layout {
         // How far the sidebar is scrolled, in pixels.
         sidebar_scroll: i32,
         inspector_visible: bool,
-        bar_items: &[BarItemInput],
         panes: &[PaneInput],
         measurer: &dyn TextMeasurer,
     ) -> Layout {
         let m = metrics;
-        // The command bar spans the window above everything else, including the
-        // sidebar: it acts on the focused pane, and one per pane would cost
-        // four bars' worth of height to say the same thing.
-        let (bar, body) = if bar_items.is_empty() {
-            (Rect::default(), client)
-        } else {
-            client.split_top(m.bar_h)
-        };
-        let bar_rects = bar_rects(bar, m, bar_items, measurer);
+        // The caption is not split off the top: the panes run up into it, and
+        // a pane whose bounds start at the window's top edge puts its tab bar
+        // there by itself. All this strip does is reserve the two ends — the
+        // logo and toggle on the left, the window buttons on the right — and
+        // give the painter and the caption drag something to ask about.
+        let (caption, _) = client.split_top(m.tab_bar_h);
+        let (caption_logo, r) = caption.split_left(m.nav_btn_w + m.pad);
+        let (caption_sidebar, _) = r.split_left(m.nav_btn_w);
+        let buttons_w = m.win_btn_w * 3;
+        let win_min = Rect::new(caption.right() - buttons_w, caption.y, m.win_btn_w, caption.h);
+        let win_max = Rect::new(win_min.right(), caption.y, m.win_btn_w, caption.h);
+        let win_close = Rect::new(win_max.right(), caption.y, m.win_btn_w, caption.h);
 
+        // The sidebar and the inspector start below the caption; the body does
+        // not, because that is where the tabs go.
         let (sidebar, body) = if sidebar_visible {
-            body.split_left(m.sidebar_w)
+            let (s, b) = client.split_left(m.sidebar_w);
+            (s.split_top(m.tab_bar_h).1, b)
         } else {
-            (Rect::default(), body)
+            (Rect::default(), client)
         };
         let (body, inspector) = if inspector_visible {
-            body.split_right(m.inspector_w)
+            let (b, i) = body.split_right(m.inspector_w);
+            (b, i.split_top(m.tab_bar_h).1)
         } else {
             (body, Rect::default())
         };
+        // How far a top-row pane's tab strip must keep clear of each end. When
+        // the sidebar or the inspector is showing it is already clear of them,
+        // and the subtraction goes negative — which is the same answer.
+        let tab_inset = (
+            (caption_sidebar.right() - body.x).max(0),
+            (body.right() - win_min.x).max(0),
+        );
+
+        // The grab strip lies inside the panel rather than across the line:
+        // straddling it would put three pixels of a resize handle over the
+        // first pane's Back button, which is a control you aim at.
+        let edge_of = |r: Rect, right_side: bool| {
+            if r.is_empty() || r.w < m.divider_w {
+                return Rect::default();
+            }
+            let x = if right_side { r.right() - m.divider_w } else { r.x };
+            Rect::new(x, r.y, m.divider_w, r.h)
+        };
+        let sidebar_edge = edge_of(sidebar, true);
+        let inspector_edge = edge_of(inspector, false);
 
         let sidebar_rows = sidebar_rows(sidebar, m, sidebar_entries, sidebar_scroll);
         let (placed, dividers) = tree.place(body, m);
@@ -984,16 +1020,25 @@ impl Layout {
             sidebar,
             sidebar_rows,
             inspector,
-            bar,
-            bar_items: bar_rects,
+            caption,
+            caption_logo,
+            caption_sidebar,
+            win_min,
+            win_max,
+            win_close,
+            sidebar_edge,
+            inspector_edge,
             // Indexed by id, not by position: with a tree the two are no
             // longer the same thing. The caller's inputs arrive in leaf order,
             // which is the order `place` produced them in.
             panes: {
                 let mut out = vec![PaneLayout::default(); MAX_PANES];
                 for ((id, rect), input) in placed.iter().zip(panes) {
+                    // Only the row of panes that reaches the top edge shares
+                    // the caption, so only it has ends to keep clear of.
+                    let inset = if rect.y <= client.y { tab_inset } else { (0, 0) };
                     if let Some(slot) = out.get_mut(id.0) {
-                        *slot = pane_layout(*rect, m, input, measurer);
+                        *slot = pane_layout(*rect, m, input, inset, measurer);
                     }
                 }
                 out
@@ -1045,13 +1090,15 @@ impl Layout {
     }
 
     pub fn hit_test(&self, x: i32, y: i32) -> Hit {
-        for (i, r) in self.bar_items.iter().enumerate() {
-            if r.contains(x, y) {
-                return Hit::Bar(i);
-            }
+        if self.caption_sidebar.contains(x, y) {
+            return Hit::SidebarToggle;
         }
-        if self.bar.contains(x, y) {
-            return Hit::Nothing;
+        // Before the panels themselves, or the edge would be a sidebar row.
+        if self.sidebar_edge.contains(x, y) {
+            return Hit::PanelEdge { sidebar: true };
+        }
+        if self.inspector_edge.contains(x, y) {
+            return Hit::PanelEdge { sidebar: false };
         }
         for (i, d) in self.dividers.iter().enumerate() {
             if d.rect.contains(x, y) {
@@ -1073,6 +1120,9 @@ impl Layout {
             if let Some(h) = hit_pane(p, PaneId(i), x, y) {
                 return h;
             }
+        }
+        if self.inspector.contains(x, y) {
+            return Hit::Inspector;
         }
         Hit::Nothing
     }
@@ -1154,6 +1204,9 @@ fn hit_pane(p: &PaneLayout, pid: PaneId, x: i32, y: i32) -> Option<Hit> {
         return Some(Hit::Nothing);
     }
     if p.toolbar.contains(x, y) {
+        if p.overflow.contains(x, y) {
+            return Some(Hit::Overflow(pid));
+        }
         if p.nav_back.contains(x, y) {
             return Some(Hit::Nav(pid, NavButton::Back));
         }
@@ -1162,6 +1215,12 @@ fn hit_pane(p: &PaneLayout, pid: PaneId, x: i32, y: i32) -> Option<Hit> {
         }
         if p.nav_up.contains(x, y) {
             return Some(Hit::Nav(pid, NavButton::Up));
+        }
+        if p.nav_home.contains(x, y) {
+            return Some(Hit::Nav(pid, NavButton::Home));
+        }
+        if p.nav_pin.contains(x, y) {
+            return Some(Hit::Nav(pid, NavButton::Pin));
         }
         for c in &p.crumbs {
             if c.rect.contains(x, y) {
@@ -1226,52 +1285,6 @@ pub fn tree_indent(m: Metrics, depth: usize) -> i32 {
 /// as wide as their text needs, and the right-aligned ones packed from the far
 /// end. Anything that does not fit gets an empty rectangle rather than
 /// overlapping its neighbour.
-fn bar_rects(
-    bar: Rect,
-    m: Metrics,
-    items: &[BarItemInput],
-    measurer: &dyn TextMeasurer,
-) -> Vec<Rect> {
-    let mut out = vec![Rect::default(); items.len()];
-    if bar.is_empty() {
-        return out;
-    }
-    let width_of = |it: &BarItemInput| {
-        if it.label.is_empty() {
-            m.bar_btn_w
-        } else {
-            // Glyph, the label, and room for the chevron when there is one.
-            m.bar_btn_w
-                + measurer.measure(it.label, true).ceil() as i32
-                + if it.menu { m.pad * 2 } else { m.pad }
-        }
-    };
-
-    let y = bar.y + m.bar_gap;
-    let h = (bar.h - m.bar_gap * 2).max(0);
-    let mut right_edge = bar.right() - m.bar_gap;
-    for (i, it) in items.iter().enumerate().rev().filter(|(_, it)| it.right) {
-        let w = width_of(it);
-        if right_edge - w < bar.x {
-            break;
-        }
-        right_edge -= w;
-        out[i] = Rect::new(right_edge, y, w, h);
-        right_edge -= m.bar_gap;
-    }
-
-    let mut x = bar.x + m.bar_gap;
-    for (i, it) in items.iter().enumerate().filter(|(_, it)| !it.right) {
-        let w = width_of(it);
-        if x + w > right_edge {
-            break; // Out of room: the overflow button is where the rest live.
-        }
-        out[i] = Rect::new(x, y, w, h);
-        x += w + m.bar_gap;
-    }
-    out
-}
-
 /// Total height every sidebar entry would need, unscrolled. The caller clamps
 /// its scroll against this.
 pub fn sidebar_content_h(m: Metrics, entries: &[SidebarEntry]) -> i32 {
@@ -1355,6 +1368,9 @@ fn pane_layout(
     bounds: Rect,
     m: Metrics,
     input: &PaneInput,
+    // Pixels the tab strip keeps clear at each end, for a pane sharing the
+    // caption row with the window's own furniture.
+    tab_inset: (i32, i32),
     measurer: &dyn TextMeasurer,
 ) -> PaneLayout {
     if bounds.w <= 0 || bounds.h <= 0 {
@@ -1364,7 +1380,13 @@ fn pane_layout(
         };
     }
 
-    let (tab_bar, rest) = bounds.split_top(m.tab_bar_h);
+    let (strip, rest) = bounds.split_top(m.tab_bar_h);
+    let tab_bar = Rect::new(
+        strip.x + tab_inset.0,
+        strip.y,
+        (strip.w - tab_inset.0 - tab_inset.1).max(0),
+        strip.h,
+    );
     let (toolbar, rest) = rest.split_top(m.toolbar_h);
     // The icon view has no columns, so it has no column header to click.
     let grid = input.icons != ICONS_OFF;
@@ -1372,9 +1394,15 @@ fn pane_layout(
     let (list_area, footer) = rest.split_bottom(m.footer_h);
     let (list, scrollbar) = list_area.split_right(m.scrollbar_w);
 
-    let tabs = tab_rects(tab_bar, m, input.tab_labels, measurer);
+    let tabs = tab_rects(tab_bar, m, input.tab_labels, input.active_tab, measurer);
     let new_tab = {
-        let after = tabs.last().map(|t| t.full.right()).unwrap_or(tab_bar.x);
+        // The last tab actually on screen, not the last tab there is.
+        let after = tabs
+            .iter()
+            .rev()
+            .find(|t| !t.full.is_empty())
+            .map(|t| t.full.right())
+            .unwrap_or(tab_bar.x);
         let x = after.min(tab_bar.right() - m.new_tab_w);
         if x >= tab_bar.x && tab_bar.w >= m.new_tab_w {
             Rect::new(x, tab_bar.y, m.new_tab_w, tab_bar.h)
@@ -1383,10 +1411,14 @@ fn pane_layout(
         }
     };
 
-    // Toolbar: three nav buttons, then the breadcrumb fills what is left.
-    let (nav_back, r) = toolbar.split_left(m.nav_btn_w);
+    // Toolbar, left to right: the nav buttons, then the breadcrumb filling
+    // what is left and the overflow menu off the far end.
+    let (r, overflow) = toolbar.split_right(m.nav_btn_w);
+    let (nav_back, r) = r.split_left(m.nav_btn_w);
     let (nav_forward, r) = r.split_left(m.nav_btn_w);
-    let (nav_up, breadcrumb) = r.split_left(m.nav_btn_w);
+    let (nav_up, r) = r.split_left(m.nav_btn_w);
+    let (nav_home, r) = r.split_left(m.nav_btn_w);
+    let (nav_pin, breadcrumb) = r.split_left(m.nav_btn_w);
     let crumbs = crumb_rects(breadcrumb, m, input.crumbs, measurer);
 
     let columns = column_rects(header, m);
@@ -1430,6 +1462,9 @@ fn pane_layout(
         nav_back,
         nav_forward,
         nav_up,
+        nav_home,
+        nav_pin,
+        overflow,
         breadcrumb,
         crumbs,
         header,
@@ -1448,7 +1483,18 @@ fn pane_layout(
     }
 }
 
-fn tab_rects(bar: Rect, m: Metrics, labels: &[String], measurer: &dyn TextMeasurer) -> Vec<TabRect> {
+/// Where each tab goes, and which of them are on screen at all.
+///
+/// The returned list always has one entry per label, so index `i` is tab `i`
+/// whatever is showing; a tab scrolled out of the strip gets an empty
+/// rectangle, which draws nothing and hit-tests to nothing.
+fn tab_rects(
+    bar: Rect,
+    m: Metrics,
+    labels: &[String],
+    active: usize,
+    measurer: &dyn TextMeasurer,
+) -> Vec<TabRect> {
     if labels.is_empty() {
         return Vec::new();
     }
@@ -1464,23 +1510,47 @@ fn tab_rects(bar: Rect, m: Metrics, labels: &[String], measurer: &dyn TextMeasur
 
     let available = (bar.w - m.new_tab_w).max(0);
     let total: i32 = natural.iter().sum();
-    // Shrink proportionally when they will not all fit, with a hard floor so a
-    // tab never collapses to nothing.
+    // Shrink proportionally when they will not all fit, but only down to a
+    // width that still shows an icon and a letter or two. Past that there are
+    // simply more tabs than fit, and forty slivers with a hairline between
+    // them is a strip you cannot read, aim at or close anything in.
+    // Enough for the icon and four or five letters. Below that every tab in a
+    // folder tree reads "D…" and the strip stops telling you anything.
+    let floor = m.tab_min_w * 3 / 4;
     let widths: Vec<i32> = if total <= available || total == 0 {
         natural
     } else {
-        let floor = m.tab_min_w.min(available / labels.len().max(1) as i32).max(1);
         natural
             .iter()
             .map(|w| ((*w as i64 * available as i64) / total as i64).max(floor as i64) as i32)
             .collect()
     };
 
-    let mut out = Vec::with_capacity(labels.len());
+    // More than fit: scroll the strip so the active tab is in it. Switching
+    // tabs is what moves the window along — Ctrl+Tab walks to a tab that is
+    // off the end and brings it into view, which is the whole affordance.
+    let active = active.min(labels.len() - 1);
+    let mut first = 0;
+    while first < active
+        && widths[first..=active].iter().sum::<i32>() > available
+    {
+        first += 1;
+    }
+
+    let mut out = vec![TabRect { full: Rect::default(), close: Rect::default() }; labels.len()];
     let mut x = bar.x;
-    for w in widths {
-        let full = Rect::new(x, bar.y, w.min((bar.right() - x).max(0)), bar.h);
-        let close = if full.w > m.tab_close_w * 3 {
+    for (i, w) in widths.iter().enumerate().skip(first) {
+        if x + w > bar.right() && i != first {
+            break;
+        }
+        let full = Rect::new(x, bar.y, (*w).min((bar.right() - x).max(0)), bar.h);
+        if full.w <= 0 {
+            break;
+        }
+        // A squeezed tab drops its close button rather than its name: the
+        // name is the only thing telling the tabs apart, and Ctrl+W still
+        // closes one whether or not it is drawing an x.
+        let close = if full.w > m.tab_min_w {
             Rect::new(
                 full.right() - m.tab_close_w - m.pad / 2,
                 full.y + (full.h - m.tab_close_w) / 2,
@@ -1490,11 +1560,8 @@ fn tab_rects(bar: Rect, m: Metrics, labels: &[String], measurer: &dyn TextMeasur
         } else {
             Rect::default()
         };
-        out.push(TabRect { full, close });
+        out[i] = TabRect { full, close };
         x += w;
-        if x >= bar.right() {
-            break;
-        }
     }
     out
 }
@@ -1652,6 +1719,7 @@ mod tests {
     fn input<'a>(tabs: &'a [String], crumbs: &'a [String], rows: u32, scroll: u32) -> PaneInput<'a> {
         PaneInput {
             tab_labels: tabs,
+            active_tab: 0,
             crumbs,
             total_lines: rows,
             icons: ICONS_OFF,
@@ -1694,7 +1762,7 @@ mod tests {
         let inputs: Vec<PaneInput> = (0..tree.count())
             .map(|_| input(&tabs, crumbs, 100, 0))
             .collect();
-        Layout::compute(client, m, tree, true, &sidebar_of(2), 0, false, &[], &inputs, &FixedWidth)
+        Layout::compute(client, m, tree, true, &sidebar_of(2), 0, false, &inputs, &FixedWidth)
     }
 
     /// Panes that are actually on screen, in tree order.
@@ -1803,7 +1871,6 @@ mod tests {
             &sidebar_of(2),
             0,
             false,
-            &[],
             &[input(&tabs, &crumbs, 10, 0)],
             &FixedWidth,
         );
@@ -1890,7 +1957,7 @@ mod tests {
     #[test]
     fn crumbs_never_escape_the_breadcrumb_bar() {
         let crumbs = strs(&[
-            "C:\\", "Users", "Sindroma", "Documents", "Projects", "file-xplorer", "src", "deep",
+            "C:\\", "Users", "Sindroma", "Documents", "Projects", "jamb", "src", "deep",
         ]);
         let l = build(900, 800, &crumbs);
         for c in &l.panes[0].crumbs {
@@ -1919,7 +1986,7 @@ mod tests {
     #[test]
     fn overflowing_crumbs_elide_from_the_left_and_keep_the_leaf() {
         let crumbs = strs(&[
-            "C:\\", "Users", "Sindroma", "Documents", "Projects", "file-xplorer", "src",
+            "C:\\", "Users", "Sindroma", "Documents", "Projects", "jamb", "src",
         ]);
         let l = build(820, 800, &crumbs);
         let last = l.panes[0].crumbs.last().unwrap();
@@ -1962,7 +2029,6 @@ mod tests {
             &[],
             0,
             false,
-            &[],
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1989,7 +2055,6 @@ mod tests {
             &[],
             0,
             false,
-            &[],
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -2056,7 +2121,6 @@ mod tests {
             &[],
             0,
             false,
-            &[],
             &[input(&tabs, &crumbs, 10, 0)],
             &FixedWidth,
         )
@@ -2120,7 +2184,6 @@ mod tests {
                 &[],
                 0,
                 false,
-                &[],
                 &[
                     input(&tabs, &crumbs, 1000, offset),
                     input(&tabs, &crumbs, 1000, offset),
@@ -2160,7 +2223,6 @@ mod tests {
             &[],
             0,
             false,
-            &[],
             &[input(&tabs, &crumbs, 3, 0), input(&tabs, &crumbs, 3, 0)],
             &FixedWidth,
         );
@@ -2246,7 +2308,6 @@ mod tests {
             &entries,
             0,
             false,
-            &[],
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -2285,7 +2346,6 @@ mod tests {
             &sidebar_of(2),
             0,
             false,
-            &[],
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -2413,7 +2473,6 @@ mod tests {
                 &sidebar_of(2),
                 0,
                 inspector,
-                &[],
                 &[input(&tabs, &crumbs, 10, 0)],
                 &FixedWidth,
             )
@@ -2426,7 +2485,12 @@ mod tests {
         let with = mk(true);
         assert_eq!(with.inspector.w, m.inspector_w);
         assert_eq!(with.inspector.right(), client.right());
-        assert_eq!(with.inspector.h, client.h, "full height, like the sidebar");
+        assert_eq!(with.inspector.y, with.caption.bottom(), "clear of the caption");
+        assert_eq!(
+            with.inspector.bottom(),
+            client.bottom(),
+            "and everything below it, like the sidebar"
+        );
         // The pane stops where the inspector starts: no overlap, no gap.
         assert_eq!(with.pane(PaneId(0)).bounds.right(), with.inspector.x);
         assert_eq!(
@@ -2447,7 +2511,7 @@ mod tests {
         let tree = Node::columns(4);
         let inputs: Vec<PaneInput> = (0..4).map(|_| input(&tabs, &[], 10, 0)).collect();
         let mk = |inspector: bool| {
-            Layout::compute(client, m, &tree, false, &[], 0, inspector, &[], &inputs, &FixedWidth)
+            Layout::compute(client, m, &tree, false, &[], 0, inspector, &inputs, &FixedWidth)
         };
 
         let roomy = mk(false);
@@ -2516,9 +2580,9 @@ mod tests {
             &[],
             0,
             false,
-            &[],
             &[PaneInput {
                 tab_labels: &tabs,
+                active_tab: 0,
                 crumbs: &crumbs,
                 total_lines: 50,
                 scroll_offset: 0,
@@ -2636,79 +2700,51 @@ mod tests {
     }
 
     #[test]
-    fn the_command_bar_takes_its_height_off_everything_below() {
+    fn the_top_row_of_panes_puts_its_tabs_in_the_caption() {
         let m = Metrics::for_dpi(96);
         let tabs = strs(&["C:\\"]);
         let crumbs = strs(&["C:"]);
         let client = Rect::new(0, 0, 1400, 800);
-        let items = [
-            BarItemInput { label: "New", menu: true, right: false },
-            BarItemInput { label: "", menu: false, right: false },
-            BarItemInput { label: "Details", menu: false, right: true },
-        ];
-        let mk = |bar: &[BarItemInput]| {
+        let mk = |sidebar: bool| {
             Layout::compute(
                 client,
                 m,
-                &Node::columns(1),
-                true,
+                &Node::columns(2),
+                sidebar,
                 &sidebar_of(2),
                 0,
                 false,
-                bar,
-                &[input(&tabs, &crumbs, 10, 0)],
+                &[
+                    input(&tabs, &crumbs, 10, 0),
+                    input(&tabs, &crumbs, 10, 0),
+                ],
                 &FixedWidth,
             )
         };
 
-        let without = mk(&[]);
-        assert!(without.bar.is_empty());
-        assert!(without.bar_items.is_empty());
-        assert_eq!(without.sidebar.y, client.y);
+        let l = mk(true);
+        // No row is taken off the top: the panes run up into the caption, and
+        // their tab bars are what fills it.
+        assert_eq!(l.panes[0].bounds.y, client.y);
+        assert_eq!(l.panes[0].tab_bar.y, l.caption.y);
+        assert_eq!(l.panes[0].tab_bar.h, l.caption.h);
+        // The sidebar does not: the logo and the toggle live above it.
+        assert_eq!(l.sidebar.y, l.caption.bottom());
+        assert!(l.caption_sidebar.right() <= l.sidebar.right());
 
-        let with = mk(&items);
-        assert_eq!(with.bar.h, m.bar_h);
-        assert_eq!(with.bar.w, client.w, "it spans the window, sidebar included");
-        // Everything below starts where the bar ends: no overlap, no gap.
-        assert_eq!(with.sidebar.y, with.bar.bottom());
-        assert_eq!(with.panes[0].bounds.y, with.bar.bottom());
-        assert_eq!(with.sidebar.h, without.sidebar.h - m.bar_h);
-    }
+        // The window buttons are the right end of the caption, and the pane
+        // under them stops short rather than drawing a tab behind one.
+        assert_eq!(l.win_close.right(), client.right());
+        assert!(l.panes[1].tab_bar.right() <= l.win_min.x);
+        // The pane itself still reaches the edge — it is only the strip that
+        // keeps clear.
+        assert_eq!(l.panes[1].bounds.right(), client.right());
 
-    #[test]
-    fn bar_buttons_flow_left_and_the_right_ones_pack_from_the_far_end() {
-        let m = Metrics::for_dpi(96);
-        let items = [
-            BarItemInput { label: "New", menu: true, right: false },
-            BarItemInput { label: "", menu: false, right: false },
-            BarItemInput { label: "Details", menu: false, right: true },
-        ];
-        let bar = Rect::new(0, 0, 900, m.bar_h);
-        let r = bar_rects(bar, m, &items, &FixedWidth);
-
-        // Left-hand buttons in order, not overlapping.
-        assert!(r[0].x >= bar.x);
-        assert!(r[0].right() <= r[1].x);
-        // A labelled button is wider than an icon-only one.
-        assert!(r[0].w > r[1].w);
-        assert_eq!(r[1].w, m.bar_btn_w);
-        // The right-hand one is against the far edge, clear of the others.
-        assert!(r[2].right() <= bar.right());
-        assert!(r[2].x > r[1].right());
-    }
-
-    #[test]
-    fn a_bar_too_narrow_drops_buttons_rather_than_overlapping_them() {
-        let m = Metrics::for_dpi(96);
-        let items: Vec<BarItemInput> = (0..12)
-            .map(|_| BarItemInput { label: "", menu: false, right: false })
-            .collect();
-        let r = bar_rects(Rect::new(0, 0, 120, m.bar_h), m, &items, &FixedWidth);
-        let drawn: Vec<&Rect> = r.iter().filter(|r| !r.is_empty()).collect();
-        assert!(drawn.len() < items.len(), "some had to go");
-        for pair in drawn.windows(2) {
-            assert!(pair[0].right() <= pair[1].x, "and none of them overlap");
-        }
+        // With no sidebar the first pane owns the left end, so its strip is
+        // the one that has to make room.
+        let l = mk(false);
+        assert_eq!(l.panes[0].bounds.x, client.x);
+        assert!(l.panes[0].tab_bar.x >= l.caption_sidebar.right());
     }
 
     #[test]
@@ -2744,25 +2780,67 @@ mod tests {
     }
 
     #[test]
-    fn the_overflow_button_is_still_there_when_nothing_else_fits() {
-        // It is right-anchored precisely so that placement reserves it first.
-        // An overflow button that could itself overflow would hide the very
-        // buttons it exists to reach.
+    fn too_many_tabs_scroll_the_strip_rather_than_shrink_to_slivers() {
         let m = Metrics::for_dpi(96);
-        let mut items: Vec<BarItemInput> = (0..12)
-            .map(|_| BarItemInput { label: "", menu: false, right: false })
-            .collect();
-        items.push(BarItemInput { label: "", menu: false, right: true });
-        let overflow = items.len() - 1;
+        let labels: Vec<String> = (0..40).map(|i| format!("Tab {i}")).collect();
+        let bar = Rect::new(0, 0, 600, m.tab_bar_h);
+        let floor = m.tab_min_w * 3 / 4;
 
-        let r = bar_rects(Rect::new(0, 0, 120, m.bar_h), m, &items, &FixedWidth);
-        assert!(!r[overflow].is_empty(), "the way out has to be drawn");
-        assert!(
-            r.iter().take(overflow).any(|r| r.is_empty()),
-            "and there is something behind it"
+        let first = tab_rects(bar, m, &labels, 0, &FixedWidth);
+        assert_eq!(first.len(), labels.len(), "one entry per tab, always");
+        let shown: Vec<&TabRect> = first.iter().filter(|t| !t.full.is_empty()).collect();
+        assert!(shown.len() < labels.len(), "they cannot all fit");
+        for t in &shown {
+            assert!(t.full.w >= floor, "no tab shrinks below readable");
+            assert!(t.full.right() <= bar.right(), "and none runs off the end");
+        }
+        assert!(!first[0].full.is_empty(), "the active tab is on screen");
+        assert!(first[39].full.is_empty(), "the far end is not");
+
+        // Switching to a tab off the end brings it into view, which is the
+        // only way back to it.
+        let last = tab_rects(bar, m, &labels, 39, &FixedWidth);
+        assert!(!last[39].full.is_empty());
+        assert!(last[0].full.is_empty());
+    }
+
+    #[test]
+    fn both_side_panels_have_an_edge_to_pull() {
+        let m = Metrics::for_dpi(96);
+        let client = Rect::new(0, 0, 1400, 800);
+        let tabs = strs(&["C:"]);
+        let l = Layout::compute(
+            client, m, &Node::columns(1), true, &sidebar_of(2), 0, true,
+            &[input(&tabs, &tabs, 10, 0)], &FixedWidth,
         );
-        for left in r.iter().take(overflow).filter(|r| !r.is_empty()) {
-            assert!(left.right() <= r[overflow].x, "no overlap with it either");
+        // Inside its own panel, not across the line: the pane's Back button
+        // starts at the very first pixel the pane owns.
+        assert_eq!(l.sidebar_edge.right(), l.sidebar.right());
+        assert_eq!(l.inspector_edge.x, l.inspector.x);
+        assert_eq!(
+            l.hit_test(l.sidebar.right() - 1, l.sidebar.y + 40),
+            Hit::PanelEdge { sidebar: true }
+        );
+        assert_eq!(
+            l.hit_test(l.inspector.x + 1, l.inspector.y + 40),
+            Hit::PanelEdge { sidebar: false }
+        );
+        let back = l.pane(PaneId(0)).nav_back;
+        assert_eq!(
+            l.hit_test(back.x + 1, back.y + 1),
+            Hit::Nav(PaneId(0), NavButton::Back)
+        );
+    }
+
+    #[test]
+    fn every_pane_carries_its_own_overflow_menu() {
+        let l = build_n(2, 1400, 800, &strs(&["C:"]));
+        for pid in [PaneId(0), PaneId(1)] {
+            let p = l.pane(pid);
+            assert_eq!(p.overflow.right(), p.toolbar.right(), "against the far end");
+            assert!(p.breadcrumb.right() <= p.overflow.x, "clear of the crumbs");
+            let (x, y) = (p.overflow.x + 1, p.overflow.y + 1);
+            assert_eq!(l.hit_test(x, y), Hit::Overflow(pid));
         }
     }
 
@@ -2836,7 +2914,7 @@ mod tests {
     #[test]
     fn splitting_a_leaf_keeps_everything_else_where_it_was() {
         let mut tree = Node::columns(2);
-        assert!(tree.split(PaneId(1), PaneId(2), false));
+        assert!(tree.split_at(PaneId(1), PaneId(2), false, false));
         assert_eq!(tree.leaves(), vec![PaneId(0), PaneId(1), PaneId(2)]);
 
         // The new pane is stacked under the one that was split, and the first
@@ -2879,9 +2957,9 @@ mod tests {
     fn a_new_pane_takes_an_id_nobody_is_using() {
         let mut tree = Node::columns(2);
         assert_eq!(tree.unused(), vec![PaneId(2), PaneId(3)]);
-        tree.split(PaneId(0), PaneId(2), true);
+        tree.split_at(PaneId(0), PaneId(2), true, false);
         assert_eq!(tree.unused(), vec![PaneId(3)]);
-        tree.split(PaneId(3), PaneId(1), true);
+        tree.split_at(PaneId(3), PaneId(1), true, false);
         assert!(tree.unused().contains(&PaneId(3)), "no such leaf, no split");
     }
 
@@ -2890,7 +2968,7 @@ mod tests {
         // The drag handler knows a divider by its index in `dividers`, so the
         // same index has to reach the same split node.
         let mut tree = Node::columns(2);
-        tree.split(PaneId(1), PaneId(2), false);
+        tree.split_at(PaneId(1), PaneId(2), false, false);
         for (i, ratio) in [(0usize, 0.25f32), (1, 0.75)] {
             let mut t = tree.clone();
             t.set_ratio(i, ratio);

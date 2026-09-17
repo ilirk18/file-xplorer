@@ -9,8 +9,7 @@ use std::time::Instant;
 use windows::core::{Result, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -21,6 +20,10 @@ use crate::file_list::{SelectMode, SortKey, SortOrder};
 use crate::fs;
 use crate::layout::{Hit, Layout, Metrics, PaneId, PaneInput, Rect, SidebarEntry, MAX_PANES};
 use crate::ops;
+
+/// Narrowest either side panel can be dragged, in DIPs. Below this a place's
+/// name is an ellipsis and the panel is a column of icons nobody can read.
+const PANEL_MIN_W: i32 = 120;
 use crate::pane::{LoadRequest, Pane};
 use crate::renderer::Renderer;
 use crate::search;
@@ -61,6 +64,9 @@ pub const WM_APP_PREVIEW_READY: u32 = WM_APP + 9;
 /// A worker finished one grid cell's image. `lparam` owns a boxed
 /// `(key, Option<HBITMAP>)`; the handler takes it or leaks the bitmap.
 pub const WM_APP_THUMB_READY: u32 = WM_APP + 10;
+
+/// A batch of duplicate groups, posted back from a worker thread.
+pub const WM_APP_DUPES_BATCH: u32 = WM_APP + 11;
 
 /// Periodic settings save. Writing only on exit means a crash — or being
 /// killed from a terminal — loses the session, which is exactly when you
@@ -172,6 +178,12 @@ pub struct SearchBatch {
     pub batch: search::Batch,
 }
 
+pub struct DupesBatch {
+    pub pid: PaneId,
+    pub tab_id: u64,
+    pub batch: crate::duplicates::Batch,
+}
+
 pub struct SizesDone {
     pub pid: PaneId,
     pub tab_id: u64,
@@ -209,6 +221,8 @@ pub enum SidebarAction {
 pub enum Drag {
     None,
     Divider { index: usize, grab_offset: i32 },
+    /// Widening the sidebar (true) or the inspector (false) by its edge.
+    PanelEdge { sidebar: bool },
     /// Resizing a column by its left edge.
     Column { key: crate::file_list::SortKey, start_x: i32, start_w: i32 },
     Scrollbar { pid: PaneId, grab_offset: i32 },
@@ -271,7 +285,7 @@ pub struct AppState {
     /// almost immediately, so it has to scroll.
     pub sidebar_scroll: i32,
     /// Folders the user pinned into Places.
-    pub pins: Vec<String>,
+    pub pins: Vec<crate::config::Pin>,
     /// Shell verbs hoisted to the top of the context menu, by menu text.
     pub pin_actions: Vec<String>,
     /// Named pane trees, as (name, tree text), most recently saved last.
@@ -323,10 +337,13 @@ pub struct AppState {
     /// Window-wide: per-pane would mean a per-pane array in the config like
     /// `sort`, and nothing has asked.
     pub icons: i32,
-    /// Is the command bar across the top showing?
-    pub command_bar: bool,
     /// Is the inspector panel on the right showing?
     pub inspector: bool,
+    /// Widths the two side panels were dragged to, in DIPs, or 0 for whatever
+    /// the metrics say. Stored unscaled so the same settings file opens at the
+    /// same apparent width on a different monitor.
+    pub sidebar_w: i32,
+    pub inspector_w: i32,
     /// What the inspector is showing, keyed by path and modified time so an
     /// edited file re-previews rather than showing a stale thumbnail.
     pub preview: Option<(String, crate::preview::Preview)>,
@@ -352,6 +369,10 @@ pub struct AppState {
     pub folder_view: Vec<(String, (SortKey, SortOrder, i32))>,
 
     pub hover: Option<Hit>,
+    /// Which window button the pointer is over: 0 minimise, 1 maximise,
+    /// 2 close. Separate from `hover` because those three are hit-tested as
+    /// non-client area, so they arrive as a different message.
+    pub caption_hover: Option<usize>,
     pub drag: Drag,
     pub mouse_tracking: bool,
 
@@ -453,8 +474,9 @@ impl AppState {
             thumbs: Default::default(),
             thumbs_pending: Default::default(),
             icons: cfg.icons,
-            command_bar: cfg.command_bar,
             inspector: cfg.inspector,
+            sidebar_w: cfg.sidebar_w,
+            inspector_w: cfg.inspector_w,
             preview: None,
             preview_pending: None,
             size_pending: None,
@@ -469,6 +491,7 @@ impl AppState {
                 })
                 .collect(),
             hover: None,
+            caption_hover: None,
             drag: Drag::None,
             mouse_tracking: false,
             theme,
@@ -556,7 +579,7 @@ impl AppState {
             entries.push(SidebarEntry::Place {
                 index: self.places.len() + i,
             });
-            actions.push(SidebarAction::Go(self.pins[i].clone()));
+            actions.push(SidebarAction::Go(self.pins[i].path.clone()));
         }
 
         entries.push(SidebarEntry::Section {
@@ -594,16 +617,27 @@ impl AppState {
     }
 
     pub fn is_pinned(&self, path: &str) -> bool {
-        self.pins.iter().any(|p| crate::pane::paths_equal(p, path))
+        self.pins
+            .iter()
+            .any(|p| crate::pane::paths_equal(&p.path, path))
     }
 
     /// Pin or unpin a folder. Toggling rather than two commands, because the
     /// menu already knows which state it is in and can say so.
-    pub fn toggle_pin(&mut self, path: &str) {
-        if let Some(i) = self.pins.iter().position(|p| crate::pane::paths_equal(p, path)) {
+    pub fn toggle_pin(&mut self, text: &str) {
+        // Parsed, so one function serves both callers: "Pin this folder"
+        // passes a bare path and gets `icon: None`, and "Pin a path…" can pass
+        // `shell32.dll,4|\nas\media`. Matching is on the path either way, so
+        // typing a pinned path takes it off whatever icon it was given.
+        let pin = crate::config::Pin::parse(text);
+        if let Some(i) = self
+            .pins
+            .iter()
+            .position(|p| crate::pane::paths_equal(&p.path, &pin.path))
+        {
             self.pins.remove(i);
-        } else if !path.is_empty() {
-            self.pins.push(path.to_string());
+        } else if !pin.path.is_empty() {
+            self.pins.push(pin);
         }
     }
 
@@ -674,6 +708,7 @@ impl AppState {
             .enumerate()
             .map(|(i, p)| PaneInput {
                 tab_labels: &tabs[i],
+                active_tab: self.pane(*p).active_tab_index,
                 crumbs: &crumbs[i],
                 total_lines: self.pane(*p).list().total_lines(),
                 scroll_offset: self.pane(*p).list().scroll_offset,
@@ -681,20 +716,6 @@ impl AppState {
             })
             .collect();
         let (entries, _) = self.sidebar_model();
-        // The bar is the caller's list, like the sidebar's: the layout only
-        // decides where each button goes.
-        let bar_items: Vec<crate::layout::BarItemInput> = if self.command_bar {
-            crate::commands::BAR
-                .iter()
-                .map(|b| crate::layout::BarItemInput {
-                    label: b.label,
-                    menu: matches!(b.action, crate::commands::BarAction::Menu(_)),
-                    right: b.right,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         Layout::compute(
             self.client,
             self.metrics,
@@ -703,7 +724,6 @@ impl AppState {
             &entries,
             self.sidebar_scroll,
             self.inspector,
-            &bar_items,
             &inputs,
             &self.renderer,
         )
@@ -880,6 +900,15 @@ impl AppState {
     /// the old row height is a list that selects the wrong row.
     pub fn apply_metrics(&mut self) {
         self.metrics = Metrics::sized(self.dpi, self.font_size, self.density);
+        // A dragged width wins over the measured one. Only the monitor scales
+        // it: how wide you want the sidebar is not a function of the font.
+        let px = |dip: i32| (dip as f32 * self.metrics.scale).round() as i32;
+        if self.sidebar_w > 0 {
+            self.metrics.sidebar_w = px(self.sidebar_w);
+        }
+        if self.inspector_w > 0 {
+            self.metrics.inspector_w = px(self.inspector_w);
+        }
         let row_h = self.metrics.row_h as u32;
         for p in &mut self.panes {
             p.set_row_height(row_h);
@@ -898,6 +927,28 @@ impl AppState {
 
     pub fn list_height(&self, pid: PaneId) -> u32 {
         self.layout().pane(pid).list.h.max(0) as u32
+    }
+
+    /// Drag the sidebar's or the inspector's edge to `x`.
+    ///
+    /// Clamped here rather than when the layout is placed, because unlike a
+    /// split these are not fractions of anything: a panel dragged past the
+    /// window would otherwise stay dragged past it.
+    pub fn set_panel_width(&mut self, sidebar: bool, x: i32) {
+        let scale = self.metrics.scale.max(0.1);
+        let wanted = if sidebar {
+            x - self.client.x
+        } else {
+            self.client.right() - x
+        };
+        let max = ((self.client.w / 2) as f32 / scale).round() as i32;
+        let dip = ((wanted as f32 / scale).round() as i32).clamp(PANEL_MIN_W, max.max(PANEL_MIN_W));
+        if sidebar {
+            self.sidebar_w = dip;
+        } else {
+            self.inspector_w = dip;
+        }
+        self.apply_metrics();
     }
 
     /// Move one divider. Minimum sizes are enforced when the tree is placed,
@@ -946,11 +997,20 @@ impl AppState {
     }
 
     /// Split `target` and return the new pane, leaving focus alone.
+    ///
+    /// The new pane opens on one tab at `target`'s folder. A slot keeps its
+    /// tabs while it is off screen — that is what makes Ctrl+1 after Ctrl+2
+    /// come back to what was there — but a split is a *new* pane, and a new
+    /// pane holding three tabs somebody closed an hour ago is not one.
     pub fn split_pane(&mut self, target: PaneId, vertical: bool, before: bool) -> Option<PaneId> {
         let fresh = *self.layout_tree.unused().first()?;
         if !self.layout_tree.split_at(target, fresh, vertical, before) {
             return None;
         }
+        let here = self.pane(target).current_path().to_string();
+        // The request is dropped: every caller issues its own load for the
+        // pane it has just been handed, and the later generation wins.
+        let _ = self.pane_mut(fresh).restore(&[here], 0);
         Some(fresh)
     }
 
@@ -959,10 +1019,7 @@ impl AppState {
     /// `vertical` puts it to the right, otherwise underneath. Fails only when
     /// every pane id is already in use.
     pub fn split_focused(&mut self, vertical: bool) -> Option<PaneId> {
-        let fresh = *self.layout_tree.unused().first()?;
-        if !self.layout_tree.split(self.focused, fresh, vertical) {
-            return None;
-        }
+        let fresh = self.split_pane(self.focused, vertical, false)?;
         // The new pane inherits where you were, which is what makes splitting
         // useful: two views of one folder, then navigate one of them away.
         self.focused = fresh;
@@ -1174,7 +1231,8 @@ impl AppState {
                 .collect(),
             recent: self.recent.clone(),
             inspector: self.inspector,
-            command_bar: self.command_bar,
+            sidebar_w: self.sidebar_w,
+            inspector_w: self.inspector_w,
             icons: self.icons,
             // Only what differs from the defaults, so a default that changes
             // in a later version still reaches someone who never rebound it.
@@ -1291,18 +1349,17 @@ fn set_dwm_attr<T>(hwnd: HWND, attr: DWMWINDOWATTRIBUTE, value: &T) {
     }
 }
 
-/// Paint the system caption with the tab strip's colours. Dark mode alone
-/// gives Windows' own dark caption, which is a different grey and reads as a
-/// second title bar sitting on top of ours.
+/// Match the window's frame to the theme.
+///
+/// The caption itself is ours and painted with everything else, so the only
+/// things left for DWM are the hairline border around the window and the
+/// shadow it casts — both of which still come out of the system's own idea of
+/// light and dark.
 pub fn apply_titlebar_theme(hwnd: HWND, theme: Theme) {
-    let pal = theme.palette();
     let dark = BOOL::from(theme.is_dark());
-    let caption = colorref(pal.tab_bar_bg);
-    let text = colorref(pal.text);
+    let border = colorref(theme.palette().tab_bar_bg);
     set_dwm_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark);
-    set_dwm_attr(hwnd, DWMWA_CAPTION_COLOR, &caption);
-    set_dwm_attr(hwnd, DWMWA_TEXT_COLOR, &text);
-    set_dwm_attr(hwnd, DWMWA_BORDER_COLOR, &caption);
+    set_dwm_attr(hwnd, DWMWA_BORDER_COLOR, &border);
 }
 
 pub fn invalidate(hwnd: HWND) {
@@ -1494,16 +1551,5 @@ mod tests {
     fn an_unknown_sort_id_falls_back_to_name() {
         // A settings file from a future build must not panic an older one.
         assert_eq!(sort_key_from_id(99), SortKey::Name);
-    }
-
-    #[test]
-    fn titlebar_caption_matches_the_tab_strip() {
-        // The caption is painted by DWM from a COLORREF; if this mapping is
-        // wrong the title bar is a different grey from the rest of the chrome.
-        let p = Theme::DARK.palette();
-        assert_eq!(colorref(p.tab_bar_bg).0, 0x00181514); // 0x141518 in BGR
-        assert_eq!(colorref(p.text).0, 0x00EDEAE8); // 0xE8EAED in BGR
-        let light = Theme::by_name("Light").unwrap().palette();
-        assert_eq!(colorref(light.tab_bar_bg).0, 0x00EDE9E7); // 0xE7E9ED in BGR
     }
 }

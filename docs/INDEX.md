@@ -1,4 +1,4 @@
-# File Xplorer – Documentation Index
+# Jamb – Documentation Index
 
 Start here. Each phase has its own doc; this index links them all and summarises
 the current state so context is never lost.
@@ -19,7 +19,7 @@ the current state so context is never lost.
 | 8 | [phase-8.md](phase-8.md) | Done | Themed context menu and tab strip, Ctrl+L, terminal, pins, autosave, tab moving, tree reveal, column resize, content compare, archiving |
 | 9 | [phase-9.md](phase-9.md) | Done | Second window, pane tree, view continuum, default manager, customization, network |
 
-**Ideas and plans:** [file-pilot-comparison.md](file-pilot-comparison.md) · [phase-9-plan.md](phase-9-plan.md) (the reasoning behind phase 9, kept for the arguments-against)
+**Ideas and plans:** [file-pilot-comparison.md](file-pilot-comparison.md) · [powertoys-inspired-ideas.md](powertoys-inspired-ideas.md) · [phase-9-plan.md](phase-9-plan.md) (the reasoning behind phase 9, kept for the arguments-against)
 
 ---
 
@@ -43,8 +43,9 @@ the current state so context is never lost.
 | `src/fs.rs` | `list_dir`, path helpers, `validate_file_name`, `drives()`, size/date formatting |
 | `src/ops.rs` | `IFileOperation` for copy/move/delete/rename/new-folder, `CF_HDROP` clipboard, `ShellExecuteW` |
 | `src/icons.rs` | `HICON` cache keyed by extension or path, handles destroyed on drop |
-| `src/config.rs` | `key=value` settings file: pane count, theme, sidebar, hidden files, splits, window box, open tabs |
+| `src/config.rs` | `key=value` settings file: pane count, theme, sidebar, hidden files, splits, window box, open tabs, pinned places |
 | `src/search.rs` | Recursive name and content search |
+| `src/duplicates.rs` | Duplicate files: size buckets, then hashes, streamed back in groups |
 | `src/tree.rs` | The sidebar's folder tree: flat rows from a set of expanded paths |
 | `src/archive.rs` | Archives browsed as folders, via the 7-Zip CLI |
 | `src/palette.rs` | Command palette and its fuzzy matcher |
@@ -89,7 +90,7 @@ the current state so context is never lost.
   failures. See [.cursor/rules/phase-tests.mdc](../.cursor/rules/phase-tests.mdc).
 - **Docs**: after each phase add or update `docs/phase-N.md` and this index.
 
-Current: **303 tests, zero warnings** (`cargo test`). CI runs both on
+Current: **317 tests, zero warnings** (`cargo test`). CI runs both on
 `windows-latest` on every push and pull request:
 [.github/workflows/ci.yml](../.github/workflows/ci.yml).
 

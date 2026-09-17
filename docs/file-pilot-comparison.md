@@ -1,4 +1,4 @@
-# File Xplorer vs File Pilot — Feature Comparison
+# Jamb vs File Pilot — Feature Comparison
 
 **Date:** 2026-09-14  
 **Scope:** Analysis only (no implementation). Goal: match everything File Pilot has, then go beyond it.
@@ -11,13 +11,13 @@
 
 ## Verdict
 
-File Xplorer already matches File Pilot on most power-user cores (panes/tabs, palette, inspector, batch rename, shell menu, session restore). File Pilot still wins on **layout flexibility**, **polish/customization**, and a few UX details. File Xplorer already beats them on several things they lack or do weakly.
+Jamb already matches File Pilot on most power-user cores (panes/tabs, palette, inspector, batch rename, shell menu, session restore). File Pilot still wins on **layout flexibility**, **polish/customization**, and a few UX details. Jamb already beats them on several things they lack or do weakly.
 
 ---
 
 ## Core identity
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Native Windows, no Electron | Yes | Yes | Both native |
 | Tiny binary | ~1.8–2 MB | ~0.5 MB | FX smaller |
@@ -30,7 +30,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Layout & multitasking
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Tabs per pane | Yes | Yes | Both |
 | Session restore tabs | Yes | Yes | Both |
@@ -49,7 +49,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Navigation
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Breadcrumbs | Yes | Yes | Both |
 | Back / forward / up | Yes | Yes | Both |
@@ -68,7 +68,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Listing, views, selection
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Details / list view | Yes | Yes | Both |
 | Icon / thumbnail view | Yes | Yes | Both |
@@ -88,7 +88,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Search
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Recursive / flattened search | Yes | Yes | Both |
 | Fuzzy / subsequence | Yes | Yes | Both |
@@ -100,7 +100,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Inspector / preview
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Preview pane | Yes (Space) | Yes (`Alt+P`) | Both |
 | Text preview | Yes | Yes | Both |
@@ -113,7 +113,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## File operations
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Copy / cut / paste | Yes | Yes | Both |
 | Delete → Recycle / permanent | Yes | Yes | Both |
@@ -132,7 +132,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Batch rename
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Batch rename | Yes | Yes | Both |
 | Counter / incremental | Yes | Yes `{#}` | Both |
@@ -144,7 +144,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Archives
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Browse archive as folder | ? | Yes | FX via 7-Zip |
 | Extract archive | ? | Yes | FX |
@@ -155,7 +155,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Context menu & commands
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Classic / full shell menu (no “Show more”) | Yes | Yes | Both + shell handlers |
 | Search/filter inside context menu | Yes | No | FP: type to find action |
@@ -170,7 +170,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Customization & chrome
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Dark / light theme | Yes | Yes | Both |
 | Multiple color schemes (6+) | Yes | No (2) | FP |
@@ -187,7 +187,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ## Shell / OS integration
 
-| Feature | File Pilot | File Xplorer | Notes |
+| Feature | File Pilot | Jamb | Notes |
 |---|---|---|---|
 | Third-party shell verbs | Yes | Yes | Both |
 | Network / LAN shares | No (reported beta gap) | Partial | FX: Network namespace; SMB polish TBD |
@@ -199,7 +199,7 @@ File Xplorer already matches File Pilot on most power-user cores (panes/tabs, pa
 
 ---
 
-## Where File Xplorer already beats File Pilot
+## Where Jamb already beats File Pilot
 
 | Area | Why it matters |
 |---|---|

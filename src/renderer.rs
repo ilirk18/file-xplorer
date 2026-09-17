@@ -53,21 +53,24 @@ pub mod glyph {
     pub const CHEVRON_UP: &str = "\u{E70E}";
     pub const FILTER: &str = "\u{E71C}";
 
-    // The command bar.
-    pub const CUT: &str = "\u{E8C6}";
-    pub const COPY: &str = "\u{E8C8}";
-    pub const PASTE: &str = "\u{E77F}";
-    pub const RENAME: &str = "\u{E8AC}";
-    pub const DELETE: &str = "\u{E74D}";
-    pub const SORT: &str = "\u{E8CB}";
-    pub const VIEW: &str = "\u{E890}";
-    /// The details panel, shut and open. A toggle whose icon never changes is
-    /// a button that does not say what it did.
-    pub const PANE_CLOSED: &str = "\u{E8A0}";
-    pub const PANE_OPEN: &str = "\u{E8A1}";
-    pub const SHARE: &str = "\u{E72D}";
-    pub const SETTINGS: &str = "\u{E713}";
+    // The window buttons. Segoe MDL2 draws these at the weight Windows' own
+    // caption uses, so they sit at the top right looking like they belong.
+    pub const MINIMIZE: &str = "\u{E921}";
+    pub const MAXIMIZE: &str = "\u{E922}";
+    pub const RESTORE: &str = "\u{E923}";
+
+    /// A window with its left column filled: the sidebar, shown or not. One
+    /// glyph for both states, because a toggle that swaps its picture makes
+    /// you work out which picture means which; this one says it in colour.
+    pub const SIDEBAR: &str = "\u{E90D}";
+    pub const HOME: &str = "\u{E80F}";
+    pub const PIN: &str = "\u{E718}";
+    pub const UNPIN: &str = "\u{E77A}";
 }
+
+/// The overflow menu's button. Segoe MDL2 has no vertical ellipsis, so this
+/// one is a character in the UI font rather than a glyph in the icon font.
+pub const MORE: &str = "\u{22EE}";
 
 use crate::fs::wide;
 
@@ -104,6 +107,9 @@ pub struct PaneView<'a> {
     pub can_back: bool,
     pub can_forward: bool,
     pub can_up: bool,
+    /// Is this pane's folder already pinned? The pin button is a toggle, so
+    /// its icon is also how the answer is shown.
+    pub pinned: bool,
     /// True when keystrokes are going to the filter box rather than the list.
     pub filter_focused: bool,
     /// The rubber-band rectangle being dragged in this pane, already clipped
@@ -132,25 +138,35 @@ pub struct InspectorView<'a> {
     /// The preview and the key it was built for; the key is what the converted
     /// bitmap is cached against.
     pub preview: Option<(&'a str, &'a crate::preview::Preview)>,
+    /// False when the panel is describing the folder itself because nothing in
+    /// it is selected. No worker was sent for that, so there is nothing to wait
+    /// for and nothing to say about waiting.
+    pub selected: bool,
 }
 
-/// One command-bar button, ready to draw.
-pub struct BarButtonView<'a> {
-    pub glyph: &'a str,
-    pub label: &'a str,
-    pub menu: bool,
-    pub enabled: bool,
-    /// A toggle that is currently on, drawn in the accent colour so the state
-    /// reads without having to remember which icon means which.
-    pub on: bool,
+/// The window's own furniture in the caption strip: everything up there that
+/// is not a pane's tab bar.
+pub struct CaptionView {
+    pub sidebar_visible: bool,
+    pub maximized: bool,
+    pub hover: Option<Hit>,
+    /// Which window button the pointer is over: 0 minimise, 1 maximise,
+    /// 2 close. They are hit-tested as non-client area, so they do not come
+    /// through `hover` like everything else does.
+    pub button_hover: Option<usize>,
 }
+
+/// What the close button goes under the pointer. Every other window on the
+/// desktop does this, so anything else there reads as a different button.
+const CLOSE_HOVER: crate::theme::Rgb = (0.77, 0.17, 0.11);
 
 /// Everything the renderer needs to paint the sidebar.
 pub struct SidebarView<'a> {
     pub entries: &'a [SidebarEntry],
     pub drives: &'a [Drive],
     /// (label, path) shortcuts.
-    pub places: &'a [(String, String)],
+    /// (label, path, icon cache key) per row of the Places section.
+    pub places: &'a [(String, String, String)],
     pub current_path: &'a str,
     /// Visible rows of the folder tree, indexed by `SidebarEntry::Tree`.
     pub tree: &'a [crate::tree::TreeRow],
@@ -629,65 +645,91 @@ impl Renderer {
         }
     }
 
-    /// The command bar: a row of buttons over the whole window, acting on
-    /// whichever pane has focus.
-    pub fn draw_command_bar(&mut self, layout: &Layout, items: &[BarButtonView], hover: Option<Hit>) {
-        if layout.bar.is_empty() {
+    /// The app's mark: an opening, and the jamb beside it running past the
+    /// opening top and bottom.
+    ///
+    /// Drawn rather than blitted from the icon resource, so it follows the
+    /// theme's accent and the monitor's scale. The geometry is the icon's, on
+    /// the same 32-unit grid, so the caption and the taskbar agree.
+    fn draw_logo(&mut self, slot: Rect, m: Metrics, c: Rgb) {
+        let side = m.icon_size + m.pad / 2;
+        if slot.w < side || slot.h < side {
+            return;
+        }
+        let k = side as f32 / 32.0;
+        let at = |x: f32, y: f32, w: f32, h: f32| {
+            Rect::new(
+                slot.x + m.pad / 2 + (x * k) as i32,
+                slot.y + (slot.h - side) / 2 + (y * k) as i32,
+                (w * k).round() as i32,
+                (h * k).round() as i32,
+            )
+        };
+        self.stroke_rounded(at(3.0, 7.0, 18.0, 18.0), 3.0 * k, c, (3.0 * k).max(1.0));
+        self.fill_rounded(at(24.0, 2.0, 5.0, 28.0), 2.5 * k, c);
+    }
+
+    /// The strip across the top of the window. The panes have already painted
+    /// their tab bars into it by the time this runs, so all that is left is
+    /// the two ends: the app icon and the sidebar toggle on the left, the
+    /// window buttons on the right.
+    pub fn draw_caption(&mut self, layout: &Layout, v: &CaptionView) {
+        let cap = layout.caption;
+        if cap.is_empty() {
             return;
         }
         let p = self.palette();
         let m = layout.metrics;
-        self.fill(layout.bar, p.toolbar_bg);
-        // A hairline underneath, so the bar reads as chrome rather than as the
-        // top of the first pane.
-        let edge = Rect::new(
-            layout.bar.x,
-            layout.bar.bottom() - 1.max(m.scale as i32),
-            layout.bar.w,
-            1.max(m.scale as i32),
-        );
-        self.fill(edge, p.divider);
+        // The sidebar and the inspector stop below the caption, so the strip
+        // above each of them is the one part no pane covered.
+        for r in [layout.sidebar, layout.inspector] {
+            if !r.is_empty() {
+                self.fill(Rect::new(r.x, cap.y, r.w, cap.h), p.tab_bar_bg);
+            }
+        }
 
-        for (i, item) in items.iter().enumerate() {
-            let Some(r) = layout.bar_items.get(i).copied() else {
-                break;
+        self.draw_logo(layout.caption_logo, m, p.accent);
+
+        let toggle = layout.caption_sidebar;
+        if !toggle.is_empty() {
+            let hovered = v.hover == Some(Hit::SidebarToggle);
+            if hovered {
+                self.fill_rounded(toggle.inset(2, 3), m.radius, p.tab_hover);
+            }
+            let c = match (v.sidebar_visible, hovered) {
+                (true, _) => p.accent,
+                (false, true) => p.text,
+                (false, false) => p.text_muted,
             };
-            if r.is_empty() {
-                continue;
+            self.glyph(glyph::SIDEBAR, toggle, c);
+        }
+
+        let buttons = [
+            (layout.win_min, glyph::MINIMIZE),
+            (
+                layout.win_max,
+                if v.maximized {
+                    glyph::RESTORE
+                } else {
+                    glyph::MAXIMIZE
+                },
+            ),
+            (layout.win_close, glyph::CLOSE),
+        ];
+        for (i, (r, g)) in buttons.iter().enumerate() {
+            let hovered = v.button_hover == Some(i);
+            let close = i == 2;
+            if hovered {
+                self.fill(*r, if close { CLOSE_HOVER } else { p.row_hover });
             }
-            if item.enabled && hover == Some(Hit::Bar(i)) {
-                self.fill_rounded(r, m.radius, p.row_hover);
-            }
-            let fg = if !item.enabled {
-                p.text_faint
-            } else if item.on {
-                p.accent
-            } else {
+            let fg = if hovered && close {
+                (1.0, 1.0, 1.0)
+            } else if hovered {
                 p.text
+            } else {
+                p.text_muted
             };
-
-            // Glyph first, then the label, then the chevron — laid out left to
-            // right so an icon-only button centres its glyph in the whole
-            // button rather than in a notional icon column.
-            let glyph_w = if item.label.is_empty() { r.w } else { m.bar_btn_w };
-            self.glyph(item.glyph, Rect::new(r.x, r.y, glyph_w, r.h), fg);
-            if !item.label.is_empty() {
-                let chevron = if item.menu { m.pad * 2 } else { 0 };
-                let text = Rect::new(
-                    r.x + glyph_w,
-                    r.y,
-                    (r.w - glyph_w - chevron).max(0),
-                    r.h,
-                );
-                self.text(item.label, text, fg, &self.formats.small.clone());
-                if item.menu {
-                    self.glyph(
-                        glyph::CHEVRON_DOWN,
-                        Rect::new(r.right() - chevron, r.y, chevron, r.h),
-                        fg,
-                    );
-                }
-            }
+            self.glyph(g, *r, fg);
         }
     }
 
@@ -796,7 +838,7 @@ impl Renderer {
                 );
             }
             // Nothing has come back from the worker yet.
-            None => {
+            None if v.selected => {
                 self.text(
                     "Reading\u{2026}",
                     Rect::new(body.x, body.y + m.pad, body.w, line),
@@ -804,6 +846,7 @@ impl Renderer {
                     &self.formats.tiny.clone(),
                 );
             }
+            None => {}
         }
         self.pop_clip();
     }
@@ -1081,6 +1124,20 @@ impl Renderer {
                         v.hover,
                         Some(Hit::Sidebar(h)) | Some(Hit::SidebarChevron(h)) if h == i
                     );
+                    // A rule above every heading but the first, so the list
+                    // reads as sections rather than as one long column with
+                    // occasional small grey words in it.
+                    if i > 0 {
+                        self.fill(
+                            Rect::new(
+                                row.rect.x + m.pad,
+                                row.rect.y,
+                                (row.rect.w - m.pad * 2).max(0),
+                                1.max(m.scale as i32),
+                            ),
+                            p.divider,
+                        );
+                    }
                     let text_rect = Rect::new(
                         row.rect.x + m.pad,
                         row.rect.y,
@@ -1136,11 +1193,11 @@ impl Renderer {
                 }
 
                 SidebarEntry::Place { index } => {
-                    let Some((label, path)) = v.places.get(*index) else {
+                    let Some((label, path, key)) = v.places.get(*index) else {
                         continue;
                     };
                     let active = crate::pane::paths_equal(v.current_path, path);
-                    let key = icon_key_for_path(path);
+                    let key = key.clone();
                     let label = label.clone();
                     self.draw_sidebar_row(m, row.rect, i, v.hover, active, &key, &label, None);
                 }
@@ -1151,6 +1208,38 @@ impl Renderer {
         // Hairline between the sidebar and the panes.
         let edge = Rect::new(layout.sidebar.right() - 1, layout.sidebar.y, 1, layout.sidebar.h);
         self.fill(edge, p.divider);
+    }
+
+    /// The rounded plate a sidebar row sits on, and the accent tick that marks
+    /// the one you are looking at.
+    ///
+    /// Shared by a place, a drive and a folder, so all three say "you are here"
+    /// the same way instead of three flat greys that only differ by row height.
+    fn sidebar_pill(&mut self, m: Metrics, rect: Rect, active: bool, hovered: bool) -> Rect {
+        let p = self.palette();
+        let pill = Rect::new(
+            rect.x + m.pad / 2,
+            rect.y + 1,
+            (rect.w - m.pad).max(0),
+            (rect.h - 2).max(0),
+        );
+        if active {
+            self.fill_rounded(pill, m.radius, p.selection_inactive);
+            let tick_h = (pill.h / 2).max(8);
+            self.fill_rounded(
+                Rect::new(
+                    pill.x,
+                    pill.y + (pill.h - tick_h) / 2,
+                    3.max(m.scale as i32),
+                    tick_h,
+                ),
+                1.5,
+                p.accent,
+            );
+        } else if hovered {
+            self.fill_rounded(pill, m.radius, p.row_hover);
+        }
+        pill
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1167,16 +1256,7 @@ impl Renderer {
     ) {
         let p = self.palette();
         let hovered = hover == Some(Hit::Sidebar(index));
-        let pill = Rect::new(rect.x + m.pad / 2, rect.y, rect.w - m.pad, rect.h);
-
-        if active {
-            self.fill_rounded(pill, m.radius, p.selection_inactive);
-            // Accent stub marking the volume the focused pane is inside.
-            let bar = Rect::new(rect.x, rect.y + 3, 2.max(m.scale as i32), rect.h - 6);
-            self.fill(bar, p.accent);
-        } else if hovered {
-            self.fill_rounded(pill, m.radius, p.row_hover);
-        }
+        let pill = self.sidebar_pill(m, rect, active, hovered);
 
         // Two-line rows hang the icon off the first line; one-line rows centre it.
         let icon_y = match subtitle {
@@ -1226,12 +1306,7 @@ impl Renderer {
             hover,
             Some(Hit::Sidebar(h)) | Some(Hit::SidebarChevron(h)) if h == index
         );
-        let pill = Rect::new(rect.x + m.pad / 2, rect.y, rect.w - m.pad, rect.h);
-        if active {
-            self.fill_rounded(pill, m.radius, p.selection_inactive);
-        } else if hovered {
-            self.fill_rounded(pill, m.radius, p.row_hover);
-        }
+        let pill = self.sidebar_pill(m, rect, active, hovered);
 
         let indent = crate::layout::tree_indent(m, depth);
         let chevron = Rect::new(rect.x + m.pad / 2 + indent, rect.y, m.icon_size, rect.h);
@@ -1336,33 +1411,40 @@ impl Renderer {
 
     fn draw_tab_bar(&mut self, m: Metrics, v: &PaneView) {
         let p = self.palette();
-        self.fill(v.layout.tab_bar, p.tab_bar_bg);
+        // The whole top row of the pane, not just the part tabs are allowed
+        // in: for a pane on the top row the rest of it is the window's caption,
+        // which has to be the same colour or the strip reads as two strips.
+        let strip = Rect::new(
+            v.layout.bounds.x,
+            v.layout.tab_bar.y,
+            v.layout.bounds.w,
+            v.layout.tab_bar.h,
+        );
+        self.fill(strip, p.tab_bar_bg);
 
         for (i, t) in v.layout.tabs.clone().iter().enumerate() {
+            // Scrolled out of the strip: no rectangle, nothing to draw.
+            if t.full.is_empty() {
+                continue;
+            }
             let active = i == v.active_tab;
             let hovered = matches!(v.hover, Some(Hit::Tab(s, h)) | Some(Hit::TabClose(s, h)) if s == v.pid && h == i);
 
-            // The active tab is a card that sits on top of the toolbar below
-            // it; the inactive ones are flat. That, rather than a slightly
-            // different grey, is what makes the active one obvious at a glance.
-            let card = Rect::new(t.full.x + 1, t.full.y + 3, t.full.w - 2, t.full.h - 3);
+            // Flat: the active tab is the pane's own colour continuing up
+            // into the strip, so the tab and the listing under it read as one
+            // surface. Which pane has focus is said once, by the accent rule
+            // under the whole strip, rather than once per tab.
+            let card = Rect::new(t.full.x + 1, t.full.y + 2, t.full.w - 2, t.full.h - 2);
             if active {
-                self.fill_rounded(card, m.radius * 1.5, p.tab_active);
-                // Square off the bottom so the card joins the toolbar instead
-                // of floating above it.
+                self.fill_rounded(card, m.radius, p.tab_active);
+                // Square off the bottom so the tab joins the row below it
+                // instead of floating above it.
                 self.fill(
-                    Rect::new(card.x, card.bottom() - 6, card.w, 6),
+                    Rect::new(card.x, card.bottom() - m.radius as i32 - 1, card.w, m.radius as i32 + 1),
                     p.tab_active,
                 );
-                // Accent bar: which pane you are typing into, at a glance.
-                let bar_w = (card.w - m.pad * 2).max(8);
-                self.fill_rounded(
-                    Rect::new(card.x + (card.w - bar_w) / 2, card.y, bar_w, 2.max(m.scale as i32)),
-                    1.0,
-                    if v.focused { p.accent } else { p.text_faint },
-                );
             } else if hovered {
-                self.fill_rounded(card, m.radius * 1.5, p.tab_hover);
+                self.fill_rounded(card, m.radius, p.tab_hover);
             }
 
             let icon = Rect::new(
@@ -1398,7 +1480,8 @@ impl Renderer {
             // A hairline between two inactive tabs only. Beside the active
             // card it would cut into its rounded corner.
             let next_active = i + 1 == v.active_tab;
-            if !active && !next_active && i + 1 < v.layout.tabs.len() {
+            let next_shown = v.layout.tabs.get(i + 1).is_some_and(|n| !n.full.is_empty());
+            if !active && !next_active && next_shown {
                 let sep = Rect::new(t.full.right() - 1, t.full.y + 9, 1, t.full.h - 18);
                 self.fill(sep, p.divider);
             }
@@ -1415,14 +1498,9 @@ impl Renderer {
 
         // A hairline under the whole strip, broken where the active card meets
         // it, so the card reads as continuous with the toolbar.
-        let under = Rect::new(
-            v.layout.tab_bar.x,
-            v.layout.tab_bar.bottom() - 1,
-            v.layout.tab_bar.w,
-            1,
-        );
+        let under = Rect::new(strip.x, strip.bottom() - 1, strip.w, 1);
         self.fill(under, p.divider);
-        if let Some(t) = v.layout.tabs.get(v.active_tab) {
+        if let Some(t) = v.layout.tabs.get(v.active_tab).filter(|t| !t.full.is_empty()) {
             self.fill(
                 Rect::new(t.full.x + 1, under.y, (t.full.w - 2).max(0), 1),
                 p.tab_active,
@@ -1443,6 +1521,13 @@ impl Renderer {
                 v.can_forward,
             ),
             (v.layout.nav_up, NavButton::Up, glyph::UP, v.can_up),
+            (v.layout.nav_home, NavButton::Home, glyph::HOME, true),
+            (
+                v.layout.nav_pin,
+                NavButton::Pin,
+                if v.pinned { glyph::UNPIN } else { glyph::PIN },
+                true,
+            ),
         ];
         for (rect, which, g, enabled) in buttons {
             let hovered = v.hover == Some(Hit::Nav(v.pid, which));
@@ -1452,12 +1537,24 @@ impl Renderer {
             // A disabled control that looks enabled is worse than no control.
             let c = if !enabled {
                 p.text_faint
+            } else if which == NavButton::Pin && v.pinned {
+                p.accent
             } else if hovered {
                 p.text
             } else {
                 p.text_muted
             };
             self.glyph(g, rect, c);
+        }
+
+        // Everything the command bar used to hold, for this pane.
+        if !v.layout.overflow.is_empty() {
+            let hovered = v.hover == Some(Hit::Overflow(v.pid));
+            if hovered {
+                self.fill_rounded(v.layout.overflow.inset(2, 4), m.radius, p.row_hover);
+            }
+            let c = if hovered { p.text } else { p.text_muted };
+            self.text(MORE, v.layout.overflow, c, &self.formats.centered.clone());
         }
 
         // Belt and braces: the layout already fits the crumbs, and this makes
@@ -1670,9 +1767,20 @@ impl Renderer {
             // to be scanned, not read.
             let missing = v.other_names.is_some_and(|o| !o.contains(&entry.name));
             let differs = v.list.differing.contains(&entry.name);
-            if missing || differs {
+            // A duplicate listing marks the same edge, in the same shape, but
+            // it alternates: what the bar says there is not "this row is
+            // special" but "this row and the one above are the same finding".
+            // Two neighbouring groups of one colour would read as one group.
+            let group = v.list.groups.get(&entry.name).copied();
+            if missing || differs || group.is_some() {
                 let bar = Rect::new(r.x, r.y + 2, 3.max(m.scale as i32), r.h - 4);
-                self.fill_rounded(bar, 1.5, if differs { p.capacity_full } else { p.accent });
+                let colour = match group {
+                    Some(g) if g % 2 == 0 => p.accent,
+                    Some(_) => p.capacity_fill,
+                    None if differs => p.capacity_full,
+                    None => p.accent,
+                };
+                self.fill_rounded(bar, 1.5, colour);
             }
 
             if let Some((icon, name)) = v.layout.cell_parts(row, v.list.scroll_px(), m) {
@@ -1782,39 +1890,45 @@ impl Renderer {
         self.fill_rounded(thumb, thumb.w as f32 / 2.0, c);
     }
 
+    /// The filter box, at the left end of the footer.
+    fn draw_filter(&mut self, m: Metrics, v: &PaneView) {
+        let p = self.palette();
+        let f = v.layout.filter;
+        if f.is_empty() {
+            return;
+        }
+        let hovered = v.hover == Some(Hit::Filter(v.pid));
+        self.fill_rounded(f, m.radius, p.field_bg);
+        if v.filter_focused {
+            self.stroke_rounded(f, m.radius, p.accent, 1.0);
+        } else if hovered {
+            self.stroke_rounded(f, m.radius, p.divider, 1.0);
+        }
+
+        let gi = Rect::new(f.x + 2, f.y, m.icon_size, f.h);
+        self.glyph(glyph::FILTER, gi, p.text_faint);
+
+        let text_rect = Rect::new(gi.right(), f.y, (f.right() - gi.right() - m.pad / 2).max(0), f.h);
+        let filter = v.list.filter();
+        if filter.is_empty() {
+            self.text("Filter\u{2026}", text_rect, p.text_faint, &self.formats.tiny.clone());
+        } else {
+            let shown = if v.filter_focused {
+                format!("{}|", filter)
+            } else {
+                filter.to_string()
+            };
+            self.text(&shown, text_rect, p.text, &self.formats.tiny.clone());
+        }
+    }
+
     fn draw_footer(&mut self, m: Metrics, v: &PaneView) {
         let p = self.palette();
         self.fill(v.layout.footer, p.footer_bg);
         let top = Rect::new(v.layout.footer.x, v.layout.footer.y, v.layout.footer.w, 1);
         self.fill(top, p.divider);
 
-        // Filter field.
-        let f = v.layout.filter;
-        if !f.is_empty() {
-            let hovered = v.hover == Some(Hit::Filter(v.pid));
-            self.fill_rounded(f, m.radius, p.field_bg);
-            if v.filter_focused {
-                self.stroke_rounded(f, m.radius, p.accent, 1.0);
-            } else if hovered {
-                self.stroke_rounded(f, m.radius, p.divider, 1.0);
-            }
-
-            let gi = Rect::new(f.x + 2, f.y, m.icon_size, f.h);
-            self.glyph(glyph::FILTER, gi, p.text_faint);
-
-            let text_rect = Rect::new(gi.right(), f.y, (f.right() - gi.right() - m.pad / 2).max(0), f.h);
-            let filter = v.list.filter();
-            if filter.is_empty() {
-                self.text("Filter\u{2026}", text_rect, p.text_faint, &self.formats.tiny.clone());
-            } else {
-                let shown = if v.filter_focused {
-                    format!("{}|", filter)
-                } else {
-                    filter.to_string()
-                };
-                self.text(&shown, text_rect, p.text, &self.formats.tiny.clone());
-            }
-        }
+        self.draw_filter(m, v);
 
         let counts = Rect::new(
             v.layout.counts.x,

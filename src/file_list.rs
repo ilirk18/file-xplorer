@@ -56,6 +56,13 @@ pub struct FileList {
     /// Names that a content comparison found to differ from the other pane.
     /// Empty until "Compare contents" is run, and cleared on navigation.
     pub differing: HashSet<String>,
+    /// Which duplicate group each name belongs to, when the listing is the
+    /// result of a duplicate scan. Empty otherwise.
+    ///
+    /// A side map keyed by name, like `differing` and `dir_sizes`, rather than
+    /// a field on `FileEntry`: every listing in the app would carry it, and
+    /// only this one ever has anything to put in it.
+    pub groups: HashMap<String, u32>,
     /// Bumped whenever the visible entries change — a new listing, a filter, a
     /// sort. What lets the accessibility snapshot skip rebuilding a hundred
     /// thousand names when only the cursor moved.
@@ -94,6 +101,7 @@ impl Default for FileList {
             filter: String::new(),
             dir_sizes: HashMap::new(),
             differing: HashSet::new(),
+            groups: HashMap::new(),
             revision: 0,
             scroll_offset: 0,
             scroll_frac: 0,
@@ -478,6 +486,8 @@ impl FileList {
     pub fn set_entries(&mut self, entries: Vec<FileEntry>) {
         // A comparison belongs to the listing it was run on.
         self.differing.clear();
+        // And so does a duplicate scan.
+        self.groups.clear();
         // So does a folder size. They are keyed by name, and two folders in
         // two places can share one \u2014 which showed the old folder's size
         // against the new folder's name.
@@ -585,6 +595,13 @@ impl FileList {
         self.rebuild_preserving_selection();
     }
 
+    /// Record which duplicate group each of these names is in. Merged, because
+    /// a scan streams its findings in and a later batch must not erase an
+    /// earlier one.
+    pub fn set_groups(&mut self, groups: Vec<(String, u32)>) {
+        self.groups.extend(groups);
+    }
+
     /// Rebuild the visible list from `all`: hidden pass, filter pass, sort.
     fn rebuild(&mut self) {
         // The one place the visible entries are produced, so the one place
@@ -626,7 +643,7 @@ impl FileList {
 
 /// Compare names the way a person reads them, so `file2` sorts before `file10`.
 /// Falls back to case-insensitive lexicographic for everything else.
-fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let mut ai = a.chars().peekable();
     let mut bi = b.chars().peekable();

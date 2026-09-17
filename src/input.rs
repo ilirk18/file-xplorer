@@ -82,6 +82,11 @@ pub fn on_mouse_move(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             invalidate(hwnd);
             return;
         }
+        Drag::PanelEdge { sidebar } => {
+            state.set_panel_width(sidebar, x);
+            invalidate(hwnd);
+            return;
+        }
         Drag::Column { key, start_x, start_w } => {
             if let Some(i) = AppState::col_index(key) {
                 // The edge being dragged is the column's *left* one, so moving
@@ -212,9 +217,21 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             unsafe { SetCapture(hwnd) };
         }
 
-        Hit::Bar(i) => {
-            let rect = state.layout().bar_items.get(i).copied().unwrap_or_default();
-            do_bar(state, hwnd, i, rect);
+        Hit::Inspector => {}
+
+        Hit::PanelEdge { sidebar } => {
+            state.drag = Drag::PanelEdge { sidebar };
+            unsafe { SetCapture(hwnd) };
+        }
+
+        Hit::SidebarToggle => {
+            crate::commands::run_command(state, hwnd, crate::commands::CMD_TOGGLE_SIDEBAR);
+        }
+
+        // Everything the command bar used to hold, for the pane it hangs off.
+        Hit::Overflow(pid) => {
+            state.focused = pid;
+            crate::commands::do_settings(state, hwnd);
         }
 
         Hit::Sidebar(i) => on_sidebar_click(state, hwnd, i, false),
@@ -225,10 +242,21 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
 
         Hit::Nav(pid, which) => {
             state.focused = pid;
+            // Home and Pin run the commands the palette and the menu run, so
+            // there is still one implementation of each.
+            let cmd = match which {
+                NavButton::Home => Some(crate::commands::CMD_GO_HOME),
+                NavButton::Pin => Some(crate::commands::CMD_PIN),
+                _ => None,
+            };
+            if let Some(cmd) = cmd {
+                crate::commands::run_command(state, hwnd, cmd);
+                return;
+            }
             let req = match which {
                 NavButton::Back => state.pane_mut(pid).go_back(),
                 NavButton::Forward => state.pane_mut(pid).go_forward(),
-                NavButton::Up => state.pane_mut(pid).navigate_up(),
+                _ => state.pane_mut(pid).navigate_up(),
             };
             start_load(hwnd, pid, req);
         }
@@ -825,9 +853,9 @@ pub fn set_pane_count(state: &mut AppState, n: usize) {
 pub fn update_title(state: &mut AppState, hwnd: HWND) {
     let path = state.focused_pane().current_path();
     let title = if path.is_empty() {
-        "File Xplorer".to_string()
+        "Jamb".to_string()
     } else {
-        format!("{} - File Xplorer", fs::path_leaf(path))
+        format!("{} - Jamb", fs::path_leaf(path))
     };
     if title == state.last_title {
         return;

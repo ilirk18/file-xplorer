@@ -1,4 +1,4 @@
-// File Xplorer, a file manager for Windows.
+// Jamb, a file manager for Windows.
 // Copyright (C) 2026 ilirk18
 //
 // This program is free software: you can redistribute it and/or modify it
@@ -36,6 +36,7 @@ mod config;
 mod default_app;
 mod dialog;
 mod dnd;
+mod duplicates;
 mod file_list;
 mod fs;
 mod icons;
@@ -65,7 +66,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -138,8 +139,8 @@ fn start_path_from_args() -> Option<String> {
 pub fn create_window(opts: WindowOpts) -> Result<HWND> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
-        let class_name = wide("FileXplorerWindow");
-        let title = wide("File Xplorer");
+        let class_name = wide("JambWindow");
+        let title = wide("Jamb");
         let cfg = Config::load();
 
         // Restore the saved box, but only if it still lands on a monitor: a
@@ -202,6 +203,17 @@ pub fn create_window(opts: WindowOpts) -> Result<HWND> {
             Some(LPARAM(load_app_icon(instance.into(), 16).0 as isize)),
         );
 
+        // The frame was sized before WM_NCCALCSIZE had a window to ask about,
+        // so make it recalculate now that there is one.
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         let _ = ShowWindow(hwnd, if maximize { SW_SHOWMAXIMIZED } else { SW_SHOW });
         let _ = UpdateWindow(hwnd);
         Ok(hwnd)
@@ -241,7 +253,7 @@ fn main() -> Result<()> {
         let _ = OleInitialize(None);
 
         let instance = GetModuleHandleW(None)?;
-        let class_name = wide("FileXplorerWindow");
+        let class_name = wide("JambWindow");
         // Resource id 1 is the sash icon compiled in from app.rc.
         let icon_big = load_app_icon(instance.into(), 0);
         let icon_sm = load_app_icon(instance.into(), 16);
@@ -421,6 +433,107 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     }
 }
 
+/// How thick the resize frame is, at this window's DPI.
+///
+/// The same number Windows uses for its own border, so grabbing an edge feels
+/// the way it does on every other window.
+fn frame_thickness(hwnd: HWND) -> i32 {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi)
+            + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    }
+}
+
+/// The usable part of the monitor this window is on: the screen less the
+/// taskbar. What a maximized window's client area should be.
+///
+/// ponytail: an auto-hiding taskbar has no work area of its own, so a window
+/// maximized over one covers the strip that reveals it. Leave a pixel back on
+/// that edge if it ever matters.
+fn work_area(hwnd: HWND) -> Option<RECT> {
+    unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(mon, &mut info).as_bool().then_some(info.rcWork)
+    }
+}
+
+/// Which window button a non-client hit code means: 0 minimise, 1 maximise,
+/// 2 close.
+fn caption_button(hit: u32) -> Option<usize> {
+    match hit {
+        HTMINBUTTON => Some(0),
+        HTMAXBUTTON => Some(1),
+        HTCLOSE => Some(2),
+        _ => None,
+    }
+}
+
+/// What the pointer is over, in the terms the frame speaks.
+///
+/// The resize edges come first, then the three buttons, then the caption. A
+/// button reports itself as one of the frame's own so that Windows 11 still
+/// offers its snap layouts when the pointer rests on maximise — the click
+/// comes back as `WM_NCLBUTTONUP`, which is where it is acted on.
+fn nc_hit(state: &AppState, hwnd: HWND, lparam: LPARAM) -> u32 {
+    let mut pt = POINT {
+        x: (lparam.0 & 0xFFFF) as u16 as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32,
+    };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+    let layout = state.layout();
+    let client = state.client;
+    // A maximized window has no edge to drag.
+    if !unsafe { IsZoomed(hwnd).as_bool() } {
+        let f = frame_thickness(hwnd);
+        let (l, r) = (pt.x < client.x + f, pt.x >= client.right() - f);
+        let (t, b) = (pt.y < client.y + f, pt.y >= client.bottom() - f);
+        // Corners before edges, or a corner would only ever resize one way.
+        let corner = match (t, b, l, r) {
+            (true, _, true, _) => Some(HTTOPLEFT),
+            (true, _, _, true) => Some(HTTOPRIGHT),
+            (_, true, true, _) => Some(HTBOTTOMLEFT),
+            (_, true, _, true) => Some(HTBOTTOMRIGHT),
+            _ => None,
+        };
+        if let Some(c) = corner {
+            return c;
+        }
+        // The top edge after the corners but before the buttons: a few pixels
+        // of a button's top being a resize grip is what every tabbed window on
+        // the desktop does, and the alternative is a window with no top edge.
+        match (t, b, l, r) {
+            (true, ..) => return HTTOP,
+            (_, true, ..) => return HTBOTTOM,
+            (_, _, true, _) => return HTLEFT,
+            (.., true) => return HTRIGHT,
+            _ => {}
+        }
+    }
+    if layout.win_close.contains(pt.x, pt.y) {
+        return HTCLOSE;
+    }
+    if layout.win_max.contains(pt.x, pt.y) {
+        return HTMAXBUTTON;
+    }
+    if layout.win_min.contains(pt.x, pt.y) {
+        return HTMINBUTTON;
+    }
+    // Blank space in the caption row is the window's handle. A tab, the
+    // toggle or the new-tab button all hit-test to something, so only what is
+    // left over drags the window.
+    if pt.y < layout.caption.bottom() && layout.hit_test(pt.x, pt.y) == Hit::Nothing {
+        return HTCAPTION;
+    }
+    HTCLIENT
+}
+
 /// Returns None for messages we do not handle, so the caller falls through to
 /// DefWindowProc. Keeping that decision in one place avoids the easy mistake of
 /// swallowing a message by returning LRESULT(0) from an unhandled arm.
@@ -550,13 +663,26 @@ fn handle(
         }
 
         WM_SETCURSOR => {
-            // Only override inside the client area, and only over the divider.
+            // Only override inside the client area, and only over an edge
+            // something can be dragged by. A divider that stacks two panes is
+            // pulled up and down, so it cannot show the same arrows as one
+            // that puts them side by side; a side panel's edge is always
+            // vertical.
             if (lparam.0 as u32 & 0xFFFF) == HTCLIENT as u32 {
-                let over_divider = matches!(state.hover, Some(Hit::Divider(_)))
-                    || matches!(state.drag, Drag::Divider { .. });
-                if over_divider {
+                let sideways = |i: usize| {
+                    state.layout().dividers.get(i).map(|d| d.vertical).unwrap_or(true)
+                };
+                let vertical = match (state.hover, state.drag) {
+                    (_, Drag::Divider { index, .. }) => Some(sideways(index)),
+                    (_, Drag::PanelEdge { .. }) => Some(true),
+                    (Some(Hit::Divider(i)), _) => Some(sideways(i)),
+                    (Some(Hit::PanelEdge { .. }), _) => Some(true),
+                    _ => None,
+                };
+                if let Some(vertical) = vertical {
+                    let want = if vertical { IDC_SIZEWE } else { IDC_SIZENS };
                     unsafe {
-                        if let Ok(c) = LoadCursorW(None, IDC_SIZEWE) {
+                        if let Ok(c) = LoadCursorW(None, want) {
                             SetCursor(Some(c));
                         }
                     }
@@ -566,8 +692,81 @@ fn handle(
             None
         }
 
+        // The client area covers the caption — that is what puts the tab bars
+        // up there — so everything the frame used to do for us is done by hand
+        // below: the resize edges, the drag area, and the three buttons.
+        WM_NCCALCSIZE if wparam.0 != 0 => {
+            // A maximized window is deliberately larger than the monitor, so
+            // that its frame falls off every edge. Keeping the whole of it
+            // would push the caption and its tabs off the top of the screen.
+            // The work area is the answer exactly, overhang and taskbar both,
+            // where a guess from the frame metrics is only usually right.
+            if unsafe { IsZoomed(hwnd).as_bool() } {
+                if let Some(work) = work_area(hwnd) {
+                    let p = unsafe { &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS) };
+                    p.rgrc[0] = work;
+                }
+            }
+            Some(LRESULT(0))
+        }
+
+        WM_NCHITTEST => Some(LRESULT(nc_hit(state, hwnd, lparam) as isize)),
+
+        WM_NCMOUSEMOVE => {
+            let want = caption_button(wparam.0 as u32);
+            if state.caption_hover != want {
+                state.caption_hover = want;
+                invalidate(hwnd);
+            }
+            if want.is_some() {
+                // Leaving by the top edge of the screen produces no further
+                // message of its own, so ask for one.
+                let mut t = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE | TME_NONCLIENT,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                unsafe {
+                    let _ = TrackMouseEvent(&mut t);
+                }
+            }
+            None
+        }
+
+        WM_NCMOUSELEAVE => {
+            if state.caption_hover.take().is_some() {
+                invalidate(hwnd);
+            }
+            None
+        }
+
+        // Swallowed so DefWindowProc does not draw the frame's own buttons
+        // over ours; the click acts on the way up, like every other button.
+        WM_NCLBUTTONDOWN if caption_button(wparam.0 as u32).is_some() => Some(LRESULT(0)),
+
+        WM_NCLBUTTONUP if caption_button(wparam.0 as u32).is_some() => {
+            match wparam.0 as u32 {
+                HTMINBUTTON => unsafe {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                },
+                HTMAXBUTTON => unsafe {
+                    let zoomed = IsZoomed(hwnd).as_bool();
+                    let _ = ShowWindow(hwnd, if zoomed { SW_RESTORE } else { SW_MAXIMIZE });
+                },
+                _ => unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                },
+            }
+            Some(LRESULT(0))
+        }
+
         WM_MOUSEMOVE => {
             let (x, y) = mouse_pos(lparam);
+            // The pointer is in the client area, so it is on none of them.
+            if state.caption_hover.take().is_some() {
+                invalidate(hwnd);
+            }
             if !state.mouse_tracking {
                 let mut t = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -954,6 +1153,52 @@ fn handle(
             Some(LRESULT(0))
         }
 
+        WM_APP_DUPES_BATCH => {
+            let msg = unsafe { Box::from_raw(lparam.0 as *mut app::DupesBatch) };
+            let app::DupesBatch { pid, tab_id, batch } = *msg;
+            let (generation, done, truncated) = (batch.generation, batch.done, batch.truncated);
+            let added = batch.groups.len() as u32;
+            let reclaimable: u64 = batch.groups.iter().map(|g| g.reclaimable()).sum();
+
+            // Numbered on from what the listing already holds, not from zero.
+            let base = state
+                .pane_mut(pid)
+                .tab_mut(tab_id)
+                .map_or(0, |t| t.dup_groups);
+            let (entries, groups) = duplicates::rows(batch.groups, base);
+            let files = entries.len();
+
+            // The same generation check every streamed result goes through, so
+            // navigating away mid-scan drops what is still arriving.
+            let applied = state
+                .pane_mut(pid)
+                .finish_search_batch(tab_id, generation, entries, done);
+            let summary = applied
+                .then(|| state.pane_mut(pid).tab_mut(tab_id))
+                .flatten()
+                .and_then(|tab| {
+                    tab.file_list.set_groups(groups);
+                    tab.dup_groups += added;
+                    tab.dup_files += files;
+                    tab.dup_bytes += reclaimable;
+                    done.then(|| {
+                        duplicates::summary(
+                            tab.dup_groups,
+                            tab.dup_files,
+                            tab.dup_bytes,
+                            truncated,
+                        )
+                    })
+                });
+            if let Some(summary) = summary {
+                state.status_override = Some(summary);
+            }
+            if applied {
+                invalidate(hwnd);
+            }
+            Some(LRESULT(0))
+        }
+
         WM_APP_SIZES_DONE => {
             let done = unsafe { Box::from_raw(lparam.0 as *mut SizesDone) };
             // Whatever it was for, the inspector's slot is free again: this is
@@ -1052,6 +1297,9 @@ fn split_off_tab(
     };
     let req = state.pane_mut(fresh).adopt_tab(tab);
     start_load(hwnd, fresh, req);
+    // The split handed over a pane already showing the folder it came from.
+    // The dropped tab is what this pane is for, so the other one goes.
+    let _ = state.pane_mut(fresh).close_tab(0);
     state.focused = fresh;
     state.rewatch(drag.from, hwnd);
     state.rewatch(fresh, hwnd);
@@ -1139,15 +1387,30 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     let drives = state.drives.clone();
     // Pinned folders sit after the standard ones and share their indices, so
     // the sidebar entries the layout built still line up with this list.
-    let places: Vec<(String, String)> = state
+    let places: Vec<(String, String, String)> = state
         .places
         .iter()
-        .map(|p| (p.label.clone(), p.path.clone()))
-        .chain(state.pins.iter().map(|p| (fs::path_leaf(p), p.clone())))
+        .map(|p| {
+            (
+                p.label.clone(),
+                p.path.clone(),
+                icons::icon_key_for_path(&p.path),
+            )
+        })
+        .chain(
+            state
+                .pins
+                .iter()
+                .map(|p| (fs::path_leaf(&p.path), p.path.clone(), p.icon_key())),
+        )
         .collect();
     let tree_rows = state.tree_rows.clone();
     let visible: Vec<PaneId> = state.visible().collect();
     let counts: Vec<String> = visible.iter().map(|p| state.counts_text(*p)).collect();
+    let pinned: Vec<bool> = visible
+        .iter()
+        .map(|p| state.is_pinned(state.pane(*p).current_path()))
+        .collect();
     // Compare mode diffs each pane against the one to its right, wrapping. With
     // two panes that is exactly "the other pane".
     let comparing = state.compare && state.pane_count() > 1;
@@ -1158,36 +1421,36 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     };
     update_title(state, hwnd);
 
-    // Built before the destructure, for the same reason the inspector's facts
-    // are: both read the focused pane, which `panes` would otherwise be holding.
-    let bar_views: Vec<renderer::BarButtonView> = commands::BAR
-        .iter()
-        .map(|b| {
-            let (on, glyph) = commands::bar_state(state, b.action);
-            renderer::BarButtonView {
-                glyph: if on { glyph } else { b.glyph },
-                label: b.label,
-                menu: matches!(b.action, commands::BarAction::Menu(_)),
-                enabled: commands::bar_enabled(state, b.action),
-                on,
-            }
-        })
-        .collect();
-
     // Built before the destructure: it reads the focused pane's cursor entry,
     // which `panes` would otherwise be holding.
+    let has_cursor = state.focused_pane().list().cursor_entry().is_some();
     let inspector = {
-        let entry = state.focused_pane().list().cursor_entry();
-        InspectorView {
-            name: entry.map(|e| e.name.clone()),
-            kind: entry.map(|e| e.type_display()).unwrap_or_default(),
-            size: entry.map(|e| e.size_display()).unwrap_or_default(),
-            modified: entry.map(|e| e.date_display()).unwrap_or_default(),
+        let pane = state.focused_pane();
+        match pane.list().cursor_entry() {
+            Some(e) => InspectorView {
+                name: Some(e.name.clone()),
+                kind: e.type_display(),
+                size: e.size_display(),
+                modified: e.date_display(),
+            },
+            // Nothing picked out. The folder you are standing in is what the
+            // panel is about then — a panel whose only content is a sentence
+            // saying it has no content reads as broken rather than as empty.
+            None => InspectorView {
+                name: Some(fs::path_leaf(pane.current_path())),
+                kind: state.counts_text(state.focused),
+                size: String::new(),
+                modified: String::new(),
+            },
         }
     };
 
     // Destructure so the renderer can be borrowed mutably while the panes are
     // borrowed immutably. Borrowing through `state` would conflict.
+    let sidebar_visible = state.sidebar_visible;
+    let caption_hover = state.caption_hover;
+    let maximized = unsafe { IsZoomed(hwnd).as_bool() };
+
     let AppState {
         renderer,
         panes,
@@ -1200,7 +1463,6 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     let icons = *icons;
 
     renderer.begin();
-    renderer.draw_command_bar(&layout, &bar_views, hover);
     renderer.draw_sidebar(
         &layout,
         &SidebarView {
@@ -1221,6 +1483,7 @@ fn paint(state: &mut AppState, hwnd: HWND) {
             size: inspector.size,
             modified: inspector.modified,
             preview: preview.as_ref().map(|(k, p)| (k.as_str(), p)),
+            selected: has_cursor,
         },
     );
 
@@ -1245,6 +1508,7 @@ fn paint(state: &mut AppState, hwnd: HWND) {
             can_back: pane.active().can_go_back(),
             can_forward: pane.active().can_go_forward(),
             can_up: fs::path_parent(pane.current_path()).is_some(),
+            pinned: pinned[i],
             filter_focused: filter_focus == Some(pid),
             renaming: renaming.filter(|(p, _)| *p == pid).map(|(_, row)| row),
             multi: multi_rename.as_ref().filter(|m| m.pid == pid),
@@ -1256,6 +1520,18 @@ fn paint(state: &mut AppState, hwnd: HWND) {
         };
         renderer.draw_pane(layout.metrics, &view);
     }
+
+    // After the panes: they paint their tab bars into the caption, so the
+    // window's own furniture up there has to go on last or it is painted over.
+    renderer.draw_caption(
+        &layout,
+        &renderer::CaptionView {
+            sidebar_visible,
+            maximized,
+            hover,
+            button_hover: caption_hover,
+        },
+    );
 
     if let Some(r) = drop_target {
         renderer.draw_drop_target(r, layout.metrics);

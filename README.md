@@ -1,7 +1,7 @@
-# File Xplorer
+# Jamb
 
 A fast, native, multi-pane file manager for Windows. Win32 + Direct2D, no
-runtime, no framework, ~500 KB.
+runtime, no framework, under a megabyte.
 
 **Full context and phase docs:** see **[docs/INDEX.md](docs/INDEX.md)**.
 
@@ -18,7 +18,7 @@ runtime, no framework, ~500 KB.
 cargo run --release
 ```
 
-The executable lands at `target/release/file-xplorer.exe`. It is self-contained:
+The executable lands at `target/release/jamb.exe`. It is self-contained:
 no installer, no DLLs to ship.
 
 ### If `cargo` is not recognised
@@ -87,7 +87,10 @@ on: the shell's own thumbnail for an image, video, PDF or Office file — the
 same call Explorer makes, so whatever handler is installed does the work — or
 the first 64 KB of anything that reads as text, UTF-16 included. Built on a
 worker thread, never on the UI thread, and a result whose file is no longer
-selected is dropped rather than shown against the wrong name.
+selected is dropped rather than shown against the wrong name. With nothing
+selected it describes the folder you are standing in instead, because a panel
+whose only content is a sentence saying it has none reads as broken.
+Right-clicking it opens the menu for whatever it is describing.
 
 **Peek into a folder.** With the inspector open, putting the cursor on a folder
 lists what is inside it without going in — folders first, marked with a
@@ -114,17 +117,28 @@ Movement is not rebindable: arrows, Page Up and Down, Home, End, Tab and
 type-ahead mean different things with Shift and Ctrl held, and that is not
 something a settings file should try to describe.
 
-**Opens where you point it.** `file-xplorer.exe C:\someolder` starts there
+**Opens where you point it.** `jamb.exe C:\someolder` starts there
 rather than restoring the session, and a path to a *file* opens the folder
 holding it — which is what dragging a file onto the exe means. `Ctrl+N` opens a
 second window on the current folder. The session belongs to the first window;
 the others are passing through and do not overwrite its tabs.
 
-**A command bar,** off the same commands as everything else. New, Cut, Copy,
-Paste, Rename and Delete act on the focused pane and grey out when they would
-not work; Sort and View drop menus; `...` is the palette and `Details` is the
-inspector. It is a second way to reach the commands, never a second
-implementation of them — "Toggle command bar" in the palette hides it.
+**Two rows of chrome, not four.** The window has no system title bar: the
+client area runs up to the top edge, and the panes on the top row put their tab
+strips there, beside the app icon, the sidebar toggle and the window buttons.
+Empty space in that strip drags the window, the edges still resize it, and
+hovering Maximise still offers Windows' snap layouts.
+
+**An overflow menu per pane.** The `⋮` at the right end of a breadcrumb row
+opens New, Cut, Copy, Paste, Rename, Delete, Share, Sort, View and every
+setting, acting on the pane it hangs off. Entries grey out when they would not
+work. The same row carries Home and a pin toggle, which lights up when the
+folder showing is already pinned. It is a second way to reach the commands,
+never a second implementation of them.
+
+**Resizable side panels.** Drag the sidebar's right edge or the inspector's
+left one. The width is kept in DIPs, so the same settings file opens at the
+same apparent width on a monitor of a different scale.
 
 **Command palette.** `Ctrl+Shift+P` finds any command by initials, so nothing
 is hidden behind a chord you have to remember.
@@ -136,6 +150,31 @@ that matches nothing literally falls back to subsequence matching, so `gtd`
 finds `get_tree_depth.rs`.
 `Ctrl+Shift+G` searches inside files instead of names, decoding UTF-8 and
 UTF-16 and skipping anything binary.
+
+**Pinned places, with your own icons.** *Pin or unpin this folder* pins where
+you are; *Pin or unpin a path…* pins somewhere you are not, which is how a
+network share gets into the sidebar without mounting it first — the prompt
+carries the shell's own completion, so `\server\share` completes as any path
+does. A pin can name its own icon the way Windows always has, as `file,index`
+before a `|`:
+
+```
+pin=shell32.dll,4|\nas\media
+pin=imageres.dll,3|C:\work
+```
+
+The same text works in the prompt. Any file holding icons will do — a `.dll`,
+an `.exe`, or an `.ico`, whose index may be left off.
+
+**Duplicate finder.** *Find duplicate files* walks the folder and everything
+under it and lists every file that has a byte-identical twin somewhere in the
+tree, grouped, biggest first, with a bar down the left edge that alternates
+colour so you can see where one group ends and the next begins. The footer says
+how many copies are redundant and what deleting them would give back. Size
+first, bytes second: two files of different lengths cannot be copies, so only
+files whose size already collides are ever read — which is what makes it
+affordable on a real disk. Empty files are left out, being identical to each
+other and to nothing that matters.
 
 **Undo.** `Ctrl+Z` takes back the last copy, move, rename, batch rename or new
 folder. What has no honest inverse says so: a delete belongs to the Recycle
@@ -178,7 +217,7 @@ without a refresh.
 **Sidebar** with drives (label, free/total, and a capacity bar that turns amber
 past 90%) and your standard folders, each with its real shell icon.
 
-**Themes.** Dark and light, including the title bar. On first run the app takes
+**Themes.** Dark and light, including the window border. On first run the app takes
 whichever Windows itself is set to; after that `Ctrl+Shift+D` decides and is
 remembered. Both palettes are tested to clear WCAG AA contrast for body and
 secondary text.
@@ -229,6 +268,8 @@ These are the defaults; "Change a shortcut" in the palette rebinds any of them.
 | Command palette | `Ctrl+Shift+P` |
 | Search in this folder and below | `Ctrl+Shift+F` |
 | Search inside files | `Ctrl+Shift+G` |
+| Find duplicate files | palette, or right-click the folder |
+| Pin or unpin a path | palette |
 | Go to a typed path | `Ctrl+L`, or "Recent folders" in the palette |
 | Copy the selection's paths | `Ctrl+Shift+C` |
 | Undo the last operation | `Ctrl+Z` |
@@ -277,6 +318,7 @@ These are the defaults; "Change a shortcut" in the palette rebinds any of them.
 | `src/config.rs` | Settings file load/save |
 | `src/palette.rs` | Command palette and its fuzzy matcher |
 | `src/search.rs` | Recursive name and content search |
+| `src/duplicates.rs` | Finding files with identical contents under one folder |
 | `src/menu.rs` | Owner-drawn context menu entries |
 | `src/tree.rs` | The sidebar's folder tree |
 | `src/archive.rs` | Browsing inside archives, via 7-Zip |
@@ -322,10 +364,10 @@ hit-tests back to itself.**
 ## Size
 
 ```powershell
-(Get-Item target\release\file-xplorer.exe).Length / 1MB
+(Get-Item target\release\jamb.exe).Length / 1MB
 ```
 
-Currently ~0.50 MB against a 3 MB budget.
+Currently ~0.96 MB against a 3 MB budget.
 
 ---
 

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 set "CARGO=%USERPROFILE%\.cargo\bin\cargo.exe"
-set "EXE=target\release\file-xplorer.exe"
+set "EXE=target\release\jamb.exe"
 
 if not exist "%CARGO%" (
     echo Rust not found at %CARGO%
