@@ -21,15 +21,19 @@ pub struct FileEntry {
     /// Junction, symlink, or other reparse point. Listed, but never recursed into.
     pub is_reparse: bool,
     pub is_hidden: bool,
+    /// True once a folder's size has been calculated on demand. Until then a
+    /// directory shows no size at all, because guessing one would be a lie.
+    pub dir_size_known: bool,
     /// Lowercased, with the leading dot (".txt"). None for directories and
     /// extensionless files. Doubles as the icon-cache key.
     pub extension: Option<String>,
 }
 
 impl FileEntry {
-    /// Display string for the Size column. Directories show nothing.
+    /// Display string for the Size column. Directories show nothing until
+    /// their size has been calculated.
     pub fn size_display(&self) -> String {
-        if self.is_dir {
+        if self.is_dir && !self.dir_size_known {
             String::new()
         } else {
             format_size(self.size)
@@ -112,6 +116,7 @@ pub fn list_dir(path: &str) -> Result<Vec<FileEntry>, std::io::Error> {
                 is_reparse: (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0,
                 is_hidden: (attrs & FILE_ATTRIBUTE_HIDDEN.0) != 0
                     || (attrs & FILE_ATTRIBUTE_SYSTEM.0) != 0,
+                dir_size_known: false,
                 extension,
             });
         }
@@ -274,12 +279,36 @@ pub struct Drive {
     pub root: String,
     /// Volume label, or a sensible fallback like "Local Disk".
     pub label: String,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
 }
 
 impl Drive {
     /// `Windows (C:)`, matching Explorer's own formatting.
     pub fn display(&self) -> String {
         format!("{} ({})", self.label, self.root.trim_end_matches('\\'))
+    }
+
+    /// Fraction of the volume in use, for the sidebar capacity bar.
+    /// None when the size is unknown, so the bar is simply not drawn.
+    pub fn used_fraction(&self) -> Option<f32> {
+        if self.total_bytes == 0 {
+            return None;
+        }
+        let used = self.total_bytes.saturating_sub(self.free_bytes);
+        Some((used as f64 / self.total_bytes as f64).clamp(0.0, 1.0) as f32)
+    }
+
+    /// `284 GB free of 931 GB`, shown under the label.
+    pub fn capacity_text(&self) -> String {
+        if self.total_bytes == 0 {
+            return String::new();
+        }
+        format!(
+            "{} free of {}",
+            format_size(self.free_bytes),
+            format_size(self.total_bytes)
+        )
     }
 }
 
@@ -334,9 +363,65 @@ pub fn drives() -> Vec<Drive> {
                 }
             }
         };
-        out.push(Drive { root, label });
+        // Capacity is best-effort: a volume can refuse to report it, and that
+        // should cost us a bar, not the whole sidebar entry.
+        let (mut total_bytes, mut free_bytes) = (0u64, 0u64);
+        let mut avail: u64 = 0;
+        let mut total: u64 = 0;
+        let mut free: u64 = 0;
+        if unsafe {
+            GetDiskFreeSpaceExW(
+                PCWSTR::from_raw(wide.as_ptr()),
+                Some(&mut avail),
+                Some(&mut total),
+                Some(&mut free),
+            )
+        }
+        .is_ok()
+        {
+            total_bytes = total;
+            // Report the space this user can actually use, not the raw free
+            // space, so a quota-limited volume reads honestly.
+            free_bytes = avail.min(free.max(avail));
+        }
+
+        out.push(Drive {
+            root,
+            label,
+            total_bytes,
+            free_bytes,
+        });
     }
     out
+}
+
+/// Total bytes under `root`, following no reparse points.
+///
+/// Iterative rather than recursive: a deep tree should cost heap, not stack.
+/// Junctions and symlinks are skipped outright — following them is how a
+/// directory walker ends up counting C:\ twice or looping forever.
+pub fn dir_size(root: &str) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack = vec![std::path::PathBuf::from(root)];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue; // Unreadable subtree: count what we can and move on.
+        };
+        for entry in read.flatten() {
+            // file_type() comes from the directory entry itself and does not
+            // follow the link, which is exactly what we want here.
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(md) = entry.metadata() {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    total
 }
 
 /// Human-readable byte count.
@@ -473,6 +558,23 @@ mod tests {
     }
 
     #[test]
+    fn dir_size_counts_a_real_tree() {
+        let base = std::env::temp_dir().join("fx_dir_size_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("a.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(base.join("sub").join("b.bin"), vec![0u8; 250]).unwrap();
+
+        assert_eq!(dir_size(&base.to_string_lossy()), 350);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dir_size_of_a_missing_path_is_zero() {
+        assert_eq!(dir_size("C:\\definitely\\not\\here\\at\\all"), 0);
+    }
+
+    #[test]
     fn test_format_size() {
         assert_eq!(format_size(0), "0 B");
         assert_eq!(format_size(512), "512 B");
@@ -493,5 +595,44 @@ mod tests {
     fn test_path_leaf() {
         assert_eq!(path_leaf("C:\\Users\\Foo"), "Foo");
         assert_eq!(path_leaf("C:\\"), "C:\\");
+    }
+
+    fn drive(total: u64, free: u64) -> Drive {
+        Drive {
+            root: "C:\\".into(),
+            label: "Windows".into(),
+            total_bytes: total,
+            free_bytes: free,
+        }
+    }
+
+    #[test]
+    fn drive_display_matches_explorer() {
+        assert_eq!(drive(0, 0).display(), "Windows (C:)");
+    }
+
+    #[test]
+    fn used_fraction_is_none_when_size_is_unknown() {
+        assert_eq!(drive(0, 0).used_fraction(), None);
+    }
+
+    #[test]
+    fn used_fraction_is_the_filled_portion() {
+        let d = drive(1000, 250);
+        assert!((d.used_fraction().unwrap() - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn used_fraction_clamps_when_free_exceeds_total() {
+        // Quota-limited volumes can report nonsense; never draw a negative bar.
+        let d = drive(1000, 5000);
+        assert_eq!(d.used_fraction(), Some(0.0));
+    }
+
+    #[test]
+    fn capacity_text_reads_naturally() {
+        let d = drive(2048, 1024);
+        assert_eq!(d.capacity_text(), "1 KB free of 2 KB");
+        assert_eq!(drive(0, 0).capacity_text(), "");
     }
 }

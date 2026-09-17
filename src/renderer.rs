@@ -1,6 +1,6 @@
 // Direct2D / DirectWrite painting.
 //
-// Three things here are deliberate departures from the previous version:
+// Departures from the original renderer, all deliberate:
 //
 //  * One reusable solid brush whose colour is set per draw, instead of eleven
 //    cached brushes torn down and rebuilt on every WM_SIZE.
@@ -8,14 +8,16 @@
 //    recreating it, so dragging the window edge does not thrash the GPU.
 //  * Text formats carry no-wrap, ellipsis trimming, and vertical centring, so a
 //    long filename is trimmed with an ellipsis instead of wrapping inside a
-//    24px row and being clipped mid-glyph.
+//    row and being clipped mid-glyph.
+//  * Chrome glyphs (chevrons, close, plus, sort arrows) come from Segoe MDL2
+//    Assets rather than being approximated with punctuation.
 //
 // The render target runs at 96 DPI so one DIP is one physical pixel; scaling
 // for the monitor happens once, in `layout::Metrics`, and in the font sizes
 // below. That keeps every coordinate in the app in the same unit.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use windows::core::{Interface, Result, PCWSTR};
 use windows::Win32::Foundation::HWND;
@@ -27,9 +29,26 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
 use crate::file_list::{FileList, SortKey, SortOrder};
-use crate::icons::{icon_key, IconCache};
-use crate::layout::{Hit, Layout, PaneLayout, Rect, Side, TextMeasurer};
+use crate::fs::Drive;
+use crate::icons::{icon_key, icon_key_for_path, IconCache};
+use crate::layout::{
+    sidebar_text_offset, Hit, Layout, Metrics, NavButton, PaneLayout, Rect, SidebarEntry, Side,
+    TextMeasurer,
+};
 use crate::theme::{Palette, Rgb, Theme};
+
+// Segoe MDL2 Assets code points. Present on every Windows 10 and 11 install.
+mod glyph {
+    pub const BACK: &str = "\u{E72B}";
+    pub const FORWARD: &str = "\u{E72A}";
+    pub const UP: &str = "\u{E74A}";
+    pub const CLOSE: &str = "\u{E8BB}";
+    pub const ADD: &str = "\u{E710}";
+    pub const CHEVRON_DOWN: &str = "\u{E70D}";
+    pub const CHEVRON_RIGHT: &str = "\u{E76C}";
+    pub const CHEVRON_UP: &str = "\u{E70E}";
+    pub const FILTER: &str = "\u{E71C}";
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -65,6 +84,25 @@ pub struct PaneView<'a> {
     pub loading: bool,
     pub error: Option<&'a str>,
     pub hover: Option<Hit>,
+    pub can_back: bool,
+    pub can_forward: bool,
+    pub can_up: bool,
+    /// True when keystrokes are going to the filter box rather than the list.
+    pub filter_focused: bool,
+    pub counts: &'a str,
+    /// In compare mode, the names present in the *other* pane. Rows missing
+    /// from it get a marker, which is what makes two trees diffable at a glance.
+    pub other_names: Option<&'a HashSet<String>>,
+}
+
+/// Everything the renderer needs to paint the sidebar.
+pub struct SidebarView<'a> {
+    pub entries: &'a [SidebarEntry],
+    pub drives: &'a [Drive],
+    /// (label, path) shortcuts.
+    pub places: &'a [(String, String)],
+    pub current_path: &'a str,
+    pub hover: Option<Hit>,
 }
 
 struct Formats {
@@ -72,6 +110,11 @@ struct Formats {
     body_right: IDWriteTextFormat,
     small: IDWriteTextFormat,
     small_bold: IDWriteTextFormat,
+    small_right: IDWriteTextFormat,
+    tiny: IDWriteTextFormat,
+    caption: IDWriteTextFormat,
+    icon: IDWriteTextFormat,
+    centered: IDWriteTextFormat,
 }
 
 pub struct Renderer {
@@ -97,8 +140,7 @@ impl Renderer {
     pub fn new(theme: Theme, dpi: u32) -> Result<Self> {
         let factory: ID2D1Factory1 =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
-        let dwrite: IDWriteFactory =
-            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+        let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         let wic: IWICImagingFactory =
             unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
         let formats = Self::make_formats(&dwrite, dpi)?;
@@ -119,13 +161,19 @@ impl Renderer {
 
     fn make_formats(dwrite: &IDWriteFactory, dpi: u32) -> Result<Formats> {
         let scale = dpi as f32 / 96.0;
-        let font = wide("Segoe UI");
+        let ui = wide("Segoe UI");
+        let mdl2 = wide("Segoe MDL2 Assets");
         let locale = wide("en-us");
 
-        let mk = |size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT| -> Result<IDWriteTextFormat> {
+        let mk = |family: &[u16],
+                  size: f32,
+                  weight: DWRITE_FONT_WEIGHT,
+                  align: DWRITE_TEXT_ALIGNMENT,
+                  ellipsis: bool|
+         -> Result<IDWriteTextFormat> {
             let f = unsafe {
                 dwrite.CreateTextFormat(
-                    PCWSTR::from_raw(font.as_ptr()),
+                    PCWSTR::from_raw(family.as_ptr()),
                     None,
                     weight,
                     DWRITE_FONT_STYLE_NORMAL,
@@ -141,22 +189,35 @@ impl Renderer {
                 // which is what made every row look misaligned before.
                 f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 f.SetTextAlignment(align)?;
-                let sign = dwrite.CreateEllipsisTrimmingSign(&f)?;
-                let trimming = DWRITE_TRIMMING {
-                    granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-                    delimiter: 0,
-                    delimiterCount: 0,
-                };
-                f.SetTrimming(&trimming, &sign)?;
+                if ellipsis {
+                    let sign = dwrite.CreateEllipsisTrimmingSign(&f)?;
+                    let trimming = DWRITE_TRIMMING {
+                        granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                        delimiter: 0,
+                        delimiterCount: 0,
+                    };
+                    f.SetTrimming(&trimming, &sign)?;
+                }
             }
             Ok(f)
         };
 
+        use DWRITE_FONT_WEIGHT_NORMAL as NORMAL;
+        use DWRITE_FONT_WEIGHT_SEMI_BOLD as SEMI;
+        use DWRITE_TEXT_ALIGNMENT_CENTER as CENTER;
+        use DWRITE_TEXT_ALIGNMENT_LEADING as LEADING;
+        use DWRITE_TEXT_ALIGNMENT_TRAILING as TRAILING;
+
         Ok(Formats {
-            body: mk(13.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-            body_right: mk(13.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
-            small: mk(12.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-            small_bold: mk(12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+            body: mk(&ui, 12.5, NORMAL, LEADING, true)?,
+            body_right: mk(&ui, 12.5, NORMAL, TRAILING, true)?,
+            small: mk(&ui, 12.0, NORMAL, LEADING, true)?,
+            small_bold: mk(&ui, 12.0, SEMI, LEADING, true)?,
+            small_right: mk(&ui, 12.0, NORMAL, TRAILING, true)?,
+            tiny: mk(&ui, 10.5, NORMAL, LEADING, true)?,
+            caption: mk(&ui, 10.5, SEMI, LEADING, true)?,
+            icon: mk(&mdl2, 10.0, NORMAL, CENTER, false)?,
+            centered: mk(&ui, 12.5, NORMAL, CENTER, false)?,
         })
     }
 
@@ -206,9 +267,7 @@ impl Renderer {
             presentOptions: D2D1_PRESENT_OPTIONS_NONE,
         };
         let target = unsafe { self.factory.CreateHwndRenderTarget(&rt_props, &hwnd_props)? };
-        let brush = unsafe {
-            target.CreateSolidColorBrush(&color((1.0, 1.0, 1.0)), None)?
-        };
+        let brush = unsafe { target.CreateSolidColorBrush(&color((1.0, 1.0, 1.0)), None)? };
         self.brush = Some(brush);
         self.target = Some(target);
         self.icon_bitmaps.clear();
@@ -245,24 +304,49 @@ impl Renderer {
         }
     }
 
-    fn stroke(&self, r: Rect, c: Rgb, width: f32) {
+    fn fill_rounded(&self, r: Rect, radius: f32, c: Rgb) {
         if r.is_empty() {
             return;
         }
         let (Some(rt), Some(brush)) = (self.rt(), self.brush.as_ref()) else {
             return;
         };
-        // Inset by half the stroke so the outline lands inside the rect.
-        let half = width / 2.0;
-        let rr = D2D_RECT_F {
-            left: r.x as f32 + half,
-            top: r.y as f32 + half,
-            right: r.right() as f32 - half,
-            bottom: r.bottom() as f32 - half,
+        // Never round more than half the shorter side, or the shape inverts.
+        let radius = radius.min(r.w as f32 / 2.0).min(r.h as f32 / 2.0).max(0.0);
+        let rr = D2D1_ROUNDED_RECT {
+            rect: d2d_rect(r),
+            radiusX: radius,
+            radiusY: radius,
         };
         unsafe {
             brush.SetColor(&color(c));
-            rt.DrawRectangle(&rr, brush, width, None);
+            rt.FillRoundedRectangle(&rr, brush);
+        }
+    }
+
+    fn stroke_rounded(&self, r: Rect, radius: f32, c: Rgb, width: f32) {
+        if r.is_empty() {
+            return;
+        }
+        let (Some(rt), Some(brush)) = (self.rt(), self.brush.as_ref()) else {
+            return;
+        };
+        let half = width / 2.0;
+        let inner = Rect::new(
+            r.x + half as i32,
+            r.y + half as i32,
+            r.w - width as i32,
+            r.h - width as i32,
+        );
+        let radius = radius.min(inner.w as f32 / 2.0).min(inner.h as f32 / 2.0).max(0.0);
+        let rr = D2D1_ROUNDED_RECT {
+            rect: d2d_rect(inner),
+            radiusX: radius,
+            radiusY: radius,
+        };
+        unsafe {
+            brush.SetColor(&color(c));
+            rt.DrawRoundedRectangle(&rr, brush, width, None);
         }
     }
 
@@ -285,6 +369,10 @@ impl Renderer {
                 DWRITE_MEASURING_MODE_NATURAL,
             );
         }
+    }
+
+    fn glyph(&self, g: &str, r: Rect, c: Rgb) {
+        self.text(g, r, c, &self.formats.icon.clone());
     }
 
     fn push_clip(&self, r: Rect) {
@@ -332,7 +420,6 @@ impl Renderer {
 
     fn draw_icon(&mut self, key: &str, r: Rect) {
         let dest = d2d_rect(r);
-        // Borrow the target before the mutable icon lookup so both can coexist.
         let Some(bmp) = self.icon_bitmap(key).cloned() else {
             return;
         };
@@ -359,8 +446,8 @@ impl Renderer {
         }
     }
 
-    /// Finish the frame. Returns Err when the device was lost and the caller
-    /// should discard the target and repaint.
+    /// Finish the frame. Err means the device was lost and the caller should
+    /// discard the target and repaint.
     pub fn end(&self) -> Result<()> {
         if let Some(rt) = self.rt() {
             unsafe { rt.EndDraw(None, None)? };
@@ -368,9 +455,9 @@ impl Renderer {
         Ok(())
     }
 
-    // -- chrome ------------------------------------------------------------
+    // -- sidebar -----------------------------------------------------------
 
-    pub fn draw_sidebar(&mut self, layout: &Layout, drives: &[crate::fs::Drive], current: &str, hover: Option<Hit>) {
+    pub fn draw_sidebar(&mut self, layout: &Layout, v: &SidebarView) {
         if layout.sidebar.is_empty() {
             return;
         }
@@ -378,50 +465,160 @@ impl Renderer {
         let m = layout.metrics;
         self.fill(layout.sidebar, p.sidebar_bg);
 
-        let title = Rect::new(
-            layout.sidebar.x + m.pad,
-            layout.sidebar.y,
-            layout.sidebar.w - m.pad,
-            m.sidebar_header_h,
-        );
-        self.text("DRIVES", title, p.text_muted, &self.formats.small_bold.clone());
-
-        for (i, r) in layout.drives.clone().iter().enumerate() {
-            let Some(drive) = drives.get(i) else { continue };
-            let is_current = current.to_lowercase().starts_with(&drive.root.to_lowercase());
-            if is_current {
-                self.fill(*r, p.selection_inactive);
-            } else if hover == Some(Hit::Drive(i)) {
-                self.fill(*r, p.row_hover);
+        self.push_clip(layout.sidebar);
+        let rows = layout.sidebar_rows.clone();
+        for (i, row) in rows.iter().enumerate() {
+            if row.rect.is_empty() {
+                continue;
             }
-            let icon = Rect::new(
-                r.x + m.pad,
-                r.y + (r.h - m.icon_size) / 2,
-                m.icon_size,
-                m.icon_size,
-            );
-            self.draw_icon("<dir>", icon);
-            let label = Rect::new(
-                icon.right() + m.pad,
-                r.y,
-                r.right() - icon.right() - m.pad * 2,
-                r.h,
-            );
-            self.text(&drive.display(), label, p.text, &self.formats.small.clone());
+            let Some(entry) = v.entries.get(i) else { continue };
+            match entry {
+                SidebarEntry::Section { label, collapsed } => {
+                    let hovered = matches!(
+                        v.hover,
+                        Some(Hit::Sidebar(h)) | Some(Hit::SidebarChevron(h)) if h == i
+                    );
+                    let text_rect = Rect::new(
+                        row.rect.x + m.pad,
+                        row.rect.y,
+                        row.rect.w - m.pad * 2 - m.icon_size,
+                        row.rect.h,
+                    );
+                    self.text(
+                        &label.to_uppercase(),
+                        text_rect,
+                        if hovered { p.text_muted } else { p.text_faint },
+                        &self.formats.caption.clone(),
+                    );
+                    let g = if *collapsed {
+                        glyph::CHEVRON_RIGHT
+                    } else {
+                        glyph::CHEVRON_DOWN
+                    };
+                    self.glyph(g, row.chevron, if hovered { p.text } else { p.text_faint });
+                }
+
+                SidebarEntry::Drive { index, used } => {
+                    let Some(d) = v.drives.get(*index) else { continue };
+                    let active = v
+                        .current_path
+                        .to_lowercase()
+                        .starts_with(&d.root.to_lowercase());
+                    let key = icon_key_for_path(&d.root);
+                    let label = d.display();
+                    let sub = used.map(|_| d.capacity_text());
+                    self.draw_sidebar_row(m, row.rect, i, v.hover, active, &key, &label, sub);
+                    if let Some(frac) = used {
+                        self.draw_capacity_bar(row.capacity, *frac);
+                    }
+                }
+
+                SidebarEntry::Place { index } => {
+                    let Some((label, path)) = v.places.get(*index) else {
+                        continue;
+                    };
+                    let active = crate::pane::paths_equal(v.current_path, path);
+                    let key = icon_key_for_path(path);
+                    let label = label.clone();
+                    self.draw_sidebar_row(m, row.rect, i, v.hover, active, &key, &label, None);
+                }
+            }
+        }
+        self.pop_clip();
+
+        // Hairline between the sidebar and the panes.
+        let edge = Rect::new(layout.sidebar.right() - 1, layout.sidebar.y, 1, layout.sidebar.h);
+        self.fill(edge, p.divider);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_sidebar_row(
+        &mut self,
+        m: Metrics,
+        rect: Rect,
+        index: usize,
+        hover: Option<Hit>,
+        active: bool,
+        icon_cache_key: &str,
+        label: &str,
+        subtitle: Option<String>,
+    ) {
+        let p = self.palette();
+        let hovered = hover == Some(Hit::Sidebar(index));
+        let pill = Rect::new(rect.x + m.pad / 2, rect.y, rect.w - m.pad, rect.h);
+
+        if active {
+            self.fill_rounded(pill, m.radius, p.selection_inactive);
+            // Accent stub marking the volume the focused pane is inside.
+            let bar = Rect::new(rect.x, rect.y + 3, 2.max(m.scale as i32), rect.h - 6);
+            self.fill(bar, p.accent);
+        } else if hovered {
+            self.fill_rounded(pill, m.radius, p.row_hover);
+        }
+
+        // Two-line rows hang the icon off the first line; one-line rows centre it.
+        let icon_y = match subtitle {
+            Some(_) => rect.y + m.pad / 2 + (m.sidebar_row_h - m.icon_size) / 2 - m.pad / 4,
+            None => rect.y + (rect.h - m.icon_size) / 2,
+        };
+        let icon = Rect::new(rect.x + m.pad + m.pad / 2, icon_y, m.icon_size, m.icon_size);
+        self.draw_icon(icon_cache_key, icon);
+
+        let text_x = rect.x + sidebar_text_offset(m);
+        let text_w = (pill.right() - text_x - m.pad / 2).max(0);
+        match subtitle {
+            Some(sub) => {
+                let top = Rect::new(text_x, rect.y + m.pad / 4, text_w, m.sidebar_row_h);
+                self.text(label, top, p.text, &self.formats.small.clone());
+                if !sub.is_empty() {
+                    let bottom = Rect::new(
+                        text_x,
+                        top.bottom() - m.pad / 2,
+                        text_w,
+                        (rect.bottom() - top.bottom()).max(0),
+                    );
+                    self.text(&sub, bottom, p.text_faint, &self.formats.tiny.clone());
+                }
+            }
+            None => {
+                let r = Rect::new(text_x, rect.y, text_w, rect.h);
+                self.text(label, r, p.text, &self.formats.small.clone());
+            }
         }
     }
 
+    fn draw_capacity_bar(&mut self, track: Rect, used: f32) {
+        if track.is_empty() {
+            return;
+        }
+        let p = self.palette();
+        let radius = track.h as f32 / 2.0;
+        self.fill_rounded(track, radius, p.capacity_track);
+        let w = ((track.w as f32) * used.clamp(0.0, 1.0)).round() as i32;
+        if w <= 0 {
+            return;
+        }
+        // A nearly full disk is information, not decoration: colour it.
+        let c = if used >= 0.9 {
+            p.capacity_full
+        } else {
+            p.capacity_fill
+        };
+        self.fill_rounded(Rect::new(track.x, track.y, w.max(2), track.h), radius, c);
+    }
+
+    // -- divider -----------------------------------------------------------
+
     pub fn draw_divider(&mut self, layout: &Layout, hovered: bool, dragging: bool) {
         let p = self.palette();
+        self.fill(layout.divider, p.window_bg);
         let c = if dragging {
-            p.focus
+            p.accent
         } else if hovered {
             p.scrollbar_thumb_hover
         } else {
             p.divider
         };
-        self.fill(layout.divider, p.window_bg);
-        // A 1px line down the middle of the (wider) grab area.
         let mid = Rect::new(
             layout.divider.x + layout.divider.w / 2,
             layout.divider.y,
@@ -431,77 +628,66 @@ impl Renderer {
         self.fill(mid, c);
     }
 
-    pub fn draw_status(&mut self, layout: &Layout, text: &str, right_text: &str) {
-        let p = self.palette();
-        let m = layout.metrics;
-        self.fill(layout.status, p.status_bg);
-        let top = Rect::new(layout.status.x, layout.status.y, layout.status.w, 1);
-        self.fill(top, p.divider);
-
-        let left = Rect::new(
-            layout.status.x + m.pad,
-            layout.status.y,
-            layout.status.w / 2,
-            layout.status.h,
-        );
-        self.text(text, left, p.text_muted, &self.formats.small.clone());
-
-        let right = Rect::new(
-            layout.status.x + layout.status.w / 2,
-            layout.status.y,
-            layout.status.w / 2 - m.pad,
-            layout.status.h,
-        );
-        self.text(right_text, right, p.text_muted, &self.formats.body_right.clone());
-    }
-
     // -- pane --------------------------------------------------------------
 
-    pub fn draw_pane(&mut self, m: crate::layout::Metrics, v: &PaneView) {
+    pub fn draw_pane(&mut self, m: Metrics, v: &PaneView) {
         if v.layout.bounds.is_empty() {
             return;
         }
+        let p = self.palette();
+        self.fill(v.layout.bounds, p.pane_bg);
+
         self.draw_tab_bar(m, v);
-        self.draw_breadcrumb(m, v);
+        self.draw_toolbar(m, v);
         self.draw_header(m, v);
         self.draw_rows(m, v);
         self.draw_scrollbar(v);
+        self.draw_footer(m, v);
 
-        // Focus ring around the whole content area of the active pane.
+        // The focused pane is marked by an accent rule under its tab bar rather
+        // than a ring around the content: it reads at a glance and costs no space.
         if v.focused {
-            let p = self.palette();
-            let area = Rect::new(
-                v.layout.list.x,
-                v.layout.header.y,
-                v.layout.list.w + v.layout.scrollbar.w,
-                v.layout.list.h + v.layout.header.h,
+            let bar = Rect::new(
+                v.layout.toolbar.x,
+                v.layout.toolbar.y,
+                v.layout.toolbar.w,
+                2.max(m.scale as i32),
             );
-            self.stroke(area, p.focus, 1.0);
+            self.fill(bar, p.accent);
         }
     }
 
-    fn draw_tab_bar(&mut self, m: crate::layout::Metrics, v: &PaneView) {
+    fn draw_tab_bar(&mut self, m: Metrics, v: &PaneView) {
         let p = self.palette();
         self.fill(v.layout.tab_bar, p.tab_bar_bg);
 
         for (i, t) in v.layout.tabs.clone().iter().enumerate() {
             let active = i == v.active_tab;
+            let hovered = matches!(v.hover, Some(Hit::Tab(s, h)) | Some(Hit::TabClose(s, h)) if s == v.side && h == i);
+
             if active {
                 self.fill(t.full, p.tab_active);
-                // Accent strip along the top of the active tab.
-                let strip = Rect::new(t.full.x, t.full.y, t.full.w, 2.max(m.scale as i32));
-                self.fill(strip, p.focus);
-            } else if v.hover == Some(Hit::Tab(v.side, i)) || v.hover == Some(Hit::TabClose(v.side, i)) {
+            } else if hovered {
                 self.fill(t.full, p.tab_hover);
             }
 
-            let label_w = (t.close.w.max(0)).max(0);
-            let label = Rect::new(
+            let icon = Rect::new(
                 t.full.x + m.pad,
-                t.full.y,
-                (t.full.w - m.pad - label_w).max(0),
-                t.full.h,
+                t.full.y + (t.full.h - m.icon_size) / 2,
+                m.icon_size,
+                m.icon_size,
             );
+            if t.full.w > m.icon_size + m.pad * 2 {
+                self.draw_icon("<dir>", icon);
+            }
+
+            let label_x = icon.right() + m.pad / 2;
+            let label_right = if t.close.is_empty() {
+                t.full.right() - m.pad / 2
+            } else {
+                t.close.x
+            };
+            let label = Rect::new(label_x, t.full.y, (label_right - label_x).max(0), t.full.h);
             let fg = if active { p.text } else { p.text_muted };
             let text = v.tab_labels.get(i).cloned().unwrap_or_default();
             self.text(&text, label, fg, &self.formats.small.clone());
@@ -509,16 +695,14 @@ impl Renderer {
             if !t.close.is_empty() {
                 let hovered_close = v.hover == Some(Hit::TabClose(v.side, i));
                 if hovered_close {
-                    self.fill(t.close, p.row_hover);
+                    self.fill_rounded(t.close, m.radius, p.row_hover);
                 }
-                let c = if hovered_close { p.text } else { p.text_muted };
-                // Centred multiplication sign reads better than a lowercase x.
-                self.text("\u{00D7}", t.close, c, &self.formats.small.clone());
+                let c = if hovered_close { p.text } else { p.text_faint };
+                self.glyph(glyph::CLOSE, t.close, c);
             }
 
-            // Separator between inactive tabs.
             if !active {
-                let sep = Rect::new(t.full.right() - 1, t.full.y + m.pad / 2, 1, t.full.h - m.pad);
+                let sep = Rect::new(t.full.right() - 1, t.full.y + 6, 1, t.full.h - 12);
                 self.fill(sep, p.divider);
             }
         }
@@ -526,60 +710,82 @@ impl Renderer {
         if !v.layout.new_tab.is_empty() {
             let hovered = v.hover == Some(Hit::NewTab(v.side));
             if hovered {
-                self.fill(v.layout.new_tab, p.tab_hover);
+                self.fill_rounded(v.layout.new_tab.inset(3, 5), m.radius, p.tab_hover);
             }
-            let c = if hovered { p.text } else { p.text_muted };
-            self.text("+", v.layout.new_tab, c, &self.formats.small.clone());
+            let c = if hovered { p.text } else { p.text_faint };
+            self.glyph(glyph::ADD, v.layout.new_tab, c);
         }
     }
 
-    fn draw_breadcrumb(&mut self, _m: crate::layout::Metrics, v: &PaneView) {
+    fn draw_toolbar(&mut self, m: Metrics, v: &PaneView) {
         let p = self.palette();
-        self.fill(v.layout.breadcrumb, p.pane_bg);
+        self.fill(v.layout.toolbar, p.toolbar_bg);
 
+        let buttons = [
+            (v.layout.nav_back, NavButton::Back, glyph::BACK, v.can_back),
+            (
+                v.layout.nav_forward,
+                NavButton::Forward,
+                glyph::FORWARD,
+                v.can_forward,
+            ),
+            (v.layout.nav_up, NavButton::Up, glyph::UP, v.can_up),
+        ];
+        for (rect, which, g, enabled) in buttons {
+            let hovered = v.hover == Some(Hit::Nav(v.side, which));
+            if hovered && enabled {
+                self.fill_rounded(rect.inset(2, 4), m.radius, p.row_hover);
+            }
+            // A disabled control that looks enabled is worse than no control.
+            let c = if !enabled {
+                p.text_faint
+            } else if hovered {
+                p.text
+            } else {
+                p.text_muted
+            };
+            self.glyph(g, rect, c);
+        }
+
+        // Belt and braces: the layout already fits the crumbs, and this makes
+        // it impossible for one to bleed into the next pane if it ever does not.
+        self.push_clip(v.layout.breadcrumb);
         let crumbs = v.layout.crumbs.clone();
-        let last_index = crumbs.len().saturating_sub(1);
+        let last = crumbs.len().saturating_sub(1);
         for (i, c) in crumbs.iter().enumerate() {
             let hovered = v.hover == Some(Hit::Crumb(v.side, c.segment_index));
             if hovered {
-                self.fill(c.rect, p.row_hover);
+                self.fill_rounded(c.rect.inset(0, 4), m.radius, p.row_hover);
             }
             let label = if c.is_ellipsis {
                 "\u{2026}".to_string()
             } else {
                 v.crumbs.get(c.segment_index).cloned().unwrap_or_default()
             };
-            let is_leaf = i == last_index && !c.is_ellipsis;
+            let is_leaf = i == last && !c.is_ellipsis;
             let fg = if is_leaf || hovered { p.text } else { p.text_muted };
             let fmt = if is_leaf {
                 self.formats.small_bold.clone()
             } else {
                 self.formats.small.clone()
             };
-            self.text(&label, c.rect, fg, &fmt);
+            let inner = Rect::new(c.rect.x + m.pad / 2, c.rect.y, c.rect.w - m.pad / 2, c.rect.h);
+            self.text(&label, inner, fg, &fmt);
 
-            // Chevron between crumbs, drawn in the gap the layout left for it.
-            if i < last_index {
+            if i < last {
                 let gap = Rect::new(
                     c.rect.right(),
                     c.rect.y,
                     (crumbs[i + 1].rect.x - c.rect.right()).max(0),
                     c.rect.h,
                 );
-                self.text("\u{203A}", gap, p.text_muted, &self.formats.small.clone());
+                self.glyph(glyph::CHEVRON_RIGHT, gap, p.text_faint);
             }
         }
-
-        let underline = Rect::new(
-            v.layout.breadcrumb.x,
-            v.layout.breadcrumb.bottom() - 1,
-            v.layout.breadcrumb.w,
-            1,
-        );
-        self.fill(underline, p.divider);
+        self.pop_clip();
     }
 
-    fn draw_header(&mut self, m: crate::layout::Metrics, v: &PaneView) {
+    fn draw_header(&mut self, m: Metrics, v: &PaneView) {
         let p = self.palette();
         self.fill(v.layout.header, p.header_bg);
 
@@ -595,34 +801,55 @@ impl Renderer {
                 SortKey::Date => "Date modified",
             };
             let right_aligned = matches!(c.key, SortKey::Size);
+            let arrow_w = if sorted { m.pad * 2 } else { 0 };
+
             let fmt = if right_aligned {
-                self.formats.body_right.clone()
+                self.formats.small_right.clone()
             } else if sorted {
                 self.formats.small_bold.clone()
             } else {
                 self.formats.small.clone()
             };
-            let inner = Rect::new(
-                c.rect.x + m.pad,
-                c.rect.y,
-                (c.rect.w - m.pad * 2 - if sorted { m.pad + 4 } else { 0 }).max(0),
-                c.rect.h,
-            );
+            let inner = if right_aligned {
+                Rect::new(
+                    c.rect.x,
+                    c.rect.y,
+                    (c.rect.w - m.pad - arrow_w).max(0),
+                    c.rect.h,
+                )
+            } else {
+                Rect::new(
+                    c.rect.x + m.pad,
+                    c.rect.y,
+                    (c.rect.w - m.pad * 2 - arrow_w).max(0),
+                    c.rect.h,
+                )
+            };
             let fg = if sorted { p.text } else { p.text_muted };
             self.text(title, inner, fg, &fmt);
 
             if sorted {
-                let arrow = if v.list.sort_order == SortOrder::Asc {
-                    "\u{25B2}"
+                let g = if v.list.sort_order == SortOrder::Asc {
+                    glyph::CHEVRON_UP
                 } else {
-                    "\u{25BC}"
+                    glyph::CHEVRON_DOWN
                 };
-                let ar = Rect::new(c.rect.right() - m.pad * 2, c.rect.y, m.pad * 2, c.rect.h);
-                self.text(arrow, ar, p.text_muted, &self.formats.small.clone());
+                // Sit the marker against the title, not at the far edge of a
+                // wide column where it reads as belonging to nothing.
+                let title_w = self.measure(title, true).ceil() as i32;
+                let ar = if right_aligned {
+                    Rect::new(inner.x - arrow_w, c.rect.y, arrow_w, c.rect.h)
+                } else {
+                    Rect::new(inner.x + title_w, c.rect.y, arrow_w, c.rect.h)
+                };
+                let ar = Rect::new(
+                    ar.x.min(c.rect.right() - arrow_w),
+                    ar.y,
+                    arrow_w,
+                    ar.h,
+                );
+                self.glyph(g, ar, p.accent);
             }
-
-            let sep = Rect::new(c.rect.right() - 1, c.rect.y + 4, 1, c.rect.h - 8);
-            self.fill(sep, p.divider);
         }
 
         let underline = Rect::new(
@@ -634,21 +861,25 @@ impl Renderer {
         self.fill(underline, p.divider);
     }
 
-    fn draw_rows(&mut self, m: crate::layout::Metrics, v: &PaneView) {
+    fn draw_rows(&mut self, m: Metrics, v: &PaneView) {
         let p = self.palette();
         let list_rect = v.layout.list;
-        self.fill(list_rect, p.pane_bg);
 
         if let Some(err) = v.error {
-            self.draw_centered_message(list_rect, &format!("Cannot open this folder\n{}", err), p.text_muted);
+            self.centered_message(list_rect, &format!("Cannot open this folder\n{}", err));
             return;
         }
         if v.loading && v.list.entries.is_empty() {
-            self.draw_centered_message(list_rect, "Loading\u{2026}", p.text_muted);
+            self.centered_message(list_rect, "Loading\u{2026}");
             return;
         }
         if v.list.entries.is_empty() {
-            self.draw_centered_message(list_rect, "This folder is empty", p.text_muted);
+            let msg = if v.list.is_filtered() {
+                "No items match the filter"
+            } else {
+                "This folder is empty"
+            };
+            self.centered_message(list_rect, msg);
             return;
         }
 
@@ -678,23 +909,42 @@ impl Renderer {
             let selected = v.list.is_selected(row);
             let hovered = v.hover == Some(Hit::Row(v.side, row));
 
-            if row % 2 == 1 {
-                self.fill(r, p.row_alt);
-            }
             if selected {
-                let c = if v.focused { p.selection } else { p.selection_inactive };
-                self.fill(r, c);
+                let c = if v.focused {
+                    p.selection
+                } else {
+                    p.selection_inactive
+                };
+                // A rounded pill inset from the gutter reads as a selected
+                // object; a full-bleed rectangle reads as a stripe.
+                self.fill_rounded(Rect::new(r.x + 2, r.y, r.w - 4, r.h), m.radius, c);
             } else if hovered {
-                self.fill(r, p.row_hover);
+                self.fill_rounded(Rect::new(r.x + 2, r.y, r.w - 4, r.h), m.radius, p.row_hover);
             }
-            if Some(row) == cursor && v.focused {
-                self.stroke(r, p.cursor_outline, 1.0);
+            if Some(row) == cursor && v.focused && !selected {
+                self.stroke_rounded(
+                    Rect::new(r.x + 2, r.y, r.w - 4, r.h),
+                    m.radius,
+                    p.cursor_outline,
+                    1.0,
+                );
             }
 
             let fg = if selected { p.text_on_selection } else { p.text };
-            let muted = if selected { p.text_on_selection } else { p.text_muted };
+            let muted = if selected {
+                p.text_on_selection
+            } else {
+                p.text_muted
+            };
 
-            // Name cell: icon then text.
+            // Compare mode: mark what this pane has and the other does not.
+            if let Some(others) = v.other_names {
+                if !others.contains(&entry.name) {
+                    let bar = Rect::new(r.x, r.y + 2, 3.max(m.scale as i32), r.h - 4);
+                    self.fill_rounded(bar, 1.5, p.accent);
+                }
+            }
+
             if let Some(nc) = name_col {
                 let icon = Rect::new(
                     nc.x + m.pad,
@@ -713,17 +963,22 @@ impl Renderer {
                 );
                 self.text(&entry.name, name, fg, &self.formats.body.clone());
 
-                // Junctions and symlinks are marked so a recursive copy is not a
-                // surprise.
+                // Junctions and symlinks are marked, so a recursive copy is
+                // never a surprise.
                 if entry.is_reparse {
-                    let badge = Rect::new(icon.x, icon.bottom() - 6, 6, 6);
-                    self.fill(badge, p.focus);
+                    let badge = Rect::new(icon.x, icon.bottom() - 5, 5, 5);
+                    self.fill_rounded(badge, 2.5, p.accent);
                 }
             }
 
             if let Some(sc) = size_col {
                 let cell = Rect::new(sc.x, y, sc.w - m.pad, row_h);
-                self.text(&entry.size_display(), cell, muted, &self.formats.body_right.clone());
+                self.text(
+                    &entry.size_display(),
+                    cell,
+                    muted,
+                    &self.formats.body_right.clone(),
+                );
             }
             if let Some(dc) = date_col {
                 let cell = Rect::new(dc.x + m.pad, y, dc.w - m.pad * 2, row_h);
@@ -734,29 +989,16 @@ impl Renderer {
         self.pop_clip();
     }
 
-    fn draw_centered_message(&mut self, area: Rect, msg: &str, c: Rgb) {
+    fn centered_message(&mut self, area: Rect, msg: &str) {
+        let p = self.palette();
         let h = 40;
         let r = Rect::new(area.x, area.y + (area.h - h) / 2, area.w, h);
-        let fmt = self.formats.small.clone();
-        // Centre horizontally by borrowing a centred copy of the format.
-        unsafe {
-            let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-        }
-        self.text(msg, r, c, &fmt);
-        unsafe {
-            let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-            let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        }
+        self.text(msg, r, p.text_faint, &self.formats.centered.clone());
     }
 
     fn draw_scrollbar(&mut self, v: &PaneView) {
         let p = self.palette();
-        if v.layout.scrollbar.is_empty() {
-            return;
-        }
-        self.fill(v.layout.scrollbar, p.pane_bg);
-        if v.layout.thumb.is_empty() {
+        if v.layout.scrollbar.is_empty() || v.layout.thumb.is_empty() {
             return;
         }
         let hovered = matches!(v.hover, Some(Hit::ScrollbarThumb(s)) if s == v.side);
@@ -765,7 +1007,51 @@ impl Renderer {
         } else {
             p.scrollbar_thumb
         };
-        self.fill(v.layout.thumb.inset(2, 2), c);
+        let thumb = v.layout.thumb.inset(3, 2);
+        self.fill_rounded(thumb, thumb.w as f32 / 2.0, c);
+    }
+
+    fn draw_footer(&mut self, m: Metrics, v: &PaneView) {
+        let p = self.palette();
+        self.fill(v.layout.footer, p.footer_bg);
+        let top = Rect::new(v.layout.footer.x, v.layout.footer.y, v.layout.footer.w, 1);
+        self.fill(top, p.divider);
+
+        // Filter field.
+        let f = v.layout.filter;
+        if !f.is_empty() {
+            let hovered = v.hover == Some(Hit::Filter(v.side));
+            self.fill_rounded(f, m.radius, p.field_bg);
+            if v.filter_focused {
+                self.stroke_rounded(f, m.radius, p.accent, 1.0);
+            } else if hovered {
+                self.stroke_rounded(f, m.radius, p.divider, 1.0);
+            }
+
+            let gi = Rect::new(f.x + 2, f.y, m.icon_size, f.h);
+            self.glyph(glyph::FILTER, gi, p.text_faint);
+
+            let text_rect = Rect::new(gi.right(), f.y, (f.right() - gi.right() - m.pad / 2).max(0), f.h);
+            let filter = v.list.filter();
+            if filter.is_empty() {
+                self.text("Filter\u{2026}", text_rect, p.text_faint, &self.formats.tiny.clone());
+            } else {
+                let shown = if v.filter_focused {
+                    format!("{}|", filter)
+                } else {
+                    filter.to_string()
+                };
+                self.text(&shown, text_rect, p.text, &self.formats.tiny.clone());
+            }
+        }
+
+        let counts = Rect::new(
+            v.layout.counts.x,
+            v.layout.counts.y,
+            (v.layout.counts.w - m.pad).max(0),
+            v.layout.counts.h,
+        );
+        self.text(v.counts, counts, p.text_muted, &self.formats.small_right.clone());
     }
 }
 

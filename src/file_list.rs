@@ -4,7 +4,7 @@
 // owns the sort because the column headers drive both.
 
 use crate::fs::FileEntry;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum SortKey {
@@ -42,7 +42,16 @@ pub enum SelectMode {
 }
 
 pub struct FileList {
+    /// Everything the last directory read returned.
+    all: Vec<FileEntry>,
+    /// `all` after the hidden-file and filter passes, then sorted. This is what
+    /// the UI indexes into, so selection indices always refer to visible rows.
     pub entries: Vec<FileEntry>,
+    /// Live substring filter from the pane footer. Empty means no filtering.
+    filter: String,
+    /// Folder sizes calculated on demand, kept across refreshes so a reload
+    /// does not throw away work the user asked for.
+    dir_sizes: HashMap<String, u64>,
     pub scroll_offset: u32,
     pub row_height: u32,
     pub sort_key: SortKey,
@@ -61,7 +70,10 @@ pub struct FileList {
 impl Default for FileList {
     fn default() -> Self {
         Self {
+            all: Vec::new(),
             entries: Vec::new(),
+            filter: String::new(),
+            dir_sizes: HashMap::new(),
             scroll_offset: 0,
             row_height: 24,
             sort_key: SortKey::Name,
@@ -350,9 +362,8 @@ impl FileList {
 
     /// Replace the contents for a *new* directory: selection and scroll reset.
     pub fn set_entries(&mut self, entries: Vec<FileEntry>) {
-        self.entries = entries;
-        self.apply_hidden_filter();
-        self.sort();
+        self.all = entries;
+        self.rebuild();
         self.scroll_offset = 0;
         self.selected.clear();
         self.cursor = None;
@@ -370,9 +381,8 @@ impl FileList {
         let cursor_name = self.cursor_entry().map(|e| e.name.clone());
         let scroll = self.scroll_offset;
 
-        self.entries = entries;
-        self.apply_hidden_filter();
-        self.sort();
+        self.all = entries;
+        self.rebuild();
         self.restore_selection(&sel, cursor_name.as_deref());
         self.scroll_offset = scroll.min(self.entries.len() as u32);
     }
@@ -387,13 +397,104 @@ impl FileList {
     }
 
     pub fn set_show_hidden(&mut self, show: bool) {
+        if self.show_hidden == show {
+            return;
+        }
         self.show_hidden = show;
+        self.rebuild_preserving_selection();
     }
 
-    fn apply_hidden_filter(&mut self) {
-        if !self.show_hidden {
-            self.entries.retain(|e| !e.is_hidden);
+    // -- filtering ---------------------------------------------------------
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Apply a live substring filter. Case-insensitive and matching anywhere in
+    /// the name, which is what a "filter as you type" box is expected to do.
+    pub fn set_filter(&mut self, filter: &str) {
+        if self.filter == filter {
+            return;
         }
+        self.filter = filter.to_string();
+        self.rebuild_preserving_selection();
+        self.scroll_offset = 0;
+    }
+
+    pub fn push_filter_char(&mut self, c: char) {
+        let mut f = self.filter.clone();
+        f.push(c);
+        self.set_filter(&f);
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        let mut f = self.filter.clone();
+        f.pop();
+        self.set_filter(&f);
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.set_filter("");
+    }
+
+    /// How many entries exist before filtering, for "12 of 340" in the footer.
+    pub fn unfiltered_count(&self) -> usize {
+        if self.show_hidden {
+            self.all.len()
+        } else {
+            self.all.iter().filter(|e| !e.is_hidden).count()
+        }
+    }
+
+    pub fn is_filtered(&self) -> bool {
+        !self.filter.is_empty()
+    }
+
+    /// Names of entries that do not appear in `other`, for pane comparison.
+    pub fn names(&self) -> HashSet<String> {
+        self.entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// Record calculated folder sizes. Merged, so calculating a second folder
+    /// does not discard the first.
+    pub fn set_dir_sizes(&mut self, sizes: Vec<(String, u64)>) {
+        self.dir_sizes.extend(sizes);
+        self.rebuild_preserving_selection();
+    }
+
+    /// Rebuild the visible list from `all`: hidden pass, filter pass, sort.
+    fn rebuild(&mut self) {
+        let show_hidden = self.show_hidden;
+        let needle = self.filter.to_lowercase();
+        let sizes = &self.dir_sizes;
+        self.entries = self
+            .all
+            .iter()
+            .filter(|e| show_hidden || !e.is_hidden)
+            .filter(|e| needle.is_empty() || e.name.to_lowercase().contains(&needle))
+            .cloned()
+            .map(|mut e| {
+                if e.is_dir {
+                    if let Some(size) = sizes.get(&e.name) {
+                        e.size = *size;
+                        e.dir_size_known = true;
+                    }
+                }
+                e
+            })
+            .collect();
+        self.sort();
+    }
+
+    fn rebuild_preserving_selection(&mut self) {
+        let sel: HashSet<String> = self
+            .selected_entries()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        let cursor_name = self.cursor_entry().map(|e| e.name.clone());
+        self.rebuild();
+        self.restore_selection(&sel, cursor_name.as_deref());
     }
 }
 
@@ -459,6 +560,7 @@ mod tests {
             is_dir,
             is_reparse: false,
             is_hidden: false,
+            dir_size_known: false,
             extension: None,
         }
     }
@@ -616,21 +718,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hidden_entries_filtered_unless_shown() {
-        let mut list = FileList::default();
-        let hidden = FileEntry {
-            is_hidden: true,
-            ..entry("secret.sys", false)
-        };
-        list.set_entries(vec![entry("visible.txt", false), hidden.clone()]);
-        assert_eq!(list.entries.len(), 1);
-
-        list.set_show_hidden(true);
-        list.set_entries(vec![entry("visible.txt", false), hidden]);
-        assert_eq!(list.entries.len(), 2);
-    }
-
-    #[test]
     fn test_apply_sort_toggles_direction() {
         let mut list = list_of(&[("a", false), ("b", false)]);
         list.apply_sort(SortKey::Name);
@@ -652,9 +739,114 @@ mod tests {
     }
 
     #[test]
+    fn calculated_folder_sizes_show_and_survive_a_refresh() {
+        let mut list = list_of(&[("docs", true), ("src", true), ("a.txt", false)]);
+        assert_eq!(list.entries[0].size_display(), "", "unknown until asked");
+
+        list.set_dir_sizes(vec![("docs".into(), 2048)]);
+        let docs = list.entries.iter().find(|e| e.name == "docs").unwrap();
+        assert_eq!(docs.size_display(), "2 KB");
+
+        // A reload must not throw the work away.
+        list.refresh_entries(vec![entry("docs", true), entry("src", true)]);
+        let docs = list.entries.iter().find(|e| e.name == "docs").unwrap();
+        assert_eq!(docs.size_display(), "2 KB");
+    }
+
+    #[test]
+    fn names_reports_the_visible_set() {
+        let list = list_of(&[("a", false), ("b", true)]);
+        let n = list.names();
+        assert!(n.contains("a") && n.contains("b") && n.len() == 2);
+    }
+
+    #[test]
     fn test_select_all() {
         let mut list = list_of(&[("a", false), ("b", false), ("c", false)]);
         list.select_all();
         assert_eq!(list.selection_count(), 3);
+    }
+
+    #[test]
+    fn filter_narrows_the_visible_list() {
+        let mut list = list_of(&[
+            ("readme.md", false),
+            ("main.rs", false),
+            ("lib.rs", false),
+            ("src", true),
+        ]);
+        assert_eq!(list.entries.len(), 4);
+        list.set_filter("rs");
+        let names: Vec<&str> = list.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["lib.rs", "main.rs"]);
+        assert_eq!(list.unfiltered_count(), 4);
+        assert!(list.is_filtered());
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_and_matches_anywhere() {
+        let mut list = list_of(&[("ReadMe.MD", false), ("other.txt", false)]);
+        list.set_filter("dme");
+        assert_eq!(list.entries.len(), 1);
+        assert_eq!(list.entries[0].name, "ReadMe.MD");
+    }
+
+    #[test]
+    fn clearing_the_filter_restores_everything() {
+        let mut list = list_of(&[("a.rs", false), ("b.txt", false)]);
+        list.set_filter("rs");
+        assert_eq!(list.entries.len(), 1);
+        list.clear_filter();
+        assert_eq!(list.entries.len(), 2);
+    }
+
+    #[test]
+    fn filter_survives_a_refresh() {
+        let mut list = list_of(&[("a.rs", false), ("b.txt", false)]);
+        list.set_filter("rs");
+        list.refresh_entries(vec![
+            entry("a.rs", false),
+            entry("b.txt", false),
+            entry("c.rs", false),
+        ]);
+        assert_eq!(list.entries.len(), 2, "new matching file appears, filter holds");
+    }
+
+    #[test]
+    fn filter_keeps_selection_on_rows_that_still_match() {
+        let mut list = list_of(&[("a.rs", false), ("b.rs", false), ("c.txt", false)]);
+        list.select(1, SelectMode::Replace);
+        assert_eq!(list.selected_entries()[0].name, "b.rs");
+        list.set_filter("rs");
+        assert_eq!(list.selection_count(), 1);
+        assert_eq!(list.selected_entries()[0].name, "b.rs");
+    }
+
+    #[test]
+    fn toggling_hidden_does_not_lose_the_underlying_entries() {
+        let hidden = FileEntry {
+            is_hidden: true,
+            ..entry("secret.sys", false)
+        };
+        let mut list = FileList::default();
+        list.set_entries(vec![entry("visible.txt", false), hidden]);
+        assert_eq!(list.entries.len(), 1);
+        // Regression: hidden entries used to be discarded at load time, so
+        // turning the option on showed nothing until the next directory read.
+        list.set_show_hidden(true);
+        assert_eq!(list.entries.len(), 2);
+        list.set_show_hidden(false);
+        assert_eq!(list.entries.len(), 1);
+    }
+
+    #[test]
+    fn push_and_pop_filter_chars() {
+        let mut list = list_of(&[("alpha", false), ("beta", false)]);
+        list.push_filter_char('a');
+        list.push_filter_char('l');
+        assert_eq!(list.entries.len(), 1);
+        list.pop_filter_char();
+        assert_eq!(list.filter(), "a");
+        assert_eq!(list.entries.len(), 2, "both names contain an a");
     }
 }
