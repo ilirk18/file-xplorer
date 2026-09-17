@@ -63,6 +63,8 @@ pub const CMD_RECENT: usize = 142;
 pub const CMD_INSPECTOR: usize = 143;
 pub const CMD_GRID: usize = 144;
 pub const CMD_BIND: usize = 145;
+pub const CMD_NEW_WINDOW: usize = 146;
+pub const CMD_TOGGLE_BAR: usize = 147;
 
 /// Everything the palette can reach. The context menu builds from the same
 /// list, so a command is described in exactly one place.
@@ -107,6 +109,11 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_GO_BACK, label: "Go back", keys: "Alt+Left" },
     CommandDef { id: CMD_GO_FORWARD, label: "Go forward", keys: "Alt+Right" },
     CommandDef { id: CMD_NEW_TAB, label: "New tab", keys: "Ctrl+T" },
+    CommandDef { id: CMD_NEW_WINDOW, label: "New window", keys: "Ctrl+N" },
+    // In the table so its shortcut is real and rebindable like every other.
+    // `show_palette` leaves it out of its own list, because a palette offering
+    // to open the palette is a joke that stops being funny immediately.
+    CommandDef { id: CMD_PALETTE, label: "All commands", keys: "Ctrl+Shift+P" },
     CommandDef { id: CMD_CLOSE_TAB, label: "Close tab", keys: "Ctrl+W" },
     CommandDef { id: CMD_SINGLE_PANE, label: "Single pane", keys: "Ctrl+1" },
     CommandDef { id: CMD_DUAL_PANE, label: "Two panes", keys: "Ctrl+2" },
@@ -117,6 +124,7 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { id: CMD_TOGGLE_HIDDEN, label: "Toggle hidden files", keys: "Ctrl+H" },
     CommandDef { id: CMD_TOGGLE_SIDEBAR, label: "Toggle sidebar", keys: "Ctrl+B" },
     CommandDef { id: CMD_INSPECTOR, label: "Toggle inspector", keys: "Alt+P" },
+    CommandDef { id: CMD_TOGGLE_BAR, label: "Toggle command bar", keys: "" },
     CommandDef { id: CMD_GRID, label: "Toggle icon view", keys: "Ctrl+Shift+I" },
     CommandDef { id: CMD_BIND, label: "Change a shortcut", keys: "" },
     CommandDef { id: CMD_TOGGLE_THEME, label: "Toggle dark / light theme", keys: "Ctrl+Shift+D" },
@@ -186,6 +194,191 @@ pub fn id_for_label(label: &str) -> Option<usize> {
         .map(|c| c.id)
 }
 
+// ---------------------------------------------------------------------------
+// Command bar
+// ---------------------------------------------------------------------------
+
+/// What one button on the command bar does when clicked.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BarAction {
+    /// Run a command, the same one the palette and the context menu run.
+    Run(usize),
+    /// Drop a menu down under the button.
+    Menu(BarMenu),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BarMenu {
+    New,
+    Sort,
+    View,
+}
+
+pub struct BarItem {
+    pub glyph: &'static str,
+    /// Empty for an icon-only button, which is most of them.
+    pub label: &'static str,
+    pub action: BarAction,
+    pub right: bool,
+}
+
+/// The bar, left to right.
+///
+/// Every entry runs something that already existed. The bar is a second way to
+/// reach the commands, never a second implementation of them, which is why
+/// nothing below this line knows how to copy a file.
+pub const BAR: &[BarItem] = &[
+    BarItem { glyph: crate::renderer::glyph::ADD, label: "New", action: BarAction::Menu(BarMenu::New), right: false },
+    BarItem { glyph: crate::renderer::glyph::CUT, label: "", action: BarAction::Run(CMD_CUT), right: false },
+    BarItem { glyph: crate::renderer::glyph::COPY, label: "", action: BarAction::Run(CMD_COPY), right: false },
+    BarItem { glyph: crate::renderer::glyph::PASTE, label: "", action: BarAction::Run(CMD_PASTE), right: false },
+    BarItem { glyph: crate::renderer::glyph::RENAME, label: "", action: BarAction::Run(CMD_RENAME), right: false },
+    BarItem { glyph: crate::renderer::glyph::DELETE, label: "", action: BarAction::Run(CMD_DELETE), right: false },
+    BarItem { glyph: crate::renderer::glyph::SORT, label: "Sort", action: BarAction::Menu(BarMenu::Sort), right: false },
+    BarItem { glyph: crate::renderer::glyph::VIEW, label: "View", action: BarAction::Menu(BarMenu::View), right: false },
+    BarItem { glyph: crate::renderer::glyph::MORE, label: "", action: BarAction::Run(CMD_PALETTE), right: false },
+    BarItem { glyph: crate::renderer::glyph::PANE, label: "Details", action: BarAction::Run(CMD_INSPECTOR), right: true },
+];
+
+/// Whether a button is live.
+///
+/// The same question the context menu asks before offering an entry, so the bar
+/// cannot offer what an operation would then refuse.
+pub fn bar_enabled(state: &AppState, action: BarAction) -> bool {
+    let pane = state.focused_pane();
+    let here = pane.current_path();
+    let selected = pane.list().selection_count();
+    let writable = !crate::shellns::is_shell_path(here) && crate::archive::split(here).is_none();
+    match action {
+        BarAction::Run(CMD_CUT) => selected > 0 && writable,
+        BarAction::Run(CMD_COPY) => selected > 0,
+        BarAction::Run(CMD_PASTE) => writable && ops::clipboard_has_files(),
+        BarAction::Run(CMD_RENAME) => selected == 1 && writable,
+        BarAction::Run(CMD_DELETE) => selected > 0 && writable,
+        BarAction::Menu(BarMenu::New) => writable,
+        _ => true,
+    }
+}
+
+/// Click a command-bar button. `rect` is where it is, so a menu drops under it.
+pub fn do_bar(state: &mut AppState, hwnd: HWND, index: usize, rect: crate::layout::Rect) {
+    let Some(item) = BAR.get(index) else { return };
+    if !bar_enabled(state, item.action) {
+        return;
+    }
+    match item.action {
+        BarAction::Run(cmd) => run_command(state, hwnd, cmd),
+        BarAction::Menu(which) => bar_menu(state, hwnd, which, rect),
+    }
+}
+
+/// Ids local to a bar menu, well clear of the command ids.
+const SORT_FIRST: usize = 9000;
+const ORDER_ASC: usize = 9100;
+const ORDER_DESC: usize = 9101;
+const ICON_FIRST: usize = 9200;
+
+/// Drop a menu under a bar button, using the same themed menu as the context
+/// menu so it looks like part of the app rather than part of Windows.
+fn bar_menu(state: &mut AppState, hwnd: HWND, which: BarMenu, rect: crate::layout::Rect) {
+    use crate::file_list::{SortKey, SortOrder};
+    use crate::layout::{ICONS_OFF, ICON_STEPS};
+
+    let pid = state.focused;
+    let list = state.pane(pid).list();
+    let (key, order) = (list.sort_key, list.sort_order);
+    let icons = state.icons;
+    let binds = state.bindings.clone();
+    // A bullet rather than a checkmark column: the themed menu draws one string
+    // per row, and three spaces keep the unticked entries lined up with it.
+    let tick = |on: bool| if on { "\u{2022} " } else { "   " };
+
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let mut themed = crate::menu::ThemedMenu::new(state.theme, state.dpi);
+        match which {
+            BarMenu::New => {
+                themed.add(menu, CMD_NEW_FOLDER, "New folder", &binds.text_for(CMD_NEW_FOLDER));
+                themed.add(menu, CMD_NEW_TAB, "New tab", &binds.text_for(CMD_NEW_TAB));
+                themed.add(menu, CMD_NEW_WINDOW, "New window", &binds.text_for(CMD_NEW_WINDOW));
+                themed.separator(menu);
+                themed.add(menu, CMD_ARCHIVE, "Add to archive\u{2026}", "");
+            }
+            BarMenu::Sort => {
+                for (i, (k, name)) in [
+                    (SortKey::Name, "Name"),
+                    (SortKey::Type, "Type"),
+                    (SortKey::Size, "Size"),
+                    (SortKey::Date, "Date modified"),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    themed.add(menu, SORT_FIRST + i, &format!("{}{}", tick(*k == key), name), "");
+                }
+                themed.separator(menu);
+                let asc = order == SortOrder::Asc;
+                themed.add(menu, ORDER_ASC, &format!("{}Ascending", tick(asc)), "");
+                themed.add(menu, ORDER_DESC, &format!("{}Descending", tick(!asc)), "");
+            }
+            BarMenu::View => {
+                themed.add(
+                    menu,
+                    ICON_FIRST,
+                    &format!("{}Details", tick(icons == ICONS_OFF)),
+                    &binds.text_for(CMD_GRID),
+                );
+                themed.separator(menu);
+                for (i, size) in ICON_STEPS.iter().enumerate() {
+                    themed.add(
+                        menu,
+                        ICON_FIRST + 1 + i,
+                        &format!("{}Icons, {} px", tick(icons == *size), size),
+                        "",
+                    );
+                }
+            }
+        }
+        themed.apply(menu);
+
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_NONOTIFY,
+            rect.x,
+            rect.bottom(),
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        let id = cmd.0 as usize;
+        if id == 0 {
+            return;
+        }
+        if id >= ICON_FIRST {
+            let step = id - ICON_FIRST;
+            state.icons = if step == 0 {
+                ICONS_OFF
+            } else {
+                ICON_STEPS[(step - 1).min(ICON_STEPS.len() - 1)]
+            };
+            state.remember_current_view();
+            state.sync_columns();
+        } else if id == ORDER_ASC || id == ORDER_DESC {
+            let want = if id == ORDER_ASC { SortOrder::Asc } else { SortOrder::Desc };
+            state.pane_mut(pid).list_mut().set_sort(key, want);
+            state.remember_current_view();
+        } else if id >= SORT_FIRST {
+            let want =
+                [SortKey::Name, SortKey::Type, SortKey::Size, SortKey::Date][(id - SORT_FIRST).min(3)];
+            state.pane_mut(pid).list_mut().set_sort(want, order);
+            state.remember_current_view();
+        } else {
+            run_command(state, hwnd, id);
+        }
+    }
+}
+
 /// Show every command, filtered as you type.
 pub fn show_palette(state: &mut AppState, hwnd: HWND) {
     if state.modal {
@@ -194,20 +387,30 @@ pub fn show_palette(state: &mut AppState, hwnd: HWND) {
     // The shortcut shown is whatever is bound now, not the default baked into
     // the table: a rebound command that still advertised its old chord would
     // be worse than showing none.
-    let items: Vec<palette::Item> = COMMANDS
+    let items: Vec<(usize, palette::Item)> = COMMANDS
         .iter()
-        .map(|c| palette::Item {
-            label: c.label.to_string(),
-            detail: state.bindings.text_for(c.id),
+        .filter(|c| c.id != CMD_PALETTE)
+        .map(|c| {
+            (
+                c.id,
+                palette::Item {
+                    label: c.label.to_string(),
+                    detail: state.bindings.text_for(c.id),
+                },
+            )
         })
         .collect();
+    let ids: Vec<usize> = items.iter().map(|(id, _)| *id).collect();
+    let items: Vec<palette::Item> = items.into_iter().map(|(_, it)| it).collect();
 
     state.modal = true;
     let chosen = palette::pick(hwnd, state.dpi, "Commands", items);
     state.modal = false;
 
     if let Some(i) = chosen {
-        run_command(state, hwnd, COMMANDS[i].id);
+        if let Some(id) = ids.get(i).copied() {
+            run_command(state, hwnd, id);
+        }
     }
 }
 
@@ -993,12 +1196,12 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
 
         // Everything installed software registered goes below our own items,
         // and only when there is something selected for it to act on.
-        let paths = if row.is_some() {
-            state.pane(pid).selected_paths()
+        let selected = if row.is_some() {
+            state.pane(pid).selected_pidls()
         } else {
             Vec::new()
         };
-        let shell = shellmenu::append(menu, hwnd, &paths);
+        let shell = shellmenu::append(menu, hwnd, &selected);
 
         let cmd = TrackPopupMenu(
             menu,
@@ -1056,6 +1259,18 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         CMD_PALETTE => show_palette(state, hwnd),
         CMD_GOTO => do_goto(state, hwnd),
         CMD_RECENT => do_recent(state, hwnd),
+        CMD_TOGGLE_BAR => state.command_bar = !state.command_bar,
+        CMD_NEW_WINDOW => {
+            // Opens on this folder rather than restoring the session: the
+            // session belongs to one window, and this is not it.
+            let here = state.pane(pid).current_path().to_string();
+            if let Err(e) = crate::create_window(crate::WindowOpts {
+                start: (!here.is_empty()).then_some(here),
+                owns_session: false,
+            }) {
+                report_error(hwnd, "New window", &ops::format_hresult(&e));
+            }
+        }
         CMD_BIND => do_bind(state, hwnd),
         CMD_TERMINAL => do_terminal(state, hwnd),
         CMD_COPY_PATH => do_copy_path(state, hwnd),
@@ -1077,7 +1292,14 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
             state.clamp_split();
         }
         CMD_GRID => {
-            state.grid = !state.grid;
+            // Toggling goes to the default size and back, rather than to
+            // whatever size was last used: a toggle that lands somewhere
+            // different each time is not a toggle.
+            state.icons = if state.icons == crate::layout::ICONS_OFF {
+                crate::layout::DEFAULT_ICONS
+            } else {
+                crate::layout::ICONS_OFF
+            };
             // Choosing a view by hand is a statement about this folder, the
             // same as choosing a sort.
             state.remember_current_view();
@@ -1189,6 +1411,19 @@ mod tests {
                 c.keys
             );
         }
+    }
+
+    #[test]
+    fn a_plain_ctrl_letter_chord_reaches_its_command() {
+        // Ctrl+N was the first command with no hardcoded fallback in the key
+        // handler, so it was also the first that would have failed silently if
+        // the binding table were not really being consulted.
+        let b = crate::keys::Bindings::from_defaults(&default_bindings());
+        let ctrl_n = crate::keys::Chord::new(b'N' as u16, true, false, false);
+        assert_eq!(b.command_for(ctrl_n), Some(CMD_NEW_WINDOW));
+
+        let ctrl_shift_p = crate::keys::Chord::new(b'P' as u16, true, true, false);
+        assert_eq!(b.command_for(ctrl_shift_p), Some(CMD_PALETTE));
     }
 
     #[test]

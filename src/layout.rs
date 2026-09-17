@@ -132,6 +132,10 @@ pub struct Metrics {
     pub new_tab_w: i32,
 
     pub toolbar_h: i32,
+    /// The command bar across the top of the window.
+    pub bar_h: i32,
+    pub bar_btn_w: i32,
+    pub bar_gap: i32,
     pub nav_btn_w: i32,
     pub header_h: i32,
     pub footer_h: i32,
@@ -154,9 +158,9 @@ pub struct Metrics {
     pub icon_size: i32,
     /// One cell of the icon view, and the icon drawn inside it. Wide enough
     /// for a readable two-line name under a thumbnail.
-    pub cell_w: i32,
-    pub cell_h: i32,
-    pub cell_icon: i32,
+    /// Icon sizes the view steps through, in DIPs. Smallest first; stepping
+    /// below the first one is the details list.
+    pub icon_steps: &'static [i32],
     pub pad: i32,
     pub radius: f32,
 
@@ -182,6 +186,9 @@ impl Metrics {
             new_tab_w: s(26.0),
 
             toolbar_h: s(30.0),
+            bar_h: s(38.0),
+            bar_btn_w: s(34.0),
+            bar_gap: s(3.0),
             nav_btn_w: s(26.0),
             header_h: s(24.0),
             footer_h: s(24.0),
@@ -200,9 +207,7 @@ impl Metrics {
             scrollbar_min_thumb: s(28.0),
             min_pane_w: s(240.0),
             icon_size: s(16.0),
-            cell_w: s(118.0),
-            cell_h: s(124.0),
-            cell_icon: s(72.0),
+            icon_steps: ICON_STEPS,
             pad: s(8.0),
             radius: 4.0 * scale,
 
@@ -319,6 +324,8 @@ pub struct PaneLayout {
     pub columns_per_line: u32,
     /// Height of one line: a row in the details view, a cell in the icon view.
     pub line_h: i32,
+    /// Icon edge inside a cell, already in physical pixels.
+    pub cell_icon: i32,
 
     pub footer: Rect,
     pub filter: Rect,
@@ -364,10 +371,10 @@ impl PaneLayout {
         if self.columns_per_line > 1 {
             // Icon view: a big icon over a two-line name, both centred.
             let icon = Rect::new(
-                cell.x + (cell.w - m.cell_icon) / 2,
+                cell.x + (cell.w - self.cell_icon) / 2,
                 cell.y + m.pad,
-                m.cell_icon,
-                m.cell_icon,
+                self.cell_icon,
+                self.cell_icon,
             );
             let label = Rect::new(
                 cell.x + m.pad / 2,
@@ -479,6 +486,11 @@ pub struct Layout {
     /// taken off the body before the panes are laid out, so nothing else has
     /// to know it exists.
     pub inspector: Rect,
+    /// The command bar, or empty when hidden.
+    pub bar: Rect,
+    /// One rectangle per item the caller passed, in the same order. An item
+    /// that did not fit gets an empty one and is neither drawn nor clickable.
+    pub bar_items: Vec<Rect>,
     pub panes: Vec<PaneLayout>,
     /// One fewer than `panes`. Empty when a single pane fills the window.
     pub dividers: Vec<Rect>,
@@ -513,9 +525,66 @@ pub enum Hit {
     /// Click on the track above or below the thumb; the f32 is 0..1 along the track.
     ScrollbarTrack(PaneId, f32),
     Filter(PaneId),
+    /// Index into the command-bar items the caller supplied.
+    Bar(usize),
 }
 
 /// Everything the layout needs to know about one pane to size it.
+/// From a thumbnail you can just about tell a photo apart, to one you can read
+/// a screenshot in. Doubling roughly each step, so a wheel notch is a visible
+/// change rather than a nudge.
+pub const ICON_STEPS: &[i32] = &[32, 48, 72, 104, 144, 192, 256];
+
+/// The details list, as an icon size. Zero is not a size, which is what makes
+/// "one scalar decides the view" work: no separate flag to keep in step.
+pub const ICONS_OFF: i32 = 0;
+
+impl Metrics {
+    /// Cell width, height and icon edge for an icon view at `icon_dip`.
+    ///
+    /// A cell is the icon plus room for two lines of name; both constants were
+    /// the difference between the old fixed 72px icon and its 118x124 cell, so
+    /// the default size still lays out exactly as it did.
+    pub fn cell(&self, icon_dip: i32) -> (i32, i32, i32) {
+        let px = |v: i32| (v as f32 * self.scale).round() as i32;
+        let icon = px(icon_dip);
+        (icon + px(46), icon + px(52), icon)
+    }
+
+    /// The next size up or down, or `ICONS_OFF` when stepping below the
+    /// smallest. Stepping up from the details list enters at the default.
+    pub fn step_icons(&self, current: i32, up: bool) -> i32 {
+        let steps = self.icon_steps;
+        if current == ICONS_OFF {
+            return if up { DEFAULT_ICONS } else { ICONS_OFF };
+        }
+        let i = steps.iter().position(|s| *s == current).unwrap_or(0);
+        match up {
+            true => steps[(i + 1).min(steps.len() - 1)],
+            false if i == 0 => ICONS_OFF,
+            false => steps[i - 1],
+        }
+    }
+}
+
+/// What the icon view opens at: big enough to recognise a photo, small enough
+/// that a folder of them still fits on a screen.
+pub const DEFAULT_ICONS: i32 = 72;
+
+/// One command-bar button, as far as the layout is concerned.
+///
+/// The same bargain as `SidebarEntry`: the caller decides what a button means
+/// and the layout only decides where it goes, so adding a button needs no
+/// change here.
+pub struct BarItemInput<'a> {
+    /// Text beside the glyph. Empty for an icon-only button.
+    pub label: &'a str,
+    /// Drawn with a chevron, because it opens a menu rather than acting.
+    pub menu: bool,
+    /// Sits at the right-hand end instead of flowing from the left.
+    pub right: bool,
+}
+
 pub struct PaneInput<'a> {
     pub tab_labels: &'a [String],
     pub crumbs: &'a [String],
@@ -523,8 +592,8 @@ pub struct PaneInput<'a> {
     /// It is what the scrollbar measures against.
     pub total_lines: u32,
     pub scroll_offset: u32,
-    /// Icon view rather than the details list.
-    pub grid: bool,
+    /// Icon edge in DIPs, or `ICONS_OFF` for the details list.
+    pub icons: i32,
 }
 
 impl Layout {
@@ -542,11 +611,20 @@ impl Layout {
         // How far the sidebar is scrolled, in pixels.
         sidebar_scroll: i32,
         inspector_visible: bool,
+        bar_items: &[BarItemInput],
         panes: &[PaneInput],
         measurer: &dyn TextMeasurer,
     ) -> Layout {
         let m = metrics;
-        let body = client;
+        // The command bar spans the window above everything else, including the
+        // sidebar: it acts on the focused pane, and one per pane would cost
+        // four bars' worth of height to say the same thing.
+        let (bar, body) = if bar_items.is_empty() {
+            (Rect::default(), client)
+        } else {
+            client.split_top(m.bar_h)
+        };
+        let bar_rects = bar_rects(bar, m, bar_items, measurer);
 
         let (sidebar, body) = if sidebar_visible {
             body.split_left(m.sidebar_w)
@@ -568,6 +646,8 @@ impl Layout {
             sidebar,
             sidebar_rows,
             inspector,
+            bar,
+            bar_items: bar_rects,
             panes: bounds
                 .iter()
                 .zip(panes)
@@ -635,6 +715,14 @@ impl Layout {
     }
 
     pub fn hit_test(&self, x: i32, y: i32) -> Hit {
+        for (i, r) in self.bar_items.iter().enumerate() {
+            if r.contains(x, y) {
+                return Hit::Bar(i);
+            }
+        }
+        if self.bar.contains(x, y) {
+            return Hit::Nothing;
+        }
         for (i, d) in self.dividers.iter().enumerate() {
             if d.contains(x, y) {
                 return Hit::Divider(i);
@@ -784,6 +872,56 @@ pub fn tree_indent(m: Metrics, depth: usize) -> i32 {
     (depth.min(12) as i32) * (m.icon_size - m.pad / 4).max(1)
 }
 
+/// Lay the command bar out: icon-only buttons at a fixed width, labelled ones
+/// as wide as their text needs, and the right-aligned ones packed from the far
+/// end. Anything that does not fit gets an empty rectangle rather than
+/// overlapping its neighbour.
+fn bar_rects(
+    bar: Rect,
+    m: Metrics,
+    items: &[BarItemInput],
+    measurer: &dyn TextMeasurer,
+) -> Vec<Rect> {
+    let mut out = vec![Rect::default(); items.len()];
+    if bar.is_empty() {
+        return out;
+    }
+    let width_of = |it: &BarItemInput| {
+        if it.label.is_empty() {
+            m.bar_btn_w
+        } else {
+            // Glyph, the label, and room for the chevron when there is one.
+            m.bar_btn_w
+                + measurer.measure(it.label, true).ceil() as i32
+                + if it.menu { m.pad * 2 } else { m.pad }
+        }
+    };
+
+    let y = bar.y + m.bar_gap;
+    let h = (bar.h - m.bar_gap * 2).max(0);
+    let mut right_edge = bar.right() - m.bar_gap;
+    for (i, it) in items.iter().enumerate().rev().filter(|(_, it)| it.right) {
+        let w = width_of(it);
+        if right_edge - w < bar.x {
+            break;
+        }
+        right_edge -= w;
+        out[i] = Rect::new(right_edge, y, w, h);
+        right_edge -= m.bar_gap;
+    }
+
+    let mut x = bar.x + m.bar_gap;
+    for (i, it) in items.iter().enumerate().filter(|(_, it)| !it.right) {
+        let w = width_of(it);
+        if x + w > right_edge {
+            break; // Out of room: the overflow button is where the rest live.
+        }
+        out[i] = Rect::new(x, y, w, h);
+        x += w + m.bar_gap;
+    }
+    out
+}
+
 /// Total height every sidebar entry would need, unscrolled. The caller clamps
 /// its scroll against this.
 pub fn sidebar_content_h(m: Metrics, entries: &[SidebarEntry]) -> i32 {
@@ -879,7 +1017,8 @@ fn pane_layout(
     let (tab_bar, rest) = bounds.split_top(m.tab_bar_h);
     let (toolbar, rest) = rest.split_top(m.toolbar_h);
     // The icon view has no columns, so it has no column header to click.
-    let (header, rest) = rest.split_top(if input.grid { 0 } else { m.header_h });
+    let grid = input.icons != ICONS_OFF;
+    let (header, rest) = rest.split_top(if grid { 0 } else { m.header_h });
     let (list_area, footer) = rest.split_bottom(m.footer_h);
     let (list, scrollbar) = list_area.split_right(m.scrollbar_w);
 
@@ -904,10 +1043,11 @@ fn pane_layout(
 
     // Details is the grid with one column: everything below works off these
     // two numbers, so neither the painter nor hit-testing needs a view branch.
-    let (columns_per_line, line_h) = if input.grid {
-        ((list.w / m.cell_w).max(1) as u32, m.cell_h)
+    let (cell_w, cell_h, cell_icon) = m.cell(input.icons);
+    let (columns_per_line, line_h, cell_icon) = if grid {
+        ((list.w / cell_w.max(1)).max(1) as u32, cell_h, cell_icon)
     } else {
-        (1, m.row_h)
+        (1, m.row_h, m.icon_size)
     };
     let visible_rows = if line_h > 0 {
         (list.h / line_h).max(0) as u32
@@ -945,6 +1085,7 @@ fn pane_layout(
         visible_rows,
         columns_per_line,
         line_h,
+        cell_icon,
         footer,
         filter: filter.inset(m.pad / 2, m.pad / 4),
         counts,
@@ -1157,7 +1298,7 @@ mod tests {
             tab_labels: tabs,
             crumbs,
             total_lines: rows,
-            grid: false,
+            icons: ICONS_OFF,
             scroll_offset: scroll,
         }
     }
@@ -1194,7 +1335,7 @@ mod tests {
         let inputs: Vec<PaneInput> = (0..n)
             .map(|_| input(&tabs, crumbs, 100, 0))
             .collect();
-        Layout::compute(client, m, &splits, true, &sidebar_of(2), 0, false, &inputs, &FixedWidth)
+        Layout::compute(client, m, &splits, true, &sidebar_of(2), 0, false, &[], &inputs, &FixedWidth)
     }
 
     fn build(w: i32, h: i32, crumbs: &[String]) -> Layout {
@@ -1238,7 +1379,7 @@ mod tests {
         // apart, not let two panes collapse to nothing.
         let splits = Layout::clamp_splits(client, m, true, false, 4, &[0.01, 0.02, 0.03]);
         let inputs: Vec<PaneInput> = (0..4).map(|_| input(&[], &[], 0, 0)).collect();
-        let l = Layout::compute(client, m, &splits, true, &[], 0, false, &inputs, &FixedWidth);
+        let l = Layout::compute(client, m, &splits, true, &[], 0, false, &[], &inputs, &FixedWidth);
         for p in &l.panes {
             assert!(p.bounds.w >= m.min_pane_w, "pane too narrow: {:?}", p.bounds);
         }
@@ -1274,6 +1415,7 @@ mod tests {
             &sidebar_of(2),
             0,
             false,
+            &[],
             &[input(&tabs, &crumbs, 10, 0)],
             &FixedWidth,
         );
@@ -1427,6 +1569,7 @@ mod tests {
             &[],
             0,
             false,
+            &[],
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1453,6 +1596,7 @@ mod tests {
             &[],
             0,
             false,
+            &[],
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1519,6 +1663,7 @@ mod tests {
             &[],
             0,
             false,
+            &[],
             &[input(&tabs, &crumbs, 10, 0)],
             &FixedWidth,
         )
@@ -1582,6 +1727,7 @@ mod tests {
                 &[],
                 0,
                 false,
+                &[],
                 &[
                     input(&tabs, &crumbs, 1000, offset),
                     input(&tabs, &crumbs, 1000, offset),
@@ -1621,6 +1767,7 @@ mod tests {
             &[],
             0,
             false,
+            &[],
             &[input(&tabs, &crumbs, 3, 0), input(&tabs, &crumbs, 3, 0)],
             &FixedWidth,
         );
@@ -1706,6 +1853,7 @@ mod tests {
             &entries,
             0,
             false,
+            &[],
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1744,6 +1892,7 @@ mod tests {
             &sidebar_of(2),
             0,
             false,
+            &[],
             &[input(&tabs, &crumbs, 0, 0), input(&tabs, &crumbs, 0, 0)],
             &FixedWidth,
         );
@@ -1871,6 +2020,7 @@ mod tests {
                 &sidebar_of(2),
                 0,
                 inspector,
+                &[],
                 &[input(&tabs, &crumbs, 10, 0)],
                 &FixedWidth,
             )
@@ -1907,6 +2057,10 @@ mod tests {
     }
 
     fn grid_pane(w: i32) -> Layout {
+        grid_pane_sized(w, DEFAULT_ICONS)
+    }
+
+    fn grid_pane_sized(w: i32, icons: i32) -> Layout {
         let tabs = strs(&["C:\\"]);
         let crumbs = strs(&["C:"]);
         Layout::compute(
@@ -1917,12 +2071,13 @@ mod tests {
             &[],
             0,
             false,
+            &[],
             &[PaneInput {
                 tab_labels: &tabs,
                 crumbs: &crumbs,
                 total_lines: 50,
                 scroll_offset: 0,
-                grid: true,
+                icons,
             }],
             &FixedWidth,
         )
@@ -1934,8 +2089,9 @@ mod tests {
         let l = grid_pane(1000);
         let p = &l.panes[0];
         assert!(p.header.is_empty(), "no columns, so no column header");
-        assert_eq!(p.columns_per_line, (p.list.w / m.cell_w).max(1) as u32);
-        assert_eq!(p.line_h, m.cell_h);
+        let (cell_w, cell_h, _) = m.cell(DEFAULT_ICONS);
+        assert_eq!(p.columns_per_line, (p.list.w / cell_w).max(1) as u32);
+        assert_eq!(p.line_h, cell_h);
         assert!(p.columns_per_line > 1, "1000px should fit several cells");
 
         // The first line's cells sit side by side, all at the same height.
@@ -1945,7 +2101,7 @@ mod tests {
         assert_eq!(first.y, second.y);
         assert_eq!(first.right(), second.x);
         // The next line starts one cell height down.
-        assert_eq!(p.cell(cols, 0).unwrap().y, first.y + m.cell_h);
+        assert_eq!(p.cell(cols, 0).unwrap().y, first.y + cell_h);
         assert_eq!(p.cell(cols, 0).unwrap().x, first.x);
     }
 
@@ -1997,5 +2153,116 @@ mod tests {
         );
         assert_eq!(p.band_indices(band, 0, 100), vec![0, 1]);
         assert!(cols > 2, "this test needs a line wider than the band");
+    }
+
+    #[test]
+    fn stepping_icon_sizes_walks_off_the_bottom_into_the_details_list() {
+        let m = Metrics::for_dpi(96);
+        // Up from the list enters at the default rather than the smallest, so
+        // one notch produces something worth looking at.
+        assert_eq!(m.step_icons(ICONS_OFF, true), DEFAULT_ICONS);
+        // Down from the list stays there: there is nothing below it.
+        assert_eq!(m.step_icons(ICONS_OFF, false), ICONS_OFF);
+
+        // Down from the smallest icon is the list.
+        assert_eq!(m.step_icons(ICON_STEPS[0], false), ICONS_OFF);
+        // Up from the largest stays there rather than wrapping round to tiny.
+        let biggest = *ICON_STEPS.last().unwrap();
+        assert_eq!(m.step_icons(biggest, true), biggest);
+
+        // And every step in between moves exactly one place.
+        for pair in ICON_STEPS.windows(2) {
+            assert_eq!(m.step_icons(pair[0], true), pair[1]);
+            assert_eq!(m.step_icons(pair[1], false), pair[0]);
+        }
+    }
+
+    #[test]
+    fn a_bigger_icon_means_bigger_cells_and_fewer_of_them() {
+        let m = Metrics::for_dpi(96);
+        let small = grid_pane_sized(1000, 48);
+        let large = grid_pane_sized(1000, 192);
+        assert!(large.panes[0].line_h > small.panes[0].line_h);
+        assert!(large.panes[0].columns_per_line < small.panes[0].columns_per_line);
+        assert!(large.panes[0].cell_icon > small.panes[0].cell_icon);
+        // The default size still lays out exactly as the fixed cell used to.
+        let (w, h, icon) = m.cell(DEFAULT_ICONS);
+        assert_eq!((w, h, icon), (118, 124, 72));
+    }
+
+    #[test]
+    fn the_command_bar_takes_its_height_off_everything_below() {
+        let m = Metrics::for_dpi(96);
+        let tabs = strs(&["C:\\"]);
+        let crumbs = strs(&["C:"]);
+        let client = Rect::new(0, 0, 1400, 800);
+        let items = [
+            BarItemInput { label: "New", menu: true, right: false },
+            BarItemInput { label: "", menu: false, right: false },
+            BarItemInput { label: "Details", menu: false, right: true },
+        ];
+        let mk = |bar: &[BarItemInput]| {
+            Layout::compute(
+                client,
+                m,
+                &[],
+                true,
+                &sidebar_of(2),
+                0,
+                false,
+                bar,
+                &[input(&tabs, &crumbs, 10, 0)],
+                &FixedWidth,
+            )
+        };
+
+        let without = mk(&[]);
+        assert!(without.bar.is_empty());
+        assert!(without.bar_items.is_empty());
+        assert_eq!(without.sidebar.y, client.y);
+
+        let with = mk(&items);
+        assert_eq!(with.bar.h, m.bar_h);
+        assert_eq!(with.bar.w, client.w, "it spans the window, sidebar included");
+        // Everything below starts where the bar ends: no overlap, no gap.
+        assert_eq!(with.sidebar.y, with.bar.bottom());
+        assert_eq!(with.panes[0].bounds.y, with.bar.bottom());
+        assert_eq!(with.sidebar.h, without.sidebar.h - m.bar_h);
+    }
+
+    #[test]
+    fn bar_buttons_flow_left_and_the_right_ones_pack_from_the_far_end() {
+        let m = Metrics::for_dpi(96);
+        let items = [
+            BarItemInput { label: "New", menu: true, right: false },
+            BarItemInput { label: "", menu: false, right: false },
+            BarItemInput { label: "Details", menu: false, right: true },
+        ];
+        let bar = Rect::new(0, 0, 900, m.bar_h);
+        let r = bar_rects(bar, m, &items, &FixedWidth);
+
+        // Left-hand buttons in order, not overlapping.
+        assert!(r[0].x >= bar.x);
+        assert!(r[0].right() <= r[1].x);
+        // A labelled button is wider than an icon-only one.
+        assert!(r[0].w > r[1].w);
+        assert_eq!(r[1].w, m.bar_btn_w);
+        // The right-hand one is against the far edge, clear of the others.
+        assert!(r[2].right() <= bar.right());
+        assert!(r[2].x > r[1].right());
+    }
+
+    #[test]
+    fn a_bar_too_narrow_drops_buttons_rather_than_overlapping_them() {
+        let m = Metrics::for_dpi(96);
+        let items: Vec<BarItemInput> = (0..12)
+            .map(|_| BarItemInput { label: "", menu: false, right: false })
+            .collect();
+        let r = bar_rects(Rect::new(0, 0, 120, m.bar_h), m, &items, &FixedWidth);
+        let drawn: Vec<&Rect> = r.iter().filter(|r| !r.is_empty()).collect();
+        assert!(drawn.len() < items.len(), "some had to go");
+        for pair in drawn.windows(2) {
+            assert!(pair[0].right() <= pair[1].x, "and none of them overlap");
+        }
     }
 }

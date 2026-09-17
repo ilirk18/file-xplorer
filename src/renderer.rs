@@ -39,7 +39,7 @@ use crate::layout::{
 use crate::theme::{Palette, Rgb, Theme};
 
 // Segoe MDL2 Assets code points. Present on every Windows 10 and 11 install.
-mod glyph {
+pub mod glyph {
     pub const BACK: &str = "\u{E72B}";
     pub const FORWARD: &str = "\u{E72A}";
     pub const UP: &str = "\u{E74A}";
@@ -49,6 +49,17 @@ mod glyph {
     pub const CHEVRON_RIGHT: &str = "\u{E76C}";
     pub const CHEVRON_UP: &str = "\u{E70E}";
     pub const FILTER: &str = "\u{E71C}";
+
+    // The command bar.
+    pub const CUT: &str = "\u{E8C6}";
+    pub const COPY: &str = "\u{E8C8}";
+    pub const PASTE: &str = "\u{E77F}";
+    pub const RENAME: &str = "\u{E8AC}";
+    pub const DELETE: &str = "\u{E74D}";
+    pub const SORT: &str = "\u{E8CB}";
+    pub const VIEW: &str = "\u{E890}";
+    pub const MORE: &str = "\u{E712}";
+    pub const PANE: &str = "\u{E8A0}";
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -114,6 +125,14 @@ pub struct InspectorView<'a> {
     /// The preview and the key it was built for; the key is what the converted
     /// bitmap is cached against.
     pub preview: Option<(&'a str, &'a crate::preview::Preview)>,
+}
+
+/// One command-bar button, ready to draw.
+pub struct BarButtonView<'a> {
+    pub glyph: &'a str,
+    pub label: &'a str,
+    pub menu: bool,
+    pub enabled: bool,
 }
 
 /// Everything the renderer needs to paint the sidebar.
@@ -525,6 +544,62 @@ impl Renderer {
                 WICBitmapPaletteTypeMedianCut,
             )?;
             Ok(rt.CreateBitmapFromWicBitmap(&converter, None)?.cast()?)
+        }
+    }
+
+    /// The command bar: a row of buttons over the whole window, acting on
+    /// whichever pane has focus.
+    pub fn draw_command_bar(&mut self, layout: &Layout, items: &[BarButtonView], hover: Option<Hit>) {
+        if layout.bar.is_empty() {
+            return;
+        }
+        let p = self.palette();
+        let m = layout.metrics;
+        self.fill(layout.bar, p.toolbar_bg);
+        // A hairline underneath, so the bar reads as chrome rather than as the
+        // top of the first pane.
+        let edge = Rect::new(
+            layout.bar.x,
+            layout.bar.bottom() - 1.max(m.scale as i32),
+            layout.bar.w,
+            1.max(m.scale as i32),
+        );
+        self.fill(edge, p.divider);
+
+        for (i, item) in items.iter().enumerate() {
+            let Some(r) = layout.bar_items.get(i).copied() else {
+                break;
+            };
+            if r.is_empty() {
+                continue;
+            }
+            if item.enabled && hover == Some(Hit::Bar(i)) {
+                self.fill_rounded(r, m.radius, p.row_hover);
+            }
+            let fg = if item.enabled { p.text } else { p.text_faint };
+
+            // Glyph first, then the label, then the chevron — laid out left to
+            // right so an icon-only button centres its glyph in the whole
+            // button rather than in a notional icon column.
+            let glyph_w = if item.label.is_empty() { r.w } else { m.bar_btn_w };
+            self.glyph(item.glyph, Rect::new(r.x, r.y, glyph_w, r.h), fg);
+            if !item.label.is_empty() {
+                let chevron = if item.menu { m.pad * 2 } else { 0 };
+                let text = Rect::new(
+                    r.x + glyph_w,
+                    r.y,
+                    (r.w - glyph_w - chevron).max(0),
+                    r.h,
+                );
+                self.text(item.label, text, fg, &self.formats.small.clone());
+                if item.menu {
+                    self.glyph(
+                        glyph::CHEVRON_DOWN,
+                        Rect::new(r.right() - chevron, r.y, chevron, r.h),
+                        fg,
+                    );
+                }
+            }
         }
     }
 

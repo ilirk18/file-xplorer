@@ -62,7 +62,13 @@ namespace folder reports its ordinary path. They are read-only here, like
 archives: one guard refuses every destructive path into them rather than each
 command remembering to.
 
-**Icon view.** `Ctrl+Shift+I` lays the listing out as cells instead of rows,
+**Icon view, at whatever size suits.** `Ctrl+Shift+I` lays the listing out as
+cells instead of rows, and `Ctrl+wheel` steps the icon through seven sizes from
+32 to 256 — stepping below the smallest is the details list again, because the
+view is one number rather than a mode with a flag beside it. The size is
+remembered per folder along with its sort.
+
+`Ctrl+Shift+I` lays the listing out as cells instead of rows,
 each showing the shell's own thumbnail — the same one Explorer draws, so
 whatever handler is installed does the work — with the file-type icon in its
 place until one arrives and for everything that has none. Images are fetched
@@ -86,7 +92,7 @@ rather than renaming the wrong file. A row that is not on screen falls back to
 the dialog.
 
 **How you looked at a folder is remembered** for the session: sort Downloads by
-date, or put Pictures in the icon view, and that is how each comes back.
+date, or put Pictures in large icons, and that is how each comes back.
 
 **Every shortcut can be changed.** "Change a shortcut" in the palette picks a
 command and takes the keys to give it — `Ctrl+Shift+R`, `Alt+Left`, `F5`, or
@@ -99,6 +105,18 @@ always what actually fires. Changes live in the settings file as
 Movement is not rebindable: arrows, Page Up and Down, Home, End, Tab and
 type-ahead mean different things with Shift and Ctrl held, and that is not
 something a settings file should try to describe.
+
+**Opens where you point it.** `file-xplorer.exe C:\someolder` starts there
+rather than restoring the session, and a path to a *file* opens the folder
+holding it — which is what dragging a file onto the exe means. `Ctrl+N` opens a
+second window on the current folder. The session belongs to the first window;
+the others are passing through and do not overwrite its tabs.
+
+**A command bar,** off the same commands as everything else. New, Cut, Copy,
+Paste, Rename and Delete act on the focused pane and grey out when they would
+not work; Sort and View drop menus; `...` is the palette and `Details` is the
+inspector. It is a second way to reach the commands, never a second
+implementation of them — "Toggle command bar" in the palette hides it.
 
 **Command palette.** `Ctrl+Shift+P` finds any command by initials, so nothing
 is hidden behind a chord you have to remember.
@@ -209,6 +227,7 @@ These are the defaults; "Change a shortcut" in the palette rebinds any of them.
 | Batch rename | `Ctrl+Shift+R` |
 | One to four panes | `Ctrl+1` … `Ctrl+4` |
 | Switch pane | `Tab` (cycles rightwards) |
+| New window | `Ctrl+N` |
 | New / close / cycle tab | `Ctrl+T` / `Ctrl+W` / `Ctrl+Tab`, middle-click a tab to close |
 | Refresh | `F5` or `Ctrl+R` |
 | Cut / copy / paste | `Ctrl+X` / `Ctrl+C` / `Ctrl+V` (interoperates with Explorer via `CF_HDROP`) |
@@ -223,7 +242,7 @@ These are the defaults; "Change a shortcut" in the palette rebinds any of them.
 | Toggle sidebar / inspector | `Ctrl+B` / `Alt+P` |
 | Toggle dark / light | `Ctrl+Shift+D` |
 | Context menu | right-click or `Shift+F10` |
-| Icon view / details | `Ctrl+Shift+I` |
+| Icon view / details | `Ctrl+Shift+I`, `Ctrl+wheel` to resize |
 | Sort | click a column header (Name, Type, Size, Date); click again to reverse |
 | Resize panes | drag the divider, double-click it to even them up |
 
@@ -276,7 +295,7 @@ is unit-tested without a window.
 cargo test
 ```
 
-249 tests, no warnings. They cover path handling and name validation, the
+260 tests, no warnings. They cover path handling and name validation, the
 virtual list and selection model, sorting and filtering, tab and history
 behaviour, session restore, stale-load rejection, layout geometry and
 hit-testing at every pane count, undo inverses, search matching and content

@@ -682,6 +682,7 @@ mod tests {
             dir_size_known: false,
             extension: None,
             target: None,
+            pidl: None,
         }
     }
 

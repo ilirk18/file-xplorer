@@ -206,6 +206,11 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             unsafe { SetCapture(hwnd) };
         }
 
+        Hit::Bar(i) => {
+            let rect = state.layout().bar_items.get(i).copied().unwrap_or_default();
+            do_bar(state, hwnd, i, rect);
+        }
+
         Hit::Sidebar(i) => on_sidebar_click(state, hwnd, i, false),
 
         // The chevron is the only part of a tree row that toggles it; the rest
@@ -489,7 +494,7 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
     // meaning shifts with Ctrl and Shift rather than naming a command.
     //
     // Consulting the table first also settles a conflict the old match had:
-    // `VK_LEFT if state.grid` came before `VK_LEFT if alt`, so Alt+Left moved
+    // `VK_LEFT if grid` came before `VK_LEFT if alt`, so Alt+Left moved
     // the cursor in the icon view instead of going back.
     let chord = crate::keys::Chord::new(vk.0, ctrl, shift, alt);
     if let Some(cmd) = state.bindings.command_for(chord) {
@@ -502,7 +507,7 @@ pub fn on_key_down(state: &mut AppState, hwnd: HWND, vk: VIRTUAL_KEY) -> bool {
     match vk {
         // Left and Right step one entry; Up and Down step one line, which in
         // the icon view is a whole row of them. Same flat indices either way.
-        VK_LEFT | VK_RIGHT if state.grid => {
+        VK_LEFT | VK_RIGHT if state.icons != crate::layout::ICONS_OFF => {
             let delta = if vk == VK_LEFT { -1 } else { 1 };
             let list = state.pane_mut(pid).list_mut();
             if let Some(n) = list.move_cursor(delta, mode) {

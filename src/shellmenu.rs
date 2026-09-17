@@ -16,7 +16,7 @@
 
 use std::cell::RefCell;
 
-use crate::pidl::PidlList;
+use crate::pidl::Pidl;
 use windows::core::{Interface, PCSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::*;
@@ -37,21 +37,23 @@ pub struct ShellMenu {
     menu: IContextMenu,
 }
 
-/// Append the shell's items for `paths` to `hmenu`.
+/// Append the shell's items for `items` to `hmenu`.
+///
+/// Takes id lists rather than paths: a namespace item's parsing name is not the
+/// item — a Recycle Bin entry's is the path it came from, and binding to that
+/// string produces the original file's verbs instead of Restore.
 ///
 /// Returns None when there is nothing to add, which includes the ordinary case
 /// of an empty selection — the caller just shows its own menu.
-pub fn append(hmenu: HMENU, hwnd: HWND, paths: &[String]) -> Option<ShellMenu> {
-    if paths.is_empty() {
+pub fn append(hmenu: HMENU, hwnd: HWND, items: &[Pidl]) -> Option<ShellMenu> {
+    if items.is_empty() {
         return None;
     }
     unsafe {
-        let pidls = PidlList::absolute(paths)?;
-
         // Every selected item shares a parent folder, which is what lets one
         // GetUIObjectOf cover the whole selection.
-        let parent: IShellFolder = SHBindToParent(pidls.first(), None).ok()?;
-        let children = pidls.child_ptrs();
+        let parent: IShellFolder = SHBindToParent(items[0].as_ptr(), None).ok()?;
+        let children: Vec<_> = items.iter().map(|p| p.child_ptr()).collect();
         let menu: IContextMenu = parent.GetUIObjectOf(hwnd, &children, None).ok()?;
 
         let count = GetMenuItemCount(Some(hmenu)).max(0) as u32;

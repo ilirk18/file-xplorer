@@ -8,7 +8,10 @@ use std::time::Instant;
 
 use windows::core::{Result, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
+};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -21,7 +24,7 @@ use crate::ops;
 use crate::pane::{LoadRequest, Pane};
 use crate::renderer::Renderer;
 use crate::search;
-use crate::theme::Theme;
+use crate::theme::{Rgb, Theme};
 use crate::watch::Watcher;
 use crate::dnd;
 
@@ -266,6 +269,12 @@ pub struct AppState {
     pub tree_rows: Vec<crate::tree::TreeRow>,
     /// Which pane's footer filter box is taking keystrokes, if any.
     pub filter_focus: Option<PaneId>,
+    /// Where this window was told to open, consumed by `WM_CREATE`. `None`
+    /// means "restore the session", which is what the first window does.
+    pub start_path: Option<String>,
+    /// Whether this window's tabs and box are what the settings file records.
+    /// Exactly one window owns the session; the rest are passing through.
+    pub owns_session: bool,
     /// What a screen reader is allowed to see. Shared with the automation
     /// providers, which run on whatever thread UIA calls them from.
     pub uia: crate::uia::Shared,
@@ -275,9 +284,13 @@ pub struct AppState {
     /// Shell images for the icon view's cells, and the keys being fetched.
     pub thumbs: crate::preview::ThumbCache,
     thumbs_pending: std::collections::HashSet<String>,
-    /// Icon view rather than the details list, in every pane. Per-pane would
-    /// mean a per-pane array in the config like `sort`; nothing has asked.
-    pub grid: bool,
+    /// Icon edge in DIPs, or `ICONS_OFF` for the details list — one scalar for
+    /// the whole view, so there is no separate flag to keep in step with it.
+    /// Window-wide: per-pane would mean a per-pane array in the config like
+    /// `sort`, and nothing has asked.
+    pub icons: i32,
+    /// Is the command bar across the top showing?
+    pub command_bar: bool,
     /// Is the inspector panel on the right showing?
     pub inspector: bool,
     /// What the inspector is showing, keyed by path and modified time so an
@@ -296,7 +309,7 @@ pub struct AppState {
     ///
     /// ponytail: not persisted. Add `folderview=` lines to the config if
     /// wanting it across restarts; the session map is where the value is.
-    pub folder_view: std::collections::HashMap<String, (SortKey, SortOrder, bool)>,
+    pub folder_view: std::collections::HashMap<String, (SortKey, SortOrder, i32)>,
 
     pub hover: Option<Hit>,
     pub drag: Drag,
@@ -332,7 +345,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(dpi: u32) -> Result<Self> {
+    pub fn new(dpi: u32, opts: crate::WindowOpts) -> Result<Self> {
         let cfg = Config::load();
         let theme = if cfg.theme_dark {
             Theme::Dark
@@ -372,6 +385,8 @@ impl AppState {
             tree: crate::tree::Tree::default(),
             tree_rows: Vec::new(),
             filter_focus: None,
+            start_path: opts.start,
+            owns_session: opts.owns_session,
             uia: Default::default(),
             bindings: {
                 let mut b = crate::keys::Bindings::from_defaults(
@@ -393,7 +408,8 @@ impl AppState {
             },
             thumbs: Default::default(),
             thumbs_pending: Default::default(),
-            grid: cfg.grid,
+            icons: cfg.icons,
+            command_bar: cfg.command_bar,
             inspector: cfg.inspector,
             preview: None,
             preview_pending: None,
@@ -570,10 +586,24 @@ impl AppState {
                 crumbs: &crumbs[p.0],
                 total_lines: self.pane(p).list().total_lines(),
                 scroll_offset: self.pane(p).list().scroll_offset,
-                grid: self.grid,
+                icons: self.icons,
             })
             .collect();
         let (entries, _) = self.sidebar_model();
+        // The bar is the caller's list, like the sidebar's: the layout only
+        // decides where each button goes.
+        let bar_items: Vec<crate::layout::BarItemInput> = if self.command_bar {
+            crate::commands::BAR
+                .iter()
+                .map(|b| crate::layout::BarItemInput {
+                    label: b.label,
+                    menu: matches!(b.action, crate::commands::BarAction::Menu(_)),
+                    right: b.right,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Layout::compute(
             self.client,
             self.metrics,
@@ -582,6 +612,7 @@ impl AppState {
             &entries,
             self.sidebar_scroll,
             self.inspector,
+            &bar_items,
             &inputs,
             &self.renderer,
         )
@@ -599,14 +630,14 @@ impl AppState {
     /// that knows what is actually visible, after every way of changing it.
     /// Bounded per frame so a fast scroll queues a screenful, not a drive.
     pub fn ensure_thumbs(&mut self, hwnd: HWND) {
-        if !self.grid {
+        if self.icons == crate::layout::ICONS_OFF {
             return;
         }
         /// Threads started per repaint. A scroll that outruns them simply asks
         /// again next frame for whatever is still missing.
         const PER_FRAME: usize = 16;
 
-        let edge = self.metrics.cell_icon;
+        let edge = self.metrics.cell(self.icons).2.max(32);
         let mut wanted: Vec<(String, Option<String>)> = Vec::new();
         for pid in self.visible().collect::<Vec<_>>() {
             let h = self.list_height(pid);
@@ -861,10 +892,10 @@ impl AppState {
     ///
     /// Unbounded for the session: one small entry per folder actually sorted by
     /// hand, which is a number of folders a person can produce, not a machine.
-    pub fn remember_view(&mut self, path: &str, key: SortKey, order: SortOrder, grid: bool) {
+    pub fn remember_view(&mut self, path: &str, key: SortKey, order: SortOrder, icons: i32) {
         if !path.is_empty() {
             self.folder_view
-                .insert(path.to_lowercase(), (key, order, grid));
+                .insert(path.to_lowercase(), (key, order, icons));
         }
     }
 
@@ -878,11 +909,11 @@ impl AppState {
         let path = self.pane(pid).current_path().to_string();
         let list = self.pane(pid).list();
         let (key, order) = (list.sort_key, list.sort_order);
-        let grid = self.grid;
-        self.remember_view(&path, key, order, grid);
+        let icons = self.icons;
+        self.remember_view(&path, key, order, icons);
     }
 
-    pub fn view_for(&self, path: &str) -> Option<(SortKey, SortOrder, bool)> {
+    pub fn view_for(&self, path: &str) -> Option<(SortKey, SortOrder, i32)> {
         self.folder_view.get(&path.to_lowercase()).copied()
     }
 
@@ -900,7 +931,8 @@ impl AppState {
             pins: self.pins.clone(),
             recent: self.recent.clone(),
             inspector: self.inspector,
-            grid: self.grid,
+            command_bar: self.command_bar,
+            icons: self.icons,
             // Only what differs from the defaults, so a default that changes
             // in a later version still reaches someone who never rebound it.
             binds: self
@@ -1004,18 +1036,34 @@ impl AppState {
 // Chrome
 // ---------------------------------------------------------------------------
 
-/// Match the title bar to the app's theme. Without this a dark app sits under a
-/// light title bar, which is the first thing anyone notices.
-pub fn apply_titlebar_theme(hwnd: HWND, theme: Theme) {
-    let dark = BOOL::from(theme.is_dark());
+fn colorref(c: Rgb) -> COLORREF {
+    let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xFF;
+    COLORREF(q(c.0) | (q(c.1) << 8) | (q(c.2) << 16))
+}
+
+fn set_dwm_attr<T>(hwnd: HWND, attr: DWMWINDOWATTRIBUTE, value: &T) {
     unsafe {
         let _ = DwmSetWindowAttribute(
             hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark as *const _ as *const _,
-            std::mem::size_of::<BOOL>() as u32,
+            attr,
+            value as *const _ as *const _,
+            std::mem::size_of_val(value) as u32,
         );
     }
+}
+
+/// Paint the system caption with the tab strip's colours. Dark mode alone
+/// gives Windows' own dark caption, which is a different grey and reads as a
+/// second title bar sitting on top of ours.
+pub fn apply_titlebar_theme(hwnd: HWND, theme: Theme) {
+    let pal = theme.palette();
+    let dark = BOOL::from(theme.is_dark());
+    let caption = colorref(pal.tab_bar_bg);
+    let text = colorref(pal.text);
+    set_dwm_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark);
+    set_dwm_attr(hwnd, DWMWA_CAPTION_COLOR, &caption);
+    set_dwm_attr(hwnd, DWMWA_TEXT_COLOR, &text);
+    set_dwm_attr(hwnd, DWMWA_BORDER_COLOR, &caption);
 }
 
 pub fn invalidate(hwnd: HWND) {
@@ -1179,5 +1227,16 @@ mod tests {
     fn an_unknown_sort_id_falls_back_to_name() {
         // A settings file from a future build must not panic an older one.
         assert_eq!(sort_key_from_id(99), SortKey::Name);
+    }
+
+    #[test]
+    fn titlebar_caption_matches_the_tab_strip() {
+        // The caption is painted by DWM from a COLORREF; if this mapping is
+        // wrong the title bar is a different grey from the rest of the chrome.
+        let p = Theme::Dark.palette();
+        assert_eq!(colorref(p.tab_bar_bg).0, 0x00181514); // 0x141518 in BGR
+        assert_eq!(colorref(p.text).0, 0x00EDEAE8); // 0xE8EAED in BGR
+        let light = Theme::Light.palette();
+        assert_eq!(colorref(light.tab_bar_bg).0, 0x00EDE9E7); // 0xE7E9ED in BGR
     }
 }

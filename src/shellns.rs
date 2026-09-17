@@ -13,16 +13,17 @@
 // was. Only the namespace folders themselves need anything new.
 
 use windows::core::PCWSTR;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::SystemServices::{
     SFGAO_FOLDER, SFGAO_HIDDEN, SFGAO_LINK, SFGAO_STREAM,
 };
 use windows::Win32::UI::Shell::{
-    IEnumShellItems, IShellItem, SHCreateItemFromParsingName, BHID_EnumItems,
+    IEnumShellItems, IShellItem, SHCreateItemFromParsingName, SHGetIDListFromObject,
+    BHID_EnumItems,
     SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_PARENTRELATIVEFORUI,
 };
 
 use crate::fs::FileEntry;
+use crate::pidl::Apartment;
 
 /// Well-known folders offered in the sidebar. `shell:` names rather than the
 /// GUIDs they resolve to, because these are the spellings a person can read,
@@ -45,33 +46,6 @@ pub fn is_shell_path(path: &str) -> bool {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// A COM apartment for as long as it is held.
-///
-/// Every function here runs on a worker thread — listing a folder never
-/// happens on the UI thread — and a worker has no apartment of its own. The
-/// shell's folder objects are in-process COM and simply fail without one,
-/// which is a "Cannot open This PC" that looks like a permissions problem.
-///
-/// `CoUninitialize` is called only when this call is what initialised the
-/// apartment: RPC_E_CHANGED_MODE means somebody else's, and balancing their
-/// count would tear it down under them.
-struct Apartment(bool);
-
-impl Apartment {
-    fn enter() -> Apartment {
-        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        Apartment(hr.is_ok())
-    }
-}
-
-impl Drop for Apartment {
-    fn drop(&mut self) {
-        if self.0 {
-            unsafe { CoUninitialize() };
-        }
-    }
 }
 
 fn item(path: &str) -> Option<IShellItem> {
@@ -144,6 +118,15 @@ pub fn list(path: &str) -> Result<Vec<FileEntry>, String> {
         // That a drive's target happens to be an ordinary path is exactly what
         // makes descending out of the namespace free.
         let target = parsing_name(&child);
+        // The item itself, not a name for it. This is what a context menu and
+        // the bin's own verbs need; the parsing name cannot stand in for it.
+        let pidl = unsafe {
+            SHGetIDListFromObject(&child).ok().and_then(|raw| {
+                let copied = crate::pidl::Pidl::copy_from(raw);
+                windows::Win32::UI::Shell::ILFree(Some(raw));
+                copied
+            })
+        };
         out.push(FileEntry {
             extension: if is_dir {
                 None
@@ -155,6 +138,7 @@ pub fn list(path: &str) -> Result<Vec<FileEntry>, String> {
             is_reparse: (attrs.0 & SFGAO_LINK.0) != 0,
             is_hidden: (attrs.0 & SFGAO_HIDDEN.0) != 0,
             target,
+            pidl,
             ..Default::default()
         });
     }
@@ -176,6 +160,27 @@ mod tests {
         assert!(!is_shell_path(r"\\server\share"));
         assert!(!is_shell_path(""));
         assert!(!is_shell_path("shell:"), "a prefix alone names nothing");
+    }
+
+    #[test]
+    fn every_namespace_entry_carries_its_own_id_list() {
+        // The whole point of the id list: an entry is identified by the item
+        // the shell gave us, not by a string we could re-parse. A Recycle Bin
+        // entry's parsing name is the path it came from, so re-parsing it asks
+        // about the original file instead of about the bin entry.
+        let entries = list("shell:MyComputerFolder").expect("This PC enumerates");
+        assert!(!entries.is_empty());
+        for e in &entries {
+            let pidl = e.pidl.as_ref().expect("a shell item has an id list");
+            assert!(!pidl.as_ptr().is_null());
+            // The last id is this item relative to its parent, which is what a
+            // context menu is built from.
+            assert!(!pidl.child_ptr().is_null());
+        }
+        // Distinct items have distinct id lists.
+        if entries.len() > 1 {
+            assert_ne!(entries[0].pidl, entries[1].pidl);
+        }
     }
 
     #[test]

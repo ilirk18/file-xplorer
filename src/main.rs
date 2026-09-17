@@ -70,38 +70,63 @@ use renderer::{PaneView, SidebarView};
 // Entry point
 // ---------------------------------------------------------------------------
 
-fn main() -> Result<()> {
-    unsafe {
-        // OleInitialize rather than CoInitializeEx: it enters the same
-        // single-threaded apartment the shell interfaces need, and additionally
-        // sets up the drag-and-drop machinery RegisterDragDrop requires.
-        let _ = OleInitialize(None);
+/// How a window should start.
+///
+/// Passed through `CreateWindowExW`'s `lpParam`, which is the mechanism Windows
+/// provides for exactly this and reaches `WM_NCCREATE` before the window has
+/// done anything — so `AppState` is built knowing the answer rather than
+/// correcting itself afterwards.
+pub struct WindowOpts {
+    /// Open here instead of restoring the saved session.
+    pub start: Option<String>,
+    /// Whether this window's tabs and box are what the settings file records.
+    /// The first window owns the session; later ones are passing through.
+    pub owns_session: bool,
+}
 
+thread_local! {
+    /// Windows still open. The last one to close ends the message loop; the
+    /// others just go away, which is what closing one of several windows has
+    /// to mean.
+    static OPEN_WINDOWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The folder named on the command line, if any.
+///
+/// A file rather than a folder opens the folder holding it, which is what
+/// someone dragging a file onto the exe means, and what the shell does when it
+/// hands a path to a file manager.
+fn start_path_from_args() -> Option<String> {
+    let arg = std::env::args().nth(1)?;
+    let arg = arg.trim().trim_matches('"').to_string();
+    if arg.is_empty() || arg.starts_with('-') {
+        return None;
+    }
+    let expanded = fs::expand_env(&arg);
+    let path = std::path::Path::new(&expanded);
+    if path.is_dir() {
+        Some(expanded)
+    } else if path.is_file() {
+        fs::path_parent(&expanded)
+    } else {
+        None
+    }
+}
+
+/// Create one window. Used for the first and for every "New window" after it.
+pub fn create_window(opts: WindowOpts) -> Result<HWND> {
+    unsafe {
         let instance = GetModuleHandleW(None)?;
         let class_name = wide("FileXplorerWindow");
-
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-            lpfnWndProc: Some(wndproc),
-            hInstance: instance.into(),
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
-            // Null background: we paint every pixel with Direct2D, and letting
-            // the system erase first would only flicker.
-            hbrBackground: HBRUSH::default(),
-            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
-            ..Default::default()
-        };
-        if RegisterClassExW(&wc) == 0 {
-            return Err(windows::core::Error::from_thread());
-        }
-
-        // Restore the saved box, but only if it still lands on a monitor:
-        // a window restored onto a display that has since been unplugged is
-        // unreachable.
+        let title = wide("File Xplorer");
         let cfg = Config::load();
-        let (x, y, w, h) = if cfg.win_x == UNSET {
-            (CW_USEDEFAULT, CW_USEDEFAULT, 1200, 760)
+
+        // Restore the saved box, but only if it still lands on a monitor: a
+        // window restored onto a display that has since been unplugged is
+        // unreachable. A window that does not own the session opens wherever
+        // Windows cascades it, so it does not land exactly on the first one.
+        let (x, y, w, h) = if !opts.owns_session || cfg.win_x == UNSET {
+            (CW_USEDEFAULT, CW_USEDEFAULT, cfg.win_w, cfg.win_h)
         } else {
             let r = RECT {
                 left: cfg.win_x,
@@ -116,8 +141,10 @@ fn main() -> Result<()> {
             }
         };
 
-        let title = wide("File Xplorer");
-        let hwnd = CreateWindowExW(
+        let maximize = opts.owns_session && cfg.maximized;
+        // Owned by the window from here: WM_NCCREATE takes it back.
+        let param = Box::into_raw(Box::new(opts));
+        let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             PCWSTR::from_raw(class_name.as_ptr()),
             PCWSTR::from_raw(title.as_ptr()),
@@ -129,18 +156,96 @@ fn main() -> Result<()> {
             None,
             None,
             Some(instance.into()),
-            None,
-        )?;
+            Some(param as *const _),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                // Creation failed before WM_NCCREATE could adopt it.
+                drop(Box::from_raw(param));
+                return Err(e);
+            }
+        };
 
-        let _ = ShowWindow(
+        // Class icons cover Alt-Tab; these keep the title bar and taskbar
+        // honest when Windows has already cached a blank default.
+        SendMessageW(
             hwnd,
-            if cfg.maximized {
-                SW_SHOWMAXIMIZED
-            } else {
-                SW_SHOW
-            },
+            WM_SETICON,
+            Some(WPARAM(ICON_BIG as usize)),
+            Some(LPARAM(load_app_icon(instance.into(), 0).0 as isize)),
         );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_SMALL as usize)),
+            Some(LPARAM(load_app_icon(instance.into(), 16).0 as isize)),
+        );
+
+        let _ = ShowWindow(hwnd, if maximize { SW_SHOWMAXIMIZED } else { SW_SHOW });
         let _ = UpdateWindow(hwnd);
+        Ok(hwnd)
+    }
+}
+
+/// The sash icon embedded by `app.rc` as resource id 1.
+///
+/// `size` 0 asks Windows for the default (usually 32); 16 is the title-bar
+/// size. A missing resource yields a null handle, which Windows treats as "no
+/// icon" rather than crashing.
+fn load_app_icon(instance: HINSTANCE, size: i32) -> HICON {
+    unsafe {
+        LoadImageW(
+            Some(instance),
+            // MAKEINTRESOURCE(1)
+            PCWSTR::from_raw(1usize as *const u16),
+            IMAGE_ICON,
+            size,
+            size,
+            if size == 0 {
+                LR_DEFAULTSIZE | LR_SHARED
+            } else {
+                LR_SHARED
+            },
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default()
+    }
+}
+
+fn main() -> Result<()> {
+    unsafe {
+        // OleInitialize rather than CoInitializeEx: it enters the same
+        // single-threaded apartment the shell interfaces need, and additionally
+        // sets up the drag-and-drop machinery RegisterDragDrop requires.
+        let _ = OleInitialize(None);
+
+        let instance = GetModuleHandleW(None)?;
+        let class_name = wide("FileXplorerWindow");
+        // Resource id 1 is the sash icon compiled in from app.rc.
+        let icon_big = load_app_icon(instance.into(), 0);
+        let icon_sm = load_app_icon(instance.into(), 16);
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance.into(),
+            hIcon: icon_big,
+            hIconSm: icon_sm,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            // Null background: we paint every pixel with Direct2D, and letting
+            // the system erase first would only flicker.
+            hbrBackground: HBRUSH::default(),
+            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+            ..Default::default()
+        };
+        if RegisterClassExW(&wc) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        create_window(WindowOpts {
+            start: start_path_from_args(),
+            owns_session: true,
+        })?;
 
         let mut msg = MSG::default();
         loop {
@@ -149,9 +254,12 @@ fn main() -> Result<()> {
                 break;
             }
             // The inline rename box is a real EDIT and swallows Enter and
-            // Escape before the window procedure can see them.
-            if let Some(state) = state_of(hwnd) {
-                if rename::handle_key(hwnd, state, &msg) {
+            // Escape before the window procedure can see them. The message
+            // names the edit control, so walk up to the window that owns it —
+            // with more than one open, the first window is not the answer.
+            let root = GetAncestor(msg.hwnd, GA_ROOT);
+            if let Some(state) = state_of(root) {
+                if rename::handle_key(root, state, &msg) {
                     continue;
                 }
             }
@@ -162,6 +270,47 @@ fn main() -> Result<()> {
         OleUninitialize();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// `start_path_from_args` reads the real process arguments, so what is
+    /// testable is the rule it applies to one: a folder opens, a file opens its
+    /// folder, anything else is not a destination.
+    fn resolve(arg: &str) -> Option<String> {
+        let expanded = crate::fs::expand_env(arg.trim().trim_matches('"'));
+        let path = std::path::Path::new(&expanded);
+        if path.is_dir() {
+            Some(expanded)
+        } else if path.is_file() {
+            crate::fs::path_parent(&expanded)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn a_file_argument_opens_the_folder_holding_it() {
+        let dir = std::env::temp_dir().join("fx-args-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("thing.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert_eq!(
+            resolve(&dir.to_string_lossy()).map(|p| p.to_lowercase()),
+            Some(dir.to_string_lossy().to_lowercase()),
+            "a folder opens itself"
+        );
+        assert_eq!(
+            resolve(&file.to_string_lossy()).map(|p| p.to_lowercase()),
+            Some(dir.to_string_lossy().to_lowercase()),
+            "a file opens the folder holding it"
+        );
+        // Quotes survive a drag-and-drop onto the exe.
+        assert!(resolve(&format!("\"{}\"", dir.to_string_lossy())).is_some());
+        assert!(resolve(r"Z:\nowhere\at\all").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The inspector's facts, built before `paint` destructures `state` and
@@ -198,10 +347,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     unsafe {
         if msg == WM_NCCREATE {
             let dpi = GetDpiForWindow(hwnd).max(96);
-            match AppState::new(dpi) {
+            // Take back what `create_window` handed over.
+            let create = &*(lparam.0 as *const CREATESTRUCTW);
+            let opts = if create.lpCreateParams.is_null() {
+                WindowOpts {
+                    start: None,
+                    owns_session: true,
+                }
+            } else {
+                *Box::from_raw(create.lpCreateParams as *mut WindowOpts)
+            };
+            match AppState::new(dpi, opts) {
                 Ok(state) => {
                     let boxed = Box::into_raw(Box::new(state));
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, boxed as isize);
+                    OPEN_WINDOWS.with(|n| n.set(n.get() + 1));
                 }
                 Err(_) => return LRESULT(0), // Abort creation.
             }
@@ -251,16 +411,24 @@ fn handle(
             state.drop_target = dnd::Registration::new(hwnd, WM_APP_DROPPED);
             state.apply_col_widths();
             unsafe { SetTimer(Some(hwnd), TIMER_AUTOSAVE, AUTOSAVE_MS, None) };
-            let start = fs::current_directory().unwrap_or_else(|_| FALLBACK_PATH.to_string());
+            // A path on the command line, or from "New window", replaces the
+            // session: being told where to go is not the same as coming back.
+            let told_where_to_go = state.start_path.is_some();
+            let start = state
+                .start_path
+                .take()
+                .or_else(|| fs::current_directory().ok())
+                .unwrap_or_else(|| FALLBACK_PATH.to_string());
+            let restoring = state.owns_session && !told_where_to_go;
             // Every pane opens something, including the ones that are off
             // screen: pressing Ctrl+2 should reveal a folder, not a blank panel.
             let session = std::mem::take(&mut state.session);
             for pid in (0..MAX_PANES).map(PaneId) {
                 let saved = &session.tabs[pid.0];
-                let req = match state
-                    .pane_mut(pid)
-                    .restore(saved, session.active_tab[pid.0])
-                {
+                let restored = restoring
+                    .then(|| state.pane_mut(pid).restore(saved, session.active_tab[pid.0]))
+                    .flatten();
+                let req = match restored {
                     Some(req) => req,
                     None => state.pane_mut(pid).navigate(&start),
                 };
@@ -277,8 +445,18 @@ fn handle(
             // Drop the watchers first: their threads post to this window.
             state.watchers = (0..MAX_PANES).map(|_| None).collect();
             state.drop_target = None;
-            state.config(hwnd).save();
-            unsafe { PostQuitMessage(0) };
+            // Only the session's window writes the session. A second window
+            // closing must not replace the saved tabs with its own.
+            if state.owns_session {
+                state.config(hwnd).save();
+            }
+            let left = OPEN_WINDOWS.with(|n| {
+                n.set(n.get().saturating_sub(1));
+                n.get()
+            });
+            if left == 0 {
+                unsafe { PostQuitMessage(0) };
+            }
             Some(LRESULT(0))
         }
 
@@ -491,6 +669,26 @@ fn handle(
                 invalidate(hwnd);
                 return Some(LRESULT(0));
             }
+            // Ctrl+wheel resizes rather than scrolls, which is what it does
+            // in every list on this OS. Stepping below the smallest icon is
+            // the details view: one scalar, no separate mode to fall out of.
+            if ctrl_down() && layout.pane_at(pt.x, pt.y).is_some() {
+                let next = state.metrics.step_icons(state.icons, delta > 0);
+                if next != state.icons {
+                    state.icons = next;
+                    state.remember_current_view();
+                    state.sync_columns();
+                    let pid = state.focused;
+                    let h = state.list_height(pid);
+                    // Keep the cursor on screen: a size change moves every
+                    // line, and the row you were looking at should stay put.
+                    if let Some(c) = state.pane(pid).list().cursor() {
+                        state.pane_mut(pid).list_mut().ensure_visible(c, h);
+                    }
+                    invalidate(hwnd);
+                }
+                return Some(LRESULT(0));
+            }
             // Scroll whatever the pointer is over, which is what people expect,
             // without stealing keyboard focus from another pane.
             let pid = layout.pane_at(pt.x, pt.y).unwrap_or(state.focused);
@@ -596,15 +794,15 @@ fn handle(
                 // the load finishing rather than on the request, so a path that
                 // failed to read never joins the history.
                 state.remember_visit(&path);
-                if let Some((key, order, grid)) = state.view_for(&path) {
+                if let Some((key, order, icons)) = state.view_for(&path) {
                     state.pane_mut(pid).list_mut().set_sort(key, order);
                     // The icon view is a window-wide setting, so a folder
                     // remembered in it switches the window. That is the same
                     // bargain Explorer makes, and the alternative — a per-pane
                     // view — is a per-pane array in the config that nothing
                     // has asked for.
-                    if state.grid != grid {
-                        state.grid = grid;
+                    if state.icons != icons {
+                        state.icons = icons;
                         state.sync_columns();
                         let h = state.list_height(pid);
                         if let Some(c) = state.pane(pid).list().cursor() {
@@ -630,7 +828,11 @@ fn handle(
             let id = wparam.0;
             if id == TIMER_AUTOSAVE {
                 // Only write when something actually changed, so an idle app
-                // is not touching the disk every few seconds.
+                // is not touching the disk every few seconds — and only from
+                // the window whose session this is.
+                if !state.owns_session {
+                    return Some(LRESULT(0));
+                }
                 let now = state.config(hwnd);
                 if now != state.last_saved {
                     now.save();
@@ -852,6 +1054,18 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     };
     update_title(state, hwnd);
 
+    // Built before the destructure, for the same reason the inspector's facts
+    // are: both read the focused pane, which `panes` would otherwise be holding.
+    let bar_views: Vec<renderer::BarButtonView> = commands::BAR
+        .iter()
+        .map(|b| renderer::BarButtonView {
+            glyph: b.glyph,
+            label: b.label,
+            menu: matches!(b.action, commands::BarAction::Menu(_)),
+            enabled: commands::bar_enabled(state, b.action),
+        })
+        .collect();
+
     // Built before the destructure: it reads the focused pane's cursor entry,
     // which `panes` would otherwise be holding.
     let inspector = {
@@ -871,12 +1085,13 @@ fn paint(state: &mut AppState, hwnd: HWND) {
         panes,
         preview,
         thumbs,
-        grid,
+        icons,
         ..
     } = state;
-    let grid = *grid;
+    let icons = *icons;
 
     renderer.begin();
+    renderer.draw_command_bar(&layout, &bar_views, hover);
     renderer.draw_sidebar(
         &layout,
         &SidebarView {
@@ -920,7 +1135,8 @@ fn paint(state: &mut AppState, hwnd: HWND) {
             can_up: fs::path_parent(pane.current_path()).is_some(),
             filter_focused: filter_focus == Some(pid),
             renaming: renaming.filter(|(p, _)| *p == pid).map(|(_, row)| row),
-            thumbs: grid.then_some((thumbs, pane.current_path())),
+            thumbs: (icons != crate::layout::ICONS_OFF)
+                .then_some((thumbs, pane.current_path())),
             band: band.filter(|(p, _)| *p == pid).map(|(_, r)| r),
             counts: &counts[pid.0],
             other_names: comparing.then(|| &names[(pid.0 + 1) % names.len()]),
