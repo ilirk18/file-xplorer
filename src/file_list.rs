@@ -56,6 +56,10 @@ pub struct FileList {
     /// Names that a content comparison found to differ from the other pane.
     /// Empty until "Compare contents" is run, and cleared on navigation.
     pub differing: HashSet<String>,
+    /// Bumped whenever the visible entries change — a new listing, a filter, a
+    /// sort. What lets the accessibility snapshot skip rebuilding a hundred
+    /// thousand names when only the cursor moved.
+    pub revision: u64,
     pub scroll_offset: u32,
     /// Pixels scrolled *within* the top row, 0..row_height. Only the wheel
     /// sets it; every other way of moving the list lands on a row boundary,
@@ -90,6 +94,7 @@ impl Default for FileList {
             filter: String::new(),
             dir_sizes: HashMap::new(),
             differing: HashSet::new(),
+            revision: 0,
             scroll_offset: 0,
             scroll_frac: 0,
             row_height: 24,
@@ -200,6 +205,16 @@ impl FileList {
 
     pub fn is_selected(&self, index: u32) -> bool {
         self.selected.contains(&index)
+    }
+
+    /// The selected indices as they are already stored.
+    ///
+    /// ponytail: the accessibility snapshot clones this each repaint. Select
+    /// all in a folder of a hundred thousand and that is a hundred thousand
+    /// integers copied per keystroke — only while a screen reader is attached.
+    /// A revision counter on the selection would avoid it if anyone notices.
+    pub fn selected_set(&self) -> &HashSet<u32> {
+        &self.selected
     }
 
     pub fn selection_count(&self) -> usize {
@@ -366,6 +381,7 @@ impl FileList {
     /// which is what every file manager does and what the old pure-alphabetical
     /// sort got wrong.
     pub fn sort(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         let key = self.sort_key;
         let order = self.sort_order;
         self.entries.sort_by(|a, b| {
@@ -564,6 +580,9 @@ impl FileList {
 
     /// Rebuild the visible list from `all`: hidden pass, filter pass, sort.
     fn rebuild(&mut self) {
+        // The one place the visible entries are produced, so the one place
+        // that has to say they changed.
+        self.revision = self.revision.wrapping_add(1);
         let show_hidden = self.show_hidden;
         let needle = self.filter.to_lowercase();
         let sizes = &self.dir_sizes;
@@ -662,6 +681,7 @@ mod tests {
             is_hidden: false,
             dir_size_known: false,
             extension: None,
+            target: None,
         }
     }
 

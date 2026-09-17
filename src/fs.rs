@@ -11,7 +11,7 @@ use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Time::FileTimeToSystemTime;
 
 /// One file or directory in a listing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FileEntry {
     pub name: String,
     pub size: u64,
@@ -27,6 +27,26 @@ pub struct FileEntry {
     /// Lowercased, with the leading dot (".txt"). None for directories and
     /// extensionless files. Doubles as the icon-cache key.
     pub extension: Option<String>,
+    /// Where this entry actually is, when that cannot be worked out by joining
+    /// `name` to the folder it was listed from.
+    ///
+    /// Filesystem listings leave it None: their names join. Shell namespace
+    /// items do not — "This PC" holds something displayed as "Local Disk (C:)"
+    /// whose path is `C:\`, and no amount of joining gets there from the
+    /// name. Use `child_path` rather than joining by hand.
+    pub target: Option<String>,
+}
+
+/// Where an entry in `dir` leads.
+///
+/// The one place that answers "what is this row's path", so a listing whose
+/// names do not join — the shell namespace — works everywhere at once rather
+/// than at each call site that remembered.
+pub fn child_path(dir: &str, entry: &FileEntry) -> String {
+    match &entry.target {
+        Some(t) => t.clone(),
+        None => path_join(dir, &entry.name),
+    }
 }
 
 impl FileEntry {
@@ -187,6 +207,9 @@ pub fn extension_of(name: &str) -> Option<String> {
 /// string carries the archive, so navigation, breadcrumbs and history need no
 /// idea that one is involved.
 pub fn list_any(path: &str) -> Result<Vec<FileEntry>, String> {
+    if crate::shellns::is_shell_path(path) {
+        return crate::shellns::list(path);
+    }
     if let Some((archive, inner)) = crate::archive::split(path) {
         return crate::archive::list(&archive, &inner);
     }
@@ -221,6 +244,7 @@ pub fn list_dir(path: &str) -> Result<Vec<FileEntry>, std::io::Error> {
                     || (attrs & FILE_ATTRIBUTE_SYSTEM.0) != 0,
                 dir_size_known: false,
                 extension,
+                target: None,
             });
         }
         if unsafe { FindNextFileW(handle, &mut data) }.is_err() {
@@ -238,6 +262,16 @@ pub fn current_directory() -> Result<String, std::io::Error> {
 
 /// Parent directory, or None at a root (`C:\`, `\\server\share`).
 pub fn path_parent(path: &str) -> Option<String> {
+    if crate::shellns::is_shell_path(path) {
+        // String work, not a shell call: this runs on the paint path to decide
+        // whether the Up button is live. A nested namespace path splits like
+        // any other; a root one — This PC, the Recycle Bin — has nowhere above
+        // it that this app browses, and the button correctly goes dark.
+        return path
+            .rsplit_once('\\')
+            .map(|(parent, _)| parent.to_string())
+            .filter(|p| !p.is_empty());
+    }
     Path::new(path)
         .parent()
         .map(|par| par.to_string_lossy().into_owned())
@@ -260,6 +294,25 @@ pub fn path_leaf(path: &str) -> String {
 /// segment, so `C:\Users\Foo` yields `["C:\", "Users", "Foo"]` rather than
 /// leaking a bare `\` crumb between the drive and the first folder.
 pub fn path_segments(path: &str) -> Vec<String> {
+    if crate::shellns::is_shell_path(path) {
+        // One crumb, named the way the sidebar named it. Asking the shell for
+        // the display name would be a COM call per repaint; the locations this
+        // app offers are the ones it can already name.
+        //
+        // ponytail: a namespace folder reached by typing a GUID into Go to
+        // shows that GUID. Reading the name once when the load finishes — on
+        // the worker, where COM is already set up — would fix it.
+        let label = crate::shellns::PLACES
+            .iter()
+            .find(|(_, p)| p.eq_ignore_ascii_case(path))
+            .map(|(label, _)| (*label).to_string())
+            .unwrap_or_else(|| {
+                path.rsplit_once('\\')
+                    .map(|(_, leaf)| leaf.to_string())
+                    .unwrap_or_else(|| path.to_string())
+            });
+        return vec![label];
+    }
     let p = Path::new(path);
     let mut out: Vec<String> = Vec::new();
     let mut comps = p.components().peekable();
@@ -769,5 +822,45 @@ mod tests {
         // A file that is not there cannot be called identical.
         assert!(files_differ(&a, &base.join("missing").to_string_lossy()));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_namespace_path_is_one_breadcrumb_with_its_own_name() {
+        assert_eq!(path_segments("shell:MyComputerFolder"), vec!["This PC"]);
+        assert_eq!(path_segments("shell:RecycleBinFolder"), vec!["Recycle Bin"]);
+        // Somewhere we do not offer: the tail is the best that can be done
+        // without asking the shell on the paint path.
+        assert_eq!(path_segments(r"::{GUID}\Printers"), vec!["Printers"]);
+    }
+
+    #[test]
+    fn going_up_out_of_a_namespace_root_is_refused() {
+        // Nested is ordinary string work.
+        assert_eq!(
+            path_parent(r"::{GUID}\Printers"),
+            Some("::{GUID}".to_string())
+        );
+        // A root namespace folder has nothing above it that this app browses,
+        // and the Up button reads that as "off".
+        assert_eq!(path_parent("shell:MyComputerFolder"), None);
+        assert_eq!(path_parent("::{GUID}"), None);
+    }
+
+    #[test]
+    fn child_path_prefers_the_target_over_joining() {
+        let mut e = FileEntry {
+            name: "Local Disk (C:)".into(),
+            is_dir: true,
+            ..Default::default()
+        };
+        // A shell entry carries where it really is; joining its display name
+        // would produce nonsense.
+        e.target = Some("C:\\".into());
+        assert_eq!(child_path("shell:MyComputerFolder", &e), "C:\\");
+
+        // A filesystem entry has no target, and joins as it always did.
+        e.target = None;
+        e.name = "Users".into();
+        assert_eq!(child_path("C:\\", &e), r"C:\Users");
     }
 }

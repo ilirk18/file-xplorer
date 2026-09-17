@@ -141,7 +141,7 @@ impl Pane {
         self.list()
             .selected_entries()
             .iter()
-            .map(|e| fs::path_join(&dir, &e.name))
+            .map(|e| fs::child_path(&dir, e))
             .collect()
     }
 
@@ -592,6 +592,7 @@ mod tests {
             is_hidden: false,
             dir_size_known: false,
             extension: None,
+            target: None,
         }
     }
 

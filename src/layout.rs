@@ -1771,7 +1771,6 @@ mod tests {
 
     #[test]
     fn band_clamps_rather_than_refusing() {
-        let m = Metrics::for_dpi(96);
         let l = build(1400, 800, &strs(&["C:\\"]));
         let p = &l.panes[0];
         let x = p.list.x + 1;

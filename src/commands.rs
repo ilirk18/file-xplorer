@@ -5,7 +5,7 @@
 // searchable and right-clickable at the same time.
 
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::app::*;
@@ -554,7 +554,7 @@ pub fn do_terminal(state: &mut AppState, hwnd: HWND) {
     let mut dir = state.pane(pid).current_path().to_string();
     if let Some(e) = state.pane(pid).list().cursor_entry() {
         if e.is_dir && state.pane(pid).list().selection_count() == 1 {
-            dir = fs::path_join(&dir, &e.name);
+            dir = fs::child_path(&dir, e);
         }
     }
     // A path inside an archive is not a directory anything can start in.
@@ -847,15 +847,40 @@ pub fn do_new_folder(state: &mut AppState, hwnd: HWND) {
 // Context menu
 // ---------------------------------------------------------------------------
 
+/// A little in from the row's left edge, so the menu does not sit flush
+/// against the pane.
+fn m_pad(layout: &crate::layout::Layout) -> i32 {
+    layout.metrics.pad
+}
+
 pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen_y: i32) {
     let mut pt = POINT {
         x: screen_x,
         y: screen_y,
     };
-    // Shift+F10 sends (-1, -1); anchor to the cursor row instead.
+    // Shift+F10 sends (-1, -1). Anchor to the cursor row — which is what the
+    // keyboard is pointing at — rather than to wherever the mouse happens to
+    // be sitting, which may be over another pane, the sidebar, or nothing.
+    // Anchoring to the mouse is why the keyboard menu used to offer the
+    // folder's commands while a file was selected.
     if screen_x == -1 && screen_y == -1 {
+        let pid = state.focused;
+        let layout = state.layout();
+        let list = state.pane(pid).list();
+        let anchor = list
+            .cursor()
+            .and_then(|i| layout.pane(pid).cell(i, list.scroll_px()))
+            .unwrap_or(layout.pane(pid).list);
+        // The row's bottom edge *minus one*, so the menu drops from under the
+        // row while the point still lands inside it: the hit test that decides
+        // whether this is the file's menu or the folder's runs on this point,
+        // and one pixel lower is already the next row.
+        pt = POINT {
+            x: anchor.x + m_pad(&layout),
+            y: anchor.y + anchor.h - 1,
+        };
         unsafe {
-            let _ = GetCursorPos(&mut pt);
+            let _ = ClientToScreen(hwnd, &mut pt);
         }
     }
     let mut client = pt;
@@ -899,10 +924,12 @@ pub fn show_context_menu(state: &mut AppState, hwnd: HWND, screen_x: i32, screen
         .cursor_entry()
         .map(|e| e.is_dir)
         .unwrap_or(false);
-    // Nothing writes inside an archive, so none of the commands that would be
-    // refused are offered.
-    let in_archive = crate::archive::split(state.pane(pid).current_path()).is_some();
-    let writable = !in_archive;
+    // Nothing writes inside an archive or in the shell namespace, so none of
+    // the commands that `spawn_op_tagged` would refuse are offered. Offering
+    // them and then reporting an error is a worse way to say the same thing.
+    let here = state.pane(pid).current_path().to_string();
+    let in_archive = crate::archive::split(&here).is_some();
+    let writable = !in_archive && !crate::shellns::is_shell_path(&here);
     let pinned = state.is_pinned(state.pane(pid).current_path());
 
     unsafe {
@@ -1006,7 +1033,7 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
             let pane = state.pane(pid);
             if let Some(entry) = pane.list().cursor_entry() {
                 if entry.is_dir {
-                    let path = fs::path_join(pane.current_path(), &entry.name);
+                    let path = fs::child_path(pane.current_path(), entry);
                     let req = state.pane_mut(pid).new_tab(&path);
                     spawn_dir_load(hwnd, pid, req);
                 }
@@ -1051,6 +1078,9 @@ pub fn run_command(state: &mut AppState, hwnd: HWND, cmd: usize) {
         }
         CMD_GRID => {
             state.grid = !state.grid;
+            // Choosing a view by hand is a statement about this folder, the
+            // same as choosing a sort.
+            state.remember_current_view();
             // The cursor keeps its index, so whatever was selected stays
             // selected; only the shape it is drawn in changes. Scroll is in
             // lines and a line now holds a different number of entries, so it

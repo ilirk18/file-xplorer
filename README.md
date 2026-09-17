@@ -54,6 +54,14 @@ An operation that fails raises a message box with the actual reason.
 **Live filter.** Each pane's footer filters its listing as you type, with a
 `12 of 340` count.
 
+**The shell's own places.** This PC, the Recycle Bin and Network sit in the
+sidebar and open like folders, listing what the shell lists and showing the
+names it shows. Opening a drive inside This PC lands on `C:\` and every
+ordinary code path takes over from there, because a filesystem child of a
+namespace folder reports its ordinary path. They are read-only here, like
+archives: one guard refuses every destructive path into them rather than each
+command remembering to.
+
 **Icon view.** `Ctrl+Shift+I` lays the listing out as cells instead of rows,
 each showing the shell's own thumbnail — the same one Explorer draws, so
 whatever handler is installed does the work — with the file-type icon in its
@@ -67,14 +75,18 @@ the first 64 KB of anything that reads as text, UTF-16 included. Built on a
 worker thread, never on the UI thread, and a result whose file is no longer
 selected is dropped rather than shown against the wrong name.
 
+**Peek into a folder.** With the inspector open, putting the cursor on a folder
+lists what is inside it without going in — folders first, marked with a
+trailing slash, and a count of whatever did not fit.
+
 **Rename in place.** `F2` types over the name where it sits, with the stem
 selected and the extension left alone. Enter commits, Escape abandons, clicking
 away commits — and anything that moves the row out from under the box abandons
 rather than renaming the wrong file. A row that is not on screen falls back to
 the dialog.
 
-**Sort is remembered per folder** for the session: sort Downloads by date and
-it is still by date when you come back to it.
+**How you looked at a folder is remembered** for the session: sort Downloads by
+date, or put Pictures in the icon view, and that is how each comes back.
 
 **Every shortcut can be changed.** "Change a shortcut" in the palette picks a
 command and takes the keys to give it — `Ctrl+Shift+R`, `Alt+Left`, `F5`, or
@@ -157,6 +169,18 @@ back to defaults rather than refusing to start.
 rows, so a precision touchpad reporting less than a notch moves it by less than
 a row. Keyboard moves still land on a row boundary, because a row half out of
 view is not something anyone asks for on purpose.
+
+**Readable by a screen reader.** Everything here is drawn with Direct2D, which
+to a screen reader is one empty rectangle. A UI Automation provider describes
+the listing as a List of ListItems: each carries its name, and its type, size
+and date as status read after it, so the name comes first rather than being
+buried. Moving the cursor raises a focus event and changing folder raises a
+structure event. The dialogs — the palette, the prompts, batch rename — are
+ordinary Win32 controls and were always readable.
+
+It costs nothing when nobody is listening: every part of it is behind
+`UiaClientsAreListening`, so a machine with no screen reader running never
+even copies a folder's worth of names.
 
 **Correct at any DPI.** The process is per-monitor-v2 aware and every size is
 computed in physical pixels for the current monitor, so nothing is ever
@@ -252,7 +276,7 @@ is unit-tested without a window.
 cargo test
 ```
 
-239 tests, no warnings. They cover path handling and name validation, the
+249 tests, no warnings. They cover path handling and name validation, the
 virtual list and selection model, sorting and filtering, tab and history
 behaviour, session restore, stale-load rejection, layout geometry and
 hit-testing at every pane count, undo inverses, search matching and content

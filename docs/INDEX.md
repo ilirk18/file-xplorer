@@ -50,6 +50,8 @@ the current state so context is never lost.
 | `src/watch.rs` | `ReadDirectoryChangesW` watcher, one per pane |
 | `src/dnd.rs` | Drag and drop (`IDropTarget` / `IDropSource`) |
 | `src/shellmenu.rs` | The real shell context menu |
+| `src/shellns.rs` | This PC, the Recycle Bin and Network: browsing the shell namespace |
+| `src/uia.rs` | UI Automation providers, so a screen reader can read the listing |
 | `src/pidl.rs` | Shell item id lists, freed on drop |
 | `src/dialog.rs` | Shared dialog font handling |
 | `build.rs` + `app.manifest` | Embeds the manifest: PerMonitorV2 DPI, long paths, UTF-8, Common Controls v6 |
@@ -69,8 +71,9 @@ the current state so context is never lost.
 5. **Sizes are physical pixels** derived from `Metrics::for_dpi`. Nothing assumes 96 DPI.
 6. **A pane is an index, not a side.** `PaneId(usize)` addresses one of up to
    `MAX_PANES`; nothing outside `set_pane_count` may assume there are two.
-7. **Archives are read-only**, and one guard in `spawn_op_tagged` enforces it for
-   every destructive path, including ones nobody thought about.
+7. **Archives and the shell namespace are read-only**, and one guard in
+   `spawn_op_tagged` enforces it for every destructive path, including ones
+   nobody thought about.
 
 ---
 
@@ -80,7 +83,7 @@ the current state so context is never lost.
   failures. See [.cursor/rules/phase-tests.mdc](../.cursor/rules/phase-tests.mdc).
 - **Docs**: after each phase add or update `docs/phase-N.md` and this index.
 
-Current: **239 tests, zero warnings** (`cargo test`).
+Current: **249 tests, zero warnings** (`cargo test`).
 
 ---
 

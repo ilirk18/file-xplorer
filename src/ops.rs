@@ -185,8 +185,18 @@ impl Op {
     /// True when any path leads inside an archive. Nothing here writes to one:
     /// 7-Zip's CLI can, but a file operation that half succeeds inside a
     /// container is not something to bolt on, so these are refused outright.
-    pub fn touches_archive(&self) -> bool {
-        self.paths().iter().any(|p| crate::archive::split(p).is_some())
+    /// True when any path this would write to is somewhere this app only
+    /// reads: inside an archive, or in the shell namespace.
+    ///
+    /// `IFileOperation` can in fact restore from the Recycle Bin and write to
+    /// a network place, but "delete" and "rename" mean something different in
+    /// each namespace and getting one subtly wrong costs somebody their files.
+    /// Refusing here rather than in each command is what makes it true of the
+    /// paths nobody thought about — a drop, an undo, a paste.
+    pub fn is_read_only(&self) -> bool {
+        self.paths().iter().any(|p| {
+            crate::archive::split(p).is_some() || crate::shellns::is_shell_path(p)
+        })
     }
 
     /// What the footer says while this is running.
