@@ -46,7 +46,7 @@ pub fn on_dropped(state: &mut AppState, hwnd: HWND, dropped: dnd::Dropped) {
     if let Hit::Row(_, row) = hit {
         if let Some(entry) = state.pane(pid).list().entries.get(row as usize) {
             if entry.is_dir {
-                dest = fs::path_join(&dest, &entry.name);
+                dest = fs::child_path(&dest, entry);
             }
         }
     }
@@ -267,10 +267,7 @@ pub fn on_left_down(state: &mut AppState, hwnd: HWND, x: i32, y: i32) {
             state.pane_mut(pid).list_mut().apply_sort(key);
             // Sorting by hand is a statement about this folder, so coming back
             // to it later comes back to this order too.
-            let path = state.pane(pid).current_path().to_string();
-            let list = state.pane(pid).list();
-            let (k, o) = (list.sort_key, list.sort_order);
-            state.remember_sort(&path, k, o);
+            state.remember_current_view();
         }
 
         Hit::ColumnEdge(pid, key) => {
@@ -415,7 +412,7 @@ pub fn activate_selection(state: &mut AppState, hwnd: HWND, pid: PaneId) {
     let dir = pane.current_path().to_string();
     let name = entry.name.clone();
     let is_dir = entry.is_dir;
-    let target = fs::path_join(&dir, &name);
+    let target = fs::child_path(&dir, entry);
 
     // An archive opens like a folder. The path keeps growing through it, so
     // Back, Up and the breadcrumb work on the way out with no special case.

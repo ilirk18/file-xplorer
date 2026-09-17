@@ -266,6 +266,9 @@ pub struct AppState {
     pub tree_rows: Vec<crate::tree::TreeRow>,
     /// Which pane's footer filter box is taking keystrokes, if any.
     pub filter_focus: Option<PaneId>,
+    /// What a screen reader is allowed to see. Shared with the automation
+    /// providers, which run on whatever thread UIA calls them from.
+    pub uia: crate::uia::Shared,
     /// Which chord runs which command. Seeded from the command table's own
     /// default shortcuts, then overridden by whatever the settings file says.
     pub bindings: crate::keys::Bindings,
@@ -287,12 +290,13 @@ pub struct AppState {
     pub rename: Option<crate::rename::InlineRename>,
     /// Folders visited, most recent first, offered by "Recent folders".
     pub recent: Vec<String>,
-    /// The sort each folder was last given, for this session only. Keyed by
-    /// lowercased path, because Windows paths are case-insensitive.
+    /// How each folder was last looked at — its sort and whether it was in the
+    /// icon view — for this session only. Keyed by lowercased path, because
+    /// Windows paths are case-insensitive.
     ///
-    /// ponytail: not persisted. Add `foldersort=` lines to the config if
+    /// ponytail: not persisted. Add `folderview=` lines to the config if
     /// wanting it across restarts; the session map is where the value is.
-    pub folder_sort: std::collections::HashMap<String, (SortKey, SortOrder)>,
+    pub folder_view: std::collections::HashMap<String, (SortKey, SortOrder, bool)>,
 
     pub hover: Option<Hit>,
     pub drag: Drag,
@@ -368,6 +372,7 @@ impl AppState {
             tree: crate::tree::Tree::default(),
             tree_rows: Vec::new(),
             filter_focus: None,
+            uia: Default::default(),
             bindings: {
                 let mut b = crate::keys::Bindings::from_defaults(
                     &crate::commands::default_bindings(),
@@ -394,7 +399,7 @@ impl AppState {
             preview_pending: None,
             rename: None,
             recent: cfg.recent.clone(),
-            folder_sort: std::collections::HashMap::new(),
+            folder_view: std::collections::HashMap::new(),
             hover: None,
             drag: Drag::None,
             mouse_tracking: false,
@@ -585,7 +590,7 @@ impl AppState {
     /// Key a cache entry by path and modified time, so an edited file re-renders
     /// rather than showing what it used to look like.
     pub fn image_key(dir: &str, entry: &crate::fs::FileEntry) -> String {
-        format!("{}|{}", fs::path_join(dir, &entry.name), entry.modified)
+        format!("{}|{}", fs::child_path(dir, entry), entry.modified)
     }
 
     /// Ask for the images of every cell on screen that has none yet.
@@ -669,6 +674,74 @@ impl AppState {
         self.thumbs.insert(key, bmp);
     }
 
+    /// Refresh what the automation providers can see, and say what moved.
+    ///
+    /// Called from the paint path, like the preview and the thumbnails: it is
+    /// the one place that sees the listing, the cursor and the geometry after
+    /// every way of changing any of them.
+    ///
+    /// Everything here is behind `clients_are_listening`, so a machine with no
+    /// screen reader running pays nothing — not even the cost of copying a
+    /// folder's worth of names.
+    pub fn sync_uia(&mut self, hwnd: HWND) {
+        if !crate::uia::clients_are_listening() {
+            return;
+        }
+        let pid = self.focused;
+        let layout = self.layout();
+        let p = layout.pane(pid);
+        let (list_rect, line_h, columns) = (p.list, p.line_h, p.columns_per_line);
+        let pane = self.pane(pid);
+        let folder = pane.current_path().to_string();
+        let list = pane.list();
+        let (revision, scroll_px) = (list.revision, list.scroll_px());
+        let cursor = list.cursor().map(|c| c as usize);
+        let selected = list.selected_set().clone();
+
+        let mut snap = self.uia.lock().unwrap_or_else(|e| e.into_inner());
+        let listing_changed = snap.revision != revision || snap.folder != folder;
+        if listing_changed {
+            snap.revision = revision;
+            snap.folder = folder;
+            snap.rows = std::sync::Arc::new(
+                list.entries
+                    .iter()
+                    .map(|e| crate::uia::Row {
+                        name: e.name.clone(),
+                        detail: if e.is_dir {
+                            "Folder".to_string()
+                        } else {
+                            format!(
+                                "{}, {}, {}",
+                                e.type_display(),
+                                e.size_display(),
+                                e.date_display()
+                            )
+                        },
+                    })
+                    .collect(),
+            );
+        }
+        let cursor_moved = snap.cursor != cursor;
+        snap.cursor = cursor;
+        snap.selected = selected;
+        snap.list = (list_rect.x, list_rect.y, list_rect.w, list_rect.h);
+        snap.line_h = line_h;
+        snap.columns = columns;
+        snap.scroll_px = scroll_px;
+        snap.hwnd = hwnd.0 as isize;
+        drop(snap);
+
+        // Order matters: a client told the cursor moved will ask about an item
+        // that has to already exist in the new listing.
+        if listing_changed {
+            crate::uia::announce_listing(&self.uia);
+        }
+        if let (true, Some(i)) = (cursor_moved || listing_changed, cursor) {
+            crate::uia::announce_focus(&self.uia, i);
+        }
+    }
+
     /// Push the layout's cells-per-line into every pane's list.
     ///
     /// Only the layout knows it — it depends on the pane's width — and the
@@ -730,7 +803,7 @@ impl AppState {
         }
         let pane = self.focused_pane();
         let entry = pane.list().cursor_entry()?;
-        let path = fs::path_join(pane.current_path(), &entry.name);
+        let path = fs::child_path(pane.current_path(), entry);
         Some((
             format!("{}|{}", path, entry.modified),
             entry.is_dir,
@@ -788,14 +861,29 @@ impl AppState {
     ///
     /// Unbounded for the session: one small entry per folder actually sorted by
     /// hand, which is a number of folders a person can produce, not a machine.
-    pub fn remember_sort(&mut self, path: &str, key: SortKey, order: SortOrder) {
+    pub fn remember_view(&mut self, path: &str, key: SortKey, order: SortOrder, grid: bool) {
         if !path.is_empty() {
-            self.folder_sort.insert(path.to_lowercase(), (key, order));
+            self.folder_view
+                .insert(path.to_lowercase(), (key, order, grid));
         }
     }
 
-    pub fn sort_for(&self, path: &str) -> Option<(SortKey, SortOrder)> {
-        self.folder_sort.get(&path.to_lowercase()).copied()
+    /// Record how the focused folder is being looked at right now.
+    ///
+    /// Called from wherever the sort or the view is changed by hand, because
+    /// only a deliberate change is worth remembering — arriving somewhere and
+    /// inheriting the last folder's settings is not a statement about this one.
+    pub fn remember_current_view(&mut self) {
+        let pid = self.focused;
+        let path = self.pane(pid).current_path().to_string();
+        let list = self.pane(pid).list();
+        let (key, order) = (list.sort_key, list.sort_order);
+        let grid = self.grid;
+        self.remember_view(&path, key, order, grid);
+    }
+
+    pub fn view_for(&self, path: &str) -> Option<(SortKey, SortOrder, bool)> {
+        self.folder_view.get(&path.to_lowercase()).copied()
     }
 
     pub fn config(&self, hwnd: HWND) -> Config {
@@ -992,11 +1080,11 @@ pub fn spawn_op_tagged(hwnd: HWND, op: ops::Op, tag: usize) {
     // One guard for every destructive path in the app, drops included: nothing
     // writes inside an archive. Refusing here rather than in each command is
     // what makes that true of paths nobody thought about.
-    if op.touches_archive() {
+    if op.is_read_only() {
         report_error(
             hwnd,
             "Not supported",
-            "Files inside an archive are read-only. Extract them first.",
+            "This location is read-only here. Archives have to be extracted              first, and This PC, the Recycle Bin and Network are for browsing.",
         );
         return;
     }
@@ -1028,6 +1116,14 @@ pub fn default_places() -> Vec<Shortcut> {
         label: "Home".to_string(),
         path: home.clone(),
     }];
+    // The shell's own locations, which are not folders on a disk and are the
+    // only way to reach the Recycle Bin or a network share from here.
+    for (label, path) in crate::shellns::PLACES {
+        out.push(Shortcut {
+            label: (*label).to_string(),
+            path: (*path).to_string(),
+        });
+    }
     for name in [
         "Desktop",
         "Documents",

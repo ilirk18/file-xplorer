@@ -39,8 +39,10 @@ mod rename;
 mod renderer;
 mod search;
 mod shellmenu;
+mod shellns;
 mod theme;
 mod tree;
+mod uia;
 mod watch;
 
 use windows::core::{Result, PCWSTR};
@@ -282,6 +284,16 @@ fn handle(
 
         // We paint every pixel; erasing first would only flicker.
         WM_ERASEBKGND => Some(LRESULT(1)),
+
+        // A screen reader asking what is in this window. Answered before the
+        // state pointer is even needed for anything else, because a client can
+        // ask at any point in the window's life.
+        WM_GETOBJECT => {
+            // A client's first look has to see real data. Until one attached,
+            // `sync_uia` was doing nothing at all, so the snapshot is empty.
+            state.sync_uia(hwnd);
+            uia::on_get_object(hwnd, wparam, lparam, &state.uia)
+        }
 
         WM_SIZE => {
             // The editor is placed at a rectangle a resize invalidates, and
@@ -584,8 +596,21 @@ fn handle(
                 // the load finishing rather than on the request, so a path that
                 // failed to read never joins the history.
                 state.remember_visit(&path);
-                if let Some((key, order)) = state.sort_for(&path) {
+                if let Some((key, order, grid)) = state.view_for(&path) {
                     state.pane_mut(pid).list_mut().set_sort(key, order);
+                    // The icon view is a window-wide setting, so a folder
+                    // remembered in it switches the window. That is the same
+                    // bargain Explorer makes, and the alternative — a per-pane
+                    // view — is a per-pane array in the config that nothing
+                    // has asked for.
+                    if state.grid != grid {
+                        state.grid = grid;
+                        state.sync_columns();
+                        let h = state.list_height(pid);
+                        if let Some(c) = state.pane(pid).list().cursor() {
+                            state.pane_mut(pid).list_mut().ensure_visible(c, h);
+                        }
+                    }
                 }
                 state.rewatch(pid, hwnd);
                 invalidate(hwnd);
@@ -773,6 +798,7 @@ fn paint(state: &mut AppState, hwnd: HWND) {
     // arrows, clicks, a drag band, type-ahead, a reload. Spawns a worker at
     // most; the disk work is not done here.
     state.sync_columns();
+    state.sync_uia(hwnd);
     state.ensure_preview(hwnd);
     state.ensure_thumbs(hwnd);
     let cache = std::mem::take(&mut state.thumbs);

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
-use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
+use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
 fn wide(s: &str) -> Vec<u16> {
@@ -74,6 +74,12 @@ unsafe fn lookup(key: &str) -> Option<HICON> {
     // allowed to touch it. Everything else is resolved from attributes alone
     // and never hits the disk.
     let (path, attrs, flags) = if let Some(real) = key.strip_prefix(PATH_PREFIX) {
+        // A shell location has no file to ask about, so it is resolved to an
+        // id list first. Worth the extra call for the three of them: the
+        // Recycle Bin's icon is the one that says whether it is full.
+        if crate::shellns::is_shell_path(real) {
+            return icon_for_shell_path(real);
+        }
         (
             real.to_string(),
             FILE_ATTRIBUTE_NORMAL,
@@ -107,6 +113,24 @@ unsafe fn lookup(key: &str) -> Option<HICON> {
         Some(&mut info),
         std::mem::size_of::<SHFILEINFOW>() as u32,
         flags,
+    );
+    if ok == 0 || info.hIcon.is_invalid() {
+        None
+    } else {
+        Some(info.hIcon)
+    }
+}
+
+/// The icon of a namespace location, by way of its id list.
+unsafe fn icon_for_shell_path(path: &str) -> Option<HICON> {
+    let pidls = crate::pidl::PidlList::absolute(&[path.to_string()])?;
+    let mut info = SHFILEINFOW::default();
+    let ok = SHGetFileInfoW(
+        PCWSTR(pidls.first() as *const u16),
+        FILE_ATTRIBUTE_NORMAL,
+        Some(&mut info),
+        std::mem::size_of::<SHFILEINFOW>() as u32,
+        SHGFI_ICON | SHGFI_SMALLICON | SHGFI_PIDL,
     );
     if ok == 0 || info.hIcon.is_invalid() {
         None

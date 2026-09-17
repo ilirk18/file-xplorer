@@ -32,6 +32,9 @@ pub enum Preview {
     /// A shell thumbnail. Owned: the bitmap is deleted when this is dropped.
     Image(HBITMAP),
     Text(String),
+    /// What is inside a folder, without going into it: names, folders first,
+    /// and how many more there were.
+    Folder { names: Vec<String>, more: usize },
     /// Nothing to show beyond the facts the listing already has.
     None,
 }
@@ -150,9 +153,38 @@ pub fn cell_image(path: &str, extension: Option<&str>, edge: i32) -> Option<HBIT
 /// `edge` is the longest side wanted, in pixels. The shell is allowed to
 /// return something larger (SIIGBF_BIGGERSIZEOK) because a cached thumbnail at
 /// the next size up is free, while forcing an exact size re-renders it.
+/// Names offered for a folder. A screenful; past that the answer to "what is
+/// in here" is to go in.
+const PEEK_NAMES: usize = 60;
+
 pub fn build(path: &str, is_dir: bool, extension: Option<&str>, edge: i32) -> Preview {
     if is_dir {
-        return Preview::None;
+        // Peeking into a folder is a plain directory read, already written and
+        // already on a worker thread.
+        let Ok(mut entries) = crate::fs::list_dir(path) else {
+            return Preview::None;
+        };
+        entries.retain(|e| !e.is_hidden);
+        entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        let more = entries.len().saturating_sub(PEEK_NAMES);
+        return Preview::Folder {
+            names: entries
+                .iter()
+                .take(PEEK_NAMES)
+                .map(|e| {
+                    if e.is_dir {
+                        format!("{}\\", e.name)
+                    } else {
+                        e.name.clone()
+                    }
+                })
+                .collect(),
+            more,
+        };
     }
     if has_thumbnail(extension) {
         if let Some(bmp) = unsafe { shell_image(path, edge, true) } {
@@ -234,11 +266,40 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_previews_as_nothing() {
-        assert!(matches!(
-            build(r"C:\Windows", true, None, 256),
-            Preview::None
-        ));
+    fn a_folder_previews_as_what_is_in_it() {
+        let dir = std::env::temp_dir().join("fx-peek-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("zeta-folder")).unwrap();
+        std::fs::write(dir.join("alpha.txt"), b"x").unwrap();
+        let path = dir.to_string_lossy().into_owned();
+
+        match build(&path, true, None, 256) {
+            Preview::Folder { ref names, more } => {
+                // Folders first whatever they are called, and marked as such.
+                assert_eq!(names[..], ["zeta-folder\\".to_string(), "alpha.txt".to_string()]);
+                assert_eq!(more, 0);
+            }
+            _ => panic!("a folder should preview as its contents"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_big_folder_says_how_many_more_there_are() {
+        let dir = std::env::temp_dir().join("fx-peek-many");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..PEEK_NAMES + 7 {
+            std::fs::write(dir.join(format!("f{:03}.txt", i)), b"x").unwrap();
+        }
+        match build(&dir.to_string_lossy(), true, None, 256) {
+            Preview::Folder { ref names, more } => {
+                assert_eq!(names.len(), PEEK_NAMES);
+                assert_eq!(more, 7);
+            }
+            _ => panic!("still a folder"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

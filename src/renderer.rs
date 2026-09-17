@@ -592,6 +592,14 @@ impl Renderer {
             Some((_, crate::preview::Preview::Text(text))) => {
                 self.text(text, body, p.text_muted, &self.formats.preview.clone())
             }
+            // Peeking into a folder: the names, and how many did not fit.
+            Some((_, crate::preview::Preview::Folder { names, more })) => {
+                let mut listing = names.join("\r\n");
+                if *more > 0 {
+                    listing.push_str(&format!("\r\n\u{2026} and {} more", more));
+                }
+                self.text(&listing, body, p.text_muted, &self.formats.preview.clone())
+            }
             Some((_, crate::preview::Preview::None)) => {
                 faint(self, "No preview for this kind of file.")
             }
