@@ -1,0 +1,5 @@
+/target/
+docx_extract/
+*.zip
+.env
+*.rs.bk
