@@ -1,0 +1,14 @@
+# Monthly, not weekly: one person's project does not want a pull request every
+# Monday. The windows crate is the one that actually moves, and CI runs the
+# whole suite against any bump before it is worth looking at.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

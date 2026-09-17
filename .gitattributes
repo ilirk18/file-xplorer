@@ -1,0 +1,10 @@
+# Everything is stored with LF; the working tree follows core.autocrlf, which
+# is what has been happening anyway. Saying so here means a contributor whose
+# git is configured differently cannot commit CRLF into the history by accident.
+* text=auto
+
+# cmd.exe is happiest reading CRLF.
+*.bat text eol=crlf
+
+# Never normalise, never diff as text.
+*.ico binary
